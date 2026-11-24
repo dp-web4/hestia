@@ -1039,6 +1039,30 @@ pub struct RecentEntry {
     /// denies from gates that do not report it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar: Option<String>,
+    /// An escalation ruling's outcome as its writers record it: `"approved"` / `"denied"`
+    /// (`esc.stored_status()` at the operator decide in `http.rs` and the peer decide in
+    /// `handler.rs`). The ruling row has no `granted` key; that name exists only on the
+    /// caller's reply (`EscalationStore::decision_reply`), which never reaches the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_met: Option<bool>,
+    /// On a `gate_escalation_expired` row, WHICH lapse it was, as `record_newly_lapsed` writes
+    /// it: `"undecided"` (the deadline passed with no ruling) or `"approved_unclaimed"` (an
+    /// approval whose claim window passed unspent). Without it the feed cannot tell the two
+    /// apart and called an approved escalation "expired unruled".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lapse_kind: Option<String>,
 }
 
 /// Flatten a `ChainEntry` into the UI-facing `RecentEntry` shape.
@@ -1081,6 +1105,23 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
             .get("attempted")
             .and_then(|v| v.as_str())
             .map(String::from),
+        escalation_id: d
+            .get("escalation_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        marker: d.get("marker").and_then(|v| v.as_str()).map(String::from),
+        decided_by: d
+            .get("decided_by")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        decided_via: d
+            .get("decided_via")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        bar: d.get("bar").and_then(|v| v.as_str()).map(String::from),
+        status: d.get("status").and_then(|v| v.as_str()).map(String::from),
+        bar_met: d.get("bar_met").and_then(|v| v.as_bool()),
+        lapse_kind: d.get("lapse_kind").and_then(|v| v.as_str()).map(String::from),
     }
 }
 
@@ -1088,7 +1129,7 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
 ///
 /// This is the whole memory fix in one type. `ChainEntry.event_data` is a parsed
 /// `serde_json::Value`, so reading a 10,000-row window built 10,000 documents to harvest
-/// fourteen scalars from each. Serde skips unknown keys **without allocating them**, so
+/// the scalars each consumer reads. Serde skips unknown keys **without allocating them**, so
 /// deserialising into this struct costs the fields named here and nothing more.
 ///
 /// Measured 2026-08-06: the daemon reached 1.35 GB in twenty-one minutes of ordinary use,
@@ -1109,6 +1150,33 @@ struct EventFields {
     rule_name: Option<String>,
     reason: Option<String>,
     attempted: Option<String>,
+    escalation_id: Option<String>,
+    marker: Option<String>,
+    decided_by: Option<String>,
+    decided_via: Option<String>,
+    bar: Option<String>,
+    #[serde(default, deserialize_with = "str_or_none")]
+    status: Option<String>,
+    bar_met: Option<bool>,
+    #[serde(default, deserialize_with = "str_or_none")]
+    lapse_kind: Option<String>,
+}
+
+/// `status` is a generic key. Escalation rulings write a string, but a row of another kind
+/// that wrote anything else must not blank every other field of its streamed projection
+/// (`project().unwrap_or_default()` drops the whole struct on one type mismatch), and must
+/// project as `flatten_entry` does: a non-string `status` is simply absent.
+fn str_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StrOrOther {
+        Str(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match <StrOrOther as serde::Deserialize>::deserialize(d)? {
+        StrOrOther::Str(s) => Some(s),
+        StrOrOther::Other(_) => None,
+    })
 }
 
 /// `flatten_entry`'s sibling, fed by a streaming row instead of a parsed entry.
@@ -1140,6 +1208,14 @@ pub fn flatten_row(r: crate::storage::chain::ChainRowRef<'_>) -> RecentEntry {
         rule_name: f.rule_name,
         reason: f.reason,
         attempted: f.attempted,
+        escalation_id: f.escalation_id,
+        marker: f.marker,
+        decided_by: f.decided_by,
+        decided_via: f.decided_via,
+        bar: f.bar,
+        status: f.status,
+        bar_met: f.bar_met,
+        lapse_kind: f.lapse_kind,
     }
 }
 
@@ -1805,6 +1881,8 @@ impl ServerState {
                             "tool": r.ext.gate.as_ref().map(|g| g.tool.clone()),
                             "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
                             "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                            "member_reason": r.ext.gate.as_ref().and_then(|g| g.member_reason.clone()),
+                            "escalated_from": r.ext.gate.as_ref().and_then(|g| g.escalated_from.clone()),
                             "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
                             "once_available": r.ext.gate.is_some(),
                             // dp, 2026-10-10 (#1232 narrowed): an act the gate could not
@@ -2372,6 +2450,91 @@ mod tests {
         // Caller-asserted, and labelled so the UI cannot render a claim as an identity.
         assert_eq!(row["claimed_by"], "kimi-code");
         assert!(row.get("secs_remaining").is_some());
+    }
+
+    #[test]
+    fn escalation_fields_survive_both_feed_projections() {
+        // The ruling row's keys as both decide writers record them (`http.rs` operator decide,
+        // `handler.rs` peer decide): the outcome is `status`, there is no `granted`. The
+        // end-to-end shape is pinned against the real writers in
+        // `handler::tests::the_dashboard_feed_fixture_matches_what_the_daemon_writes`.
+        let data = json!({
+            "escalation_id": "0123456789abcdef",
+            "plugin_id": "kimi-code",
+            "marker": "policy.json",
+            "decided_by": "dp",
+            "decided_via": "operator_session",
+            "bar": "single_approver",
+            "status": "approved",
+            "bar_met": true,
+            "lapse_kind": "approved_unclaimed",
+        });
+        let parsed = flatten_entry(crate::storage::ChainEntry {
+            hash: "h".into(),
+            prev_hash: "p".into(),
+            timestamp: Utc::now(),
+            event_type: "gate_escalation_decided".into(),
+            event_data: data.clone(),
+            signer_lct: "signer".into(),
+            chain_position: 9,
+        });
+        let raw = data.to_string();
+        let timestamp = Utc::now().to_rfc3339();
+        let streamed = flatten_row(crate::storage::chain::ChainRowRef {
+            chain_position: 9,
+            hash: "h",
+            prev_hash: "p",
+            event_type: "gate_escalation_decided",
+            event_data: &raw,
+            signer_lct: "signer",
+            timestamp: &timestamp,
+        });
+        for projected in [parsed, streamed] {
+            assert_eq!(projected.escalation_id.as_deref(), Some("0123456789abcdef"));
+            assert_eq!(projected.plugin_id.as_deref(), Some("kimi-code"));
+            assert_eq!(projected.marker.as_deref(), Some("policy.json"));
+            assert_eq!(projected.decided_by.as_deref(), Some("dp"));
+            assert_eq!(projected.decided_via.as_deref(), Some("operator_session"));
+            assert_eq!(projected.bar.as_deref(), Some("single_approver"));
+            assert_eq!(projected.status.as_deref(), Some("approved"));
+            assert_eq!(projected.bar_met, Some(true));
+            assert_eq!(projected.lapse_kind.as_deref(), Some("approved_unclaimed"));
+            let wire = serde_json::to_value(projected).unwrap();
+            for key in ["escalation_id", "marker", "decided_by", "decided_via", "bar", "status", "bar_met", "lapse_kind"] {
+                assert!(wire.get(key).is_some(), "{key} must reach the browser");
+            }
+        }
+    }
+
+    /// `status` is a generic key: a row of another kind that wrote a non-string `status` must
+    /// keep every other field in the streamed projection, exactly as the parsed one does.
+    #[test]
+    fn a_non_string_status_does_not_blank_a_streamed_row() {
+        let data = json!({"plugin_id": "kimi-code", "status": {"code": 3}});
+        let parsed = flatten_entry(crate::storage::ChainEntry {
+            hash: "h".into(),
+            prev_hash: "p".into(),
+            timestamp: Utc::now(),
+            event_type: "outcome".into(),
+            event_data: data.clone(),
+            signer_lct: "signer".into(),
+            chain_position: 9,
+        });
+        let raw = data.to_string();
+        let timestamp = Utc::now().to_rfc3339();
+        let streamed = flatten_row(crate::storage::chain::ChainRowRef {
+            chain_position: 9,
+            hash: "h",
+            prev_hash: "p",
+            event_type: "outcome",
+            event_data: &raw,
+            signer_lct: "signer",
+            timestamp: &timestamp,
+        });
+        for projected in [parsed, streamed] {
+            assert_eq!(projected.plugin_id.as_deref(), Some("kimi-code"));
+            assert_eq!(projected.status, None);
+        }
     }
 
     /// A FAILED FEED READ MUST BE DISTINGUISHABLE FROM AN EMPTY CHAIN.

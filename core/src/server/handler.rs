@@ -106,12 +106,14 @@ impl ServerHandler for HestiaServer {
             "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
+            "hestia_scope_escalate" => tool_scope_escalate(&self.state, &args).await,
             "hestia_scope_peer_decide" => tool_scope_peer_decide(&self.state, &args).await,
             "hestia_scope_request_view" => tool_scope_request_view(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
+            "hestia_gate_escalation_escalate" => tool_gate_escalation_escalate(&self.state, &args).await,
             "hestia_gate_escalation_lookup" => tool_gate_escalation_lookup(&self.state, &args).await,
             "hestia_gate_escalation_corroborate" => {
                 tool_gate_escalation_corroborate(&self.state, &args).await
@@ -131,6 +133,7 @@ impl ServerHandler for HestiaServer {
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
+            "hestia_member_claim" => tool_member_claim(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
             "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
@@ -307,6 +310,7 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
             | "hestia_gate_pending_escalations"
             | "hestia_escalation_evidence"
             | "hestia_gate_escalation_claim"
+            | "hestia_gate_escalation_escalate"
             | "hestia_member_inbox"
             | "hestia_member_unanswered"
             | "hestia_inbox"
@@ -322,6 +326,7 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
             // gate lets an act run on `approved`. So the reply waits for those rows to be
             // durable. A peer decide may report a request it did not write the same way.
             | "hestia_scope_claim"
+            | "hestia_scope_escalate"
             | "hestia_scope_peer_decide"
     )
 }
@@ -453,7 +458,11 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_scope_claim",
-            "The GATE's question after it refuses you a path (mrh.path / mrh.command) — your gate calls this, you normally do not. It ASKS and READS; it never decides: a grant already in force answers in_force; a one-time approval the operator made for exactly this act (same act string) answers approved and is spent (single use, claim window); a request still pending for this path answers pending with the SAME id (a re-issue never mints a second ask); a refusal inside its window answers refused; otherwise a scope request is opened on the operator's queue, carrying the refused act, and the operator rules it once, for the session, or standing, at the breadth they choose. Watch it with hestia_scope_status and re-issue the identical act afterwards. Not the appeal channel: hestia_appeal disputes whether the deny was right",
+            "The GATE's question after it refuses you a path (mrh.path / mrh.command) — your gate calls this, you normally do not. It ASKS and READS; it never decides: a grant already in force answers in_force; a one-time approval the operator made for exactly this act (same act string) answers approved and is spent (single use, claim window); a request still pending for this path answers pending with the SAME id (a re-issue never mints a second ask); a refusal inside its window answers refused; otherwise NOTHING is opened: the refusal is recorded and answered not_asked with a refusal_id, and nobody is told (dp, 2026-11-05). If you really need the path, escalate deliberately with hestia_scope_escalate. Not the appeal channel: hestia_appeal disputes whether the deny was right",
+        ),
+        t(
+            "hestia_scope_escalate",
+            "Escalate ONE scope refusal the gate recorded (its deny names the refusal_id) into a scope request, as a deliberate act. Pass plugin_id, refusal_id and reason: what you are doing and why it needs this path (the decider has only that sentence and the refused act). The gate never asks on your behalf (dp, 2026-11-05); this is how you ask. The request carries the gate's record of the act, so a one-time approval binds to exactly that act; a NOT-SAME peer decides it, the operator may override, and you cannot decide it yourself. Only the member the gate refused may escalate its refusal. Watch it with hestia_scope_status and re-issue the identical act after it is ruled. CLI: hestia scope escalate <refusal_id> --as <member> --reason '...'",
         ),
         t(
             "hestia_gate_escalation_open",
@@ -462,6 +471,10 @@ fn hestia_tools() -> Vec<Tool> {
              OPTIONAL resolved_targets = the paths the write reaches (#810; a single-string \
              resolved_target is also accepted): the bar is priced over the marker, the act and \
              every target, highest wins, so naming them can raise the bar and never lower it",
+        ),
+        t(
+            "hestia_gate_escalation_escalate",
+            "Escalate ONE governance-write refusal the gate recorded (its deny names the refusal_id) into an escalation, as a deliberate act. Pass plugin_id, refusal_id and reason: what you are doing and why it needs this write (the decider has only that sentence and the refused act). The gate never asks on your behalf (dp, 2026-11-05); this is how you ask. The escalation is the one the gate would have opened: the same act, marker, targets, bytes and bar, plus your reason. It is decided exactly as before, and you cannot decide it yourself. Only the member the gate refused may escalate its refusal. It never permits the write: after approval, re-issue the write BYTE-FOR-BYTE and the gate claims it. A scope refusal id is accepted too and goes to hestia_scope_escalate. CLI: hestia gate escalate <refusal_id> --as <member> --reason '...'",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -556,7 +569,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_claim",
-            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
+            "Claim a human's approval for a write to the governance surface, or REFUSE. Your gate calls this; you normally do not. It never opens an escalation on its own (dp, 2026-11-05: all escalations are deliberate acts by the member, with a reason): with no approval and nothing of yours pending for this act, the refusal is recorded and answered not_asked with a refusal_id, and nobody is told. Escalate it with hestia_gate_escalation_escalate if you really need the write. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
              — no second petition is minted and no peer is woken again; wait on the id you are given. \
              OPTIONAL resolved_targets = EVERY write-position path the gate's closure resolved \
@@ -844,7 +857,23 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_member_inbox",
-            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
+            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity). A consuming drain skips another session's unexpired claims and never marks those rows drained; peek:true remains non-consuming",
+        ),
+        t_args(
+            "hestia_member_claim",
+            "Claim one of YOUR queued notices before acting on it. The default action=claim takes a 15-minute lease; renew uses the same transition and reports renewed:false if it took an available claim rather than extending your live one; release returns your claim to the queue. A different session's unexpired claim is a conflict, never an overwrite. Expired claims may be reclaimed. Requires your own live session_id; only notices addressed to your member can be claimed. Claims and releases are witnessed; a bystander's consuming hestia_member_inbox neither returns nor marks a live-claimed notice",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["notice_id"],
+                "properties": {
+                    "notice_id": {"type": "integer", "minimum": 0},
+                    "action": {"type": "string", "enum": ["claim", "renew", "release"], "default": "claim"},
+                    "lease_secs": {"type": "integer", "minimum": 30, "maximum": 3600, "default": 900},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id."}
+                }
+            }),
         ),
         t(
             "hestia_egress_pending",
@@ -937,17 +966,20 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
     // real connect also re-checks. Both are reads.
     let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
         Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
-                          id.constellation_role.clone(), id.role_basis.clone())),
+                          id.constellation_role.clone(), id.role_basis.clone(),
+                          id.identity_basis, id.canonical_principal.clone())),
         None => {
             let s = state.lock().await;
             s.sessions
                 .find_reuse_id(&plugin_id, &host_session_id)
                 .and_then(|id| s.sessions.get(&id))
                 .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
-                          e.constellation_role.clone(), e.role_basis.clone()))
+                          e.constellation_role.clone(), e.role_basis.clone(),
+                          e.identity_basis, e.canonical_principal.clone()))
         }
     };
-    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis)) = found else {
+    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis,
+              identity_basis, canonical_principal)) = found else {
         return Ok(hestia_error_envelope(
             "hestia.connect_dry_run_no_session",
             "no live session for this (plugin_id, host_session_id): a real connect would mint \
@@ -963,6 +995,8 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
         "constellationRole": constellation_role,
         "roleDeclarationHonored": !declared_role.is_empty() && declared_role == constellation_role,
         "roleBasis": role_basis,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "gateCapabilityReportAccepted": false,
         "protocolVersion": 1,
         "reused": true,
@@ -1097,6 +1131,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1141,6 +1177,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1167,6 +1205,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         assigned_role: requested_role.clone(),
         constellation_role: constellation_role.clone(),
         role_basis,
+        identity_basis: crate::server::state::IdentityBasis::Asserted,
+        canonical_principal: None,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
@@ -1249,6 +1289,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // and a later policy change can't silently split them.
     let assigned_role = s.sessions[&session_id].assigned_role.clone();
     let role_basis = s.sessions[&session_id].role_basis.clone();
+    let identity_basis = s.sessions[&session_id].identity_basis;
+    let canonical_principal = s.sessions[&session_id].canonical_principal.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -1263,6 +1305,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         "softLct": soft_lct,
         "assignedRole": assigned_role,
         "constellationRole": constellation_role,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "roleDeclarationHonored": role_declaration_honored,
         "roleBasis": role_basis,
         "gateCapabilityReportAccepted": gate_capability_report_accepted,
@@ -1983,6 +2027,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         &json!({"policy_version": policy_version, "role_lct": role_lct, "enforced": evaluation.enforced}),
     );
     feedback.act = Some(act);
+    // Whether that digest is an act IDENTITY: judged here over the whole input, where masking past
+    // the row's display cut is still visible (NOVA's re-review of 7c73d48c9). Null with no attempt.
+    let act_exact = full_command.zip(attempted_whole.as_deref()).map(|(raw, w)| act_exact_of(raw, w));
     let mut committed_feedback = None;
     let mut feedback_recorded = false;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
@@ -2067,6 +2114,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 // trace of the operation. Stored explicitly and scrubbed, so the UI has
                 // one field to read for every tool rather than a per-tool special case.
                 "attempted": attempted,
+                // True only when `feedback.act` digests the unmasked, unbounded attempt
+                // (`act_exact_of`); derivation scores a digest retry only on true on both sides.
+                "act_exact": act_exact,
                 // The verdict as feedback: level, serves, act key, doors, repeat_of (above).
                 "feedback": feedback.to_value(),
             });
@@ -2202,6 +2252,8 @@ fn resolve_attributed_caller(
 }
 
 /// Keep a valid caller key, or derive the hook's act-bound key for an open-door refusal (#540).
+/// The basis says what the key can and cannot correlate; a derived key is not assumed to be
+/// hook-compatible, an act identity, or evidence that an act was even supplied.
 fn refusal_request_key(
     s: &super::state::ServerState,
     plugin_id: &str,
@@ -2209,19 +2261,30 @@ fn refusal_request_key(
     attempted_act: Option<&str>,
     session_id_arg: Option<&str>,
     supplied: Option<&str>,
-) -> String {
+    identity_mismatch: bool,
+) -> (String, &'static str) {
     if let Some(key) = supplied.filter(|key| super::gate_escalation::valid_request_key(key)) {
-        return key.to_string();
+        return (key.to_string(), "caller_supplied");
     }
     let host_session_id = session_id_arg
         .and_then(|raw| Uuid::parse_str(raw).ok())
         .and_then(|uuid| s.sessions.get(&uuid))
         .and_then(|session| session.host_session_id.as_deref());
-    super::gate_escalation::request_key_for_act(
-        plugin_id,
-        marker,
-        attempted_act.unwrap_or(""),
-        host_session_id,
+    let basis = if identity_mismatch {
+        "derived_identity_mismatch"
+    } else if attempted_act.unwrap_or("").is_empty() {
+        "derived_without_act"
+    } else {
+        "derived"
+    };
+    (
+        super::gate_escalation::request_key_for_act(
+            plugin_id,
+            marker,
+            attempted_act.unwrap_or(""),
+            host_session_id,
+        ),
+        basis,
     )
 }
 
@@ -2257,8 +2320,8 @@ fn refuse_asker_mismatch(
 ) -> anyhow::Error {
     let session = session_id_arg.unwrap_or("?");
     let session_prefix: String = session.chars().take(8).collect();
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2266,7 +2329,7 @@ fn refuse_asker_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "asker mismatch",
             "asserted_plugin_id": plugin_id,
             "proven_plugin_id": who.plugin_id,
@@ -2317,8 +2380,8 @@ fn refuse_host_session_mismatch(
     attempted_act: Option<&str>,
     request_key: Option<&str>,
 ) -> anyhow::Error {
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2326,7 +2389,7 @@ fn refuse_host_session_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "host session mismatch",
             "asserted_host_session_id": stated,
             "proven_host_session_id": proven,
@@ -3462,6 +3525,22 @@ fn redact_secrets(input: &str) -> String {
         fin.push(t.to_string());
     }
     fin.join(" ")
+}
+
+/// Is `feedback.act` — a digest over `redacted`, the whole attempt after `redact_secrets` — an
+/// IDENTITY of the act, so that two equal digests mean two equal acts? Only when nothing was
+/// masked or bounded anywhere in the input: not by this daemon (`redacted` differs from the
+/// whitespace-normalised `raw`), and not by the sender (its `***` value mask, `[REDACTED —`
+/// withholding, or `…` cut, which `attempted_summary` applies before the daemon sees the text).
+/// Decided at the producer over the whole input because the row's `attempted` is capped at
+/// `ATTEMPTED_MAX`: a mask past the cap is invisible to any reader of the row (NOVA's re-review
+/// of 7c73d48c9). Conservative: a command that merely contains `***` or `…` reads as not exact.
+fn act_exact_of(raw: &str, redacted: &str) -> bool {
+    let normalised = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    redacted == normalised
+        && !redacted.contains('…')
+        && !redacted.contains("[REDACTED —")
+        && !redacted.contains("***")
 }
 
 // =========================================================================
@@ -4867,7 +4946,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     // intent — never persist an unbounded payload into a less-protected surface — by
     // requiring the SENDER to bound and scrub, and by clamping here regardless, since a
     // gate that over-shares must not be able to make the daemon over-store.
-    let attempted_whole = optional_string(args, "attempted").map(|a| redact_secrets(&a));
+    let attempted_raw = optional_string(args, "attempted");
+    let attempted_whole = attempted_raw.as_deref().map(redact_secrets);
+    // Judged over the WHOLE sent text: a gate's own mask or bound (`attempted_summary`'s
+    // `***`, `[REDACTED —`, ` …`) makes the digest below a digest of a summary, not of the act.
+    let act_exact = attempted_raw
+        .as_deref()
+        .zip(attempted_whole.as_deref())
+        .map(|(raw, w)| act_exact_of(raw, w));
     let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
             a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
@@ -5016,6 +5102,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "reason": reason,
         "payload_sha256": payload_sha256,
         "attempted": attempted,
+        "act_exact": act_exact,
         "rule_id": rule_id,
         "verdict_available": verdict_available,
     });
@@ -9059,7 +9146,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("peeking member inbox: {e}"))?
     } else {
         s.inbox_store
-            .drain_member(&who.plugin_id)
+            .drain_member_for_session(
+                &who.plugin_id,
+                who.session_uuid.expect("attributed callers have a session"),
+            )
             .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
     };
     // Silently-dropped mail, reported to the only party who can tell what is
@@ -9081,6 +9171,220 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
     Ok(out)
+}
+
+/// Witness is finality for a lease change (NOVA re-review of #1513, mirroring #1650's
+/// corroboration undo): when the `member_notice_claimed` / `member_notice_released` append
+/// fails, put the lease back to its exact prior owner/expiry while the state lock is still
+/// held, and say so. The restore is compare-and-swap against what this act wrote; if it does
+/// not apply (or `prior` is unknown) the answer is explicitly `lease_state: "uncertain"`.
+fn undo_unwitnessed_member_claim(
+    store: &crate::storage::SqliteInboxStore,
+    notice_id: u64,
+    to_plugin: &str,
+    action: &str,
+    written: &crate::storage::inbox::MemberNoticeLease,
+    prior: Option<&crate::storage::inbox::MemberNoticeLease>,
+    append_err: &anyhow::Error,
+) -> Value {
+    let restore = match prior {
+        Some(prior) => store
+            .restore_member_notice_lease(notice_id, to_plugin, written, prior)
+            .map_err(|e| e.to_string()),
+        None => Err("the prior lease was not readable before the change".to_string()),
+    };
+    let (lease_state, restore_error) = match &restore {
+        Ok(true) => ("restored_to_prior", None),
+        Ok(false) => ("uncertain", Some("the row changed after this act; nothing was restored".to_string())),
+        Err(e) => ("uncertain", Some(e.clone())),
+    };
+    hestia_error_envelope(
+        "hestia.member_claim_unwitnessed",
+        if lease_state == "restored_to_prior" {
+            "the lease change was NOT recorded — its witness append failed; the lease is back to its exact prior owner and expiry"
+        } else {
+            "the lease change was NOT recorded — its witness append failed, and the rollback could not be confirmed; treat the lease state as uncertain"
+        },
+        Some(json!({
+            "notice_id": notice_id,
+            "action": action,
+            "lease_state": lease_state,
+            "restore_error": restore_error,
+            "append_error": append_err.to_string(),
+        })),
+    )
+}
+
+async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::storage::inbox::MemberNoticeClaimOutcome;
+
+    let Some(notice_id) = args.get("notice_id").and_then(Value::as_u64) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "member_claim requires a nonnegative integer notice_id",
+            None,
+        ));
+    };
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("claim");
+    if !matches!(action, "claim" | "renew" | "release") {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "action must be claim, renew, or release",
+            None,
+        ));
+    }
+    let lease_secs = args
+        .get("lease_secs")
+        .and_then(Value::as_i64)
+        .unwrap_or(crate::storage::inbox::MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS);
+    if !(crate::storage::inbox::MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS
+        ..=crate::storage::inbox::MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS)
+        .contains(&lease_secs)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid_lease",
+            "lease_secs must be between 30 and 3600",
+            Some(json!({"lease_secs": lease_secs})),
+        ));
+    }
+
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_unattributed",
+            "member_claim requires the caller's own live session_id (from hestia_connect)",
+            None,
+        ));
+    };
+    let target = format!("notice:{notice_id}");
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_member_claim",
+        "member_notify",
+        &target,
+    ) {
+        return Ok(denied);
+    }
+    let session = who.session_uuid.expect("attributed callers have a session");
+    // The exact lease before this act, read under the same state lock as the change, so a
+    // failed witness append can put it back (fresh claim, renewal, expired takeover, release).
+    let prior_lease = s
+        .inbox_store
+        .member_notice_lease(notice_id, &who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("reading member notice lease: {e}"))?;
+    let outcome = if action == "release" {
+        s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
+    } else {
+        s.inbox_store.claim_member_notice(
+            notice_id,
+            &who.plugin_id,
+            session,
+            lease_secs,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("changing member notice claim: {e}"))?;
+
+    match outcome {
+        MemberNoticeClaimOutcome::Claimed {
+            claim_expires_at,
+            renewed,
+            superseded_expired_claim,
+        } => {
+            let entry = match s.append_chain(
+                "member_notice_claimed",
+                json!({
+                    "notice_id": notice_id,
+                    "plugin_id": who.plugin_id,
+                    "role_lct": who.role_lct,
+                    "session_id": session,
+                    "claim_expires_at": claim_expires_at,
+                    "lease_secs": lease_secs,
+                    "renewed": renewed,
+                    "superseded_expired_claim": superseded_expired_claim,
+                }),
+            ) {
+                Ok(entry) => entry,
+                Err(append_err) => {
+                    let written = crate::storage::inbox::MemberNoticeLease {
+                        claimed_by_session: Some(session.to_string()),
+                        claim_expires_at: Some(claim_expires_at.to_rfc3339()),
+                    };
+                    return Ok(undo_unwitnessed_member_claim(
+                        &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                        prior_lease.as_ref(), &append_err,
+                    ));
+                }
+            };
+            Ok(json!({
+                "notice_id": notice_id,
+                "claimed": true,
+                "renewed": renewed,
+                "superseded_expired_claim": superseded_expired_claim,
+                "claim_expires_at": claim_expires_at,
+                "witnessEntryHash": entry.hash,
+            }))
+        }
+        MemberNoticeClaimOutcome::Released { was_claimed } => {
+            let witness = if was_claimed {
+                match s.append_chain(
+                    "member_notice_released",
+                    json!({
+                        "notice_id": notice_id,
+                        "plugin_id": who.plugin_id,
+                        "role_lct": who.role_lct,
+                        "session_id": session,
+                    }),
+                ) {
+                    Ok(entry) => Some(entry),
+                    Err(append_err) => {
+                        // An unwitnessed release must not free the notice for a sibling drain.
+                        let written = crate::storage::inbox::MemberNoticeLease {
+                            claimed_by_session: None,
+                            claim_expires_at: None,
+                        };
+                        return Ok(undo_unwitnessed_member_claim(
+                            &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                            prior_lease.as_ref(), &append_err,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(json!({
+                "notice_id": notice_id,
+                "released": was_claimed,
+                "witnessEntryHash": witness.map(|entry| entry.hash),
+            }))
+        }
+        MemberNoticeClaimOutcome::Conflict {
+            claimed_by_session,
+            claim_expires_at,
+        } => {
+            let owner_prefix: String = claimed_by_session.chars().take(8).collect();
+            Ok(hestia_error_envelope(
+                "hestia.member_claim_conflict",
+                "this notice is claimed by another session; wait for its lease to expire or coordinate with that session",
+                Some(json!({
+                    "notice_id": notice_id,
+                    "claimed_by_session_prefix": owner_prefix,
+                    "claim_expires_at": claim_expires_at,
+                })),
+            ))
+        }
+        MemberNoticeClaimOutcome::NotFound => Ok(hestia_error_envelope(
+            "hestia.member_claim_not_found",
+            "no queued notice with that id is addressed to your member on this machine",
+            Some(json!({"notice_id": notice_id})),
+        )),
+        MemberNoticeClaimOutcome::AlreadyDrained => Ok(hestia_error_envelope(
+            "hestia.member_claim_already_drained",
+            "this notice has already been drained and cannot be claimed",
+            Some(json!({"notice_id": notice_id})),
+        )),
+    }
 }
 
 /// "Which notices were queued and never answered?" — the query the mesh could
@@ -9147,47 +9451,51 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
-    // #1354: a transient ask dies with its target. A `review_request` row whose
-    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
-    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
-    // is read-time against the live request map — no sweep — so a request the map
-    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
-    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
-    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
-    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
-    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
-    // terminal transition) is #1354's named follow-up, not this slice.
+    // #1354: a transient ask dies with its terminal scope/escalation target. The
+    // disposition projection durably marks that evidence; a live terminal target is also
+    // recognized at read time, without a sweep or a mutation by this read-only tool. Once
+    // live evidence is gone (scope eviction, escalation reaping, restart), an unmarked row
+    // fails back to owed: unknown is NOT moot. Durable marks do not un-derive.
     //
     // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
-    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
-    // recipient is still owed — mooting it would silently erase debt. The match is
-    // by kind ROOT, because the send gate admits dotted specializations
-    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
-    // must agree here too.
+    // target. A durable `reply` carrying a terminal target is CONTENT the recipient is
+    // still owed — mooting it would silently erase debt. The match is by kind ROOT, because
+    // the send gate admits dotted specializations (review_request.pr) and the ledger's own
+    // kind matching is by prefix; the two must agree here too.
     //
     // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
     // the misroute is sender-actionable, mootness is not.
     let now = super::gate_escalation::now_secs();
-    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
-        if kind.split('.').next() != Some("review_request") {
+    let target_moot = |n: &crate::storage::inbox::UnansweredNotice| -> bool {
+        if n.kind.split('.').next() != Some("review_request") {
             return false;
         }
-        let Some(p) = pointer_uri.as_deref() else {
+        if n.mooted_at.is_some()
+            && n.moot_reason.as_deref().is_some_and(|r| !r.trim().is_empty())
+        {
+            return true;
+        }
+        let Some(p) = n.pointer_uri.as_deref() else {
             return false;
         };
-        let Some(rest) = p.strip_prefix("hestia://scope/") else {
-            return false;
-        };
-        let id = rest.split('#').next().unwrap_or(rest);
-        match s.scope_requests.get(id) {
-            Some(req) => {
+        if let Some(rest) = p.strip_prefix("hestia://scope/") {
+            let id = rest.split('#').next().unwrap_or(rest);
+            return s.scope_requests.get(id).is_some_and(|req| {
                 req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
-            }
-            None => false,
+            });
         }
+        if let Some(rest) = p.strip_prefix("hestia://escalation/") {
+            let id = rest.split('#').next().unwrap_or(rest);
+            // status_of deliberately maps an UNKNOWN id to Expired for gate denial. Mootness
+            // is evidence classification instead: only a record actually present can be terminal.
+            return s.gate_escalations.get(id).is_some_and(|esc| {
+                esc.status_at(now) != super::gate_escalation::Status::Pending
+            });
+        }
+        false
     };
     let (mine, mine_moot): (Vec<_>, Vec<_>) =
-        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
+        mine.into_iter().partition(|n| !target_moot(&n));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
@@ -9197,7 +9505,7 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
-            let moot = scope_moot(&n.kind, &n.pointer_uri);
+            let moot = target_moot(&n);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
@@ -9221,15 +9529,19 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe_moot": mine_moot,
         "owed_to_me_moot": theirs_moot,
         "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
-                       reply never moots) whose pointer names a scope request that is \
-                       TERMINAL (ruled, revoked, or past its window), derived at read \
-                       time against the live request map — no sweep (#1354). A request \
-                       the memory-only map no longer holds reads UNKNOWN, and unknown \
-                       stays owed: absence of evidence is not mootness. Eviction or \
-                       restart therefore reverts moot -> owed; that non-monotonicity is \
-                       intentional until durable mooted_at evidence lands (the #1354 \
-                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
-                       outranks mootness — the misroute is sender-actionable.",
+                       reply never moots) whose scope/escalation target is terminal. Moot means \
+                       no longer counted as responsiveness debt, not that late review is \
+                       worthless: a factor filed now is still recorded. A terminal disposition \
+                       durably marks mooted_at and moot_reason on rows already queued and on \
+                       late asks enqueued after the ruling; those marks survive map eviction, \
+                       escalation reaping, and restart. A still-live target can also be derived \
+                       at read time, with no sweep and no mutation by this read-only tool. An \
+                       undecided scope request whose window merely lapses has no disposition, \
+                       so its live-derived mootness returns to owed after map eviction or \
+                       restart; the same fail-back applies to every unmarked target. An absent \
+                       target is UNKNOWN, never terminal. In owed_to_me a misroute \
+                       (recipient_liveness unknown) outranks mootness — the misroute is \
+                       sender-actionable (#1354).",
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null means the drain mark is absent; a peek may still \
                   have seen it. A mark does not prove it was returned or read; \
@@ -9357,6 +9669,8 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(json!({ "total": 0, "secrets": [], "note": "no hub connection" }));
     };
 
+    let rest_endpoint = crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)?;
+
     // Member identity keypair — same load path as tool_inbox.
     let secret_hex = s
         .vault
@@ -9377,7 +9691,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     for p in &snapshot {
         // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
         let detail = match client
-            .get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id)
+            .get_pair(&rest_endpoint, conn.hub_lct_id, p.pair_id)
             .await
         {
             Ok(d) if d.is_active() => d,
@@ -9389,7 +9703,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         };
         let since = pairings.cursor(&p.pair_id);
         let msgs = match client
-            .get_pair_messages(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id, since)
+            .get_pair_messages(&rest_endpoint, conn.hub_lct_id, p.pair_id, since)
             .await
         {
             Ok(m) => m,
@@ -12496,6 +12810,8 @@ mod inbox_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -12676,6 +12992,8 @@ mod inbox_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: "role:constellation:mesh-worker".into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
                     host_session_id: None,
@@ -13274,6 +13592,177 @@ mod member_mesh_tests {
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
     }
 
+    #[tokio::test]
+    async fn a_claim_routes_one_notice_to_its_owner_without_blocking_other_mail() {
+        let (_dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let bystander = connect(&state, "kimi-code").await;
+
+        let mut queued = Vec::new();
+        for pointer in ["shared-context/forum/claimed.md", "shared-context/forum/other.md"] {
+            let sent = tool_member_notify(
+                &state,
+                &json!({
+                    "to_plugin_id": "kimi-code",
+                    "kind": "review_request",
+                    "pointer_uri": pointer,
+                    "session_id": sender,
+                }),
+            )
+            .await
+            .unwrap();
+            queued.push(sent["queued_id"].as_u64().expect("notice queued"));
+        }
+
+        let claimed = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": owner}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], json!(true), "claim failed: {claimed}");
+        assert!(claimed["witnessEntryHash"].is_string());
+
+        let conflict = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict["_hestia_error"]["code"], json!("hestia.member_claim_conflict"));
+        assert!(conflict["_hestia_error"]["data"]["claim_expires_at"].is_string());
+
+        let bystander_mail = tool_member_inbox(
+            &state,
+            &json!({"session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bystander_mail["total"], json!(1));
+        assert_eq!(bystander_mail["notices"][0]["id"], json!(queued[1]));
+
+        let owner_mail = tool_member_inbox(&state, &json!({"session_id": owner}))
+            .await
+            .unwrap();
+        assert_eq!(owner_mail["total"], json!(1), "the bystander consumed the claim: {owner_mail}");
+        assert_eq!(owner_mail["notices"][0]["id"], json!(queued[0]));
+
+        let s = state.lock().await;
+        let event = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|entry| entry.event_type == "member_notice_claimed")
+            .expect("claim was not witnessed");
+        assert_eq!(event.event_data["notice_id"], json!(queued[0]));
+        assert_eq!(event.event_data["plugin_id"], json!("kimi-code"));
+    }
+
+    /// NOVA re-review of #1513: a lease change whose witness append fails must not stay
+    /// effective. For each of fresh claim, renewal, expired takeover and release, inject a
+    /// failure on exactly that act's chain event, and require (a) an explicit unwitnessed
+    /// error with `lease_state: restored_to_prior`, (b) the row's owner/expiry byte-identical
+    /// to before, and (c) for release, that a sibling session still cannot drain the notice.
+    async fn unwitnessed_lease_change_rolls_back(arm: &str) {
+        let (dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let sibling = connect(&state, "kimi-code").await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let witness = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        witness.pragma_update(None, "key", hex::encode(key)).unwrap();
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "shared-context/forum/lease.md", "session_id": sender}),
+        )
+        .await
+        .unwrap();
+        let id = sent["queued_id"].as_u64().expect("notice queued");
+        let lease = || {
+            let state = state.clone();
+            async move {
+                state.lock().await.inbox_store.member_notice_lease(id, "kimi-code").unwrap()
+                    .expect("notice still undrained")
+            }
+        };
+        let claim = |session: &str, extra: Value| {
+            let state = state.clone();
+            let mut args = json!({"notice_id": id, "session_id": session});
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            async move { tool_member_claim(&state, &args).await.unwrap() }
+        };
+
+        // Arrange the lease the failing act starts from.
+        let (actor, extra, event) = match arm {
+            "fresh" => (&owner, json!({}), "member_notice_claimed"),
+            "renew" => {
+                let ok = claim(&owner, json!({"lease_secs": 120})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"lease_secs": 3600}), "member_notice_claimed")
+            }
+            "takeover" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                let inbox = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+                inbox.pragma_update(None, "key", hex::encode(key)).unwrap();
+                inbox.execute("UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                              rusqlite::params!["2000-01-01T00:00:00+00:00", id as i64]).unwrap();
+                (&sibling, json!({}), "member_notice_claimed")
+            }
+            "release" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"action": "release"}), "member_notice_released")
+            }
+            other => panic!("unknown arm {other}"),
+        };
+        let prior = lease().await;
+        assert_eq!(prior.claimed_by_session.is_some(), arm != "fresh", "{arm}: setup {prior:?}");
+
+        witness.execute_batch(&format!(
+            "CREATE TRIGGER fail_lease BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = '{event}'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;")).unwrap();
+        let r = claim(actor, extra).await;
+        witness.execute_batch("DROP TRIGGER fail_lease").unwrap();
+
+        assert_eq!(r["_hestia_error"]["code"], json!("hestia.member_claim_unwitnessed"),
+                   "{arm}: {r}");
+        assert_eq!(r["_hestia_error"]["data"]["lease_state"], json!("restored_to_prior"),
+                   "{arm}: {r}");
+        assert_eq!(lease().await, prior, "{arm}: the lease change stayed effective unwitnessed");
+        if arm == "release" {
+            let sibling_mail = tool_member_inbox(&state, &json!({"session_id": sibling}))
+                .await
+                .unwrap();
+            assert_eq!(sibling_mail["total"], json!(0),
+                       "an unwitnessed release let a sibling consume the notice: {sibling_mail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_fresh_claim_is_rolled_back() {
+        unwitnessed_lease_change_rolls_back("fresh").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_renewal_is_rolled_back_to_the_prior_expiry() {
+        unwitnessed_lease_change_rolls_back("renew").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_expired_takeover_is_rolled_back_to_the_prior_owner() {
+        unwitnessed_lease_change_rolls_back("takeover").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_release_is_rolled_back_and_blocks_sibling_drain() {
+        unwitnessed_lease_change_rolls_back("release").await;
+    }
+
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
     /// accepted one **on the chain**, not just in an ephemeral tool response.
     ///
@@ -13832,9 +14321,9 @@ mod member_mesh_tests {
     /// post-restart every id is unknown, and unknown fails toward owed), a durable
     /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
     /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
-    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
-    /// request from the map moves the row BACK to owed (moot -> owed): read-time
-    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// dotted specialization of the ask kind moots exactly like its root. Without durable
+    /// evidence, evicting the request moves a live-derived row BACK to owed (moot -> owed).
+    /// Once the terminal disposition marks mooted_at/moot_reason, eviction cannot un-moot it.
     /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
     /// because the misroute is the sender-actionable signal. Binding to a mooted row
     /// still works: mootness reclassifies the debt, it does not close the row.
@@ -13972,12 +14461,10 @@ mod member_mesh_tests {
         assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
         assert_eq!(owed_moot.len(), 1, "{rows}");
 
-        // Eviction/restart regression (dp-web4 review of #1357): the request map is
-        // memory-only, so losing the request must move the row BACK to owed. Mootness
-        // is a read-time property of available evidence, not a row state — the
-        // non-monotonicity is intentional until durable `mooted_at` evidence lands
-        // (the #1354 follow-up), and this transition is the proof it fails toward
-        // visibility rather than silently staying moot.
+        // Eviction/restart regression (dp-web4 review of #1357): with no terminal
+        // disposition yet, mootness is only derived from the live request. Losing that
+        // evidence must move the row BACK to owed rather than silently staying moot.
+        // The next block proves the durable-mark arm does not revert.
         {
             let mut s = state.lock().await;
             s.scope_requests.remove("scope-moot-decided");
@@ -14007,6 +14494,49 @@ mod member_mesh_tests {
         assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
                 "nothing stays moot on absent evidence: {rows2}");
 
+        // The terminal disposition carries durable evidence. Once it has landed, eviction of
+        // the memory-only request cannot resurrect the transient ask as debt.
+        {
+            let s = state.lock().await;
+            ensure_disposition(&s, "cbp-being", "hestia://scope/scope-moot-decided",
+                               "scope-ruling-hash");
+        }
+        let late_scope_ptr =
+            "hestia://scope/scope-moot-decided#peer-decide;late-after-eviction";
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_scope_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let rows3 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let durable = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == "hestia://scope/scope-moot-decided#peer-decide")
+            .unwrap_or_else(|| panic!("durable scope mootness survives eviction: {rows3}"));
+        assert!(durable["mooted_at"].is_string(), "{rows3}");
+        assert!(durable["moot_reason"].as_str().unwrap_or_default().contains("scope-ruling-hash"),
+                "the evidence names the ruling that made it moot: {rows3}");
+        let late_scope = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_scope_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling scope ask inherits durable mootness: {rows3}")
+            });
+        assert!(late_scope["mooted_at"].is_string(), "{rows3}");
+        assert!(late_scope["moot_reason"].as_str().unwrap_or_default()
+                .contains("scope-ruling-hash"), "{rows3}");
+
         // Mootness reclassifies; it does not close. The ASKED member can still bind late.
         let late = tool_member_notify(
             &state,
@@ -14017,6 +14547,134 @@ mod member_mesh_tests {
         .await
         .unwrap();
         assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
+    }
+
+    #[tokio::test]
+    async fn unanswered_moots_terminal_escalations_without_treating_unknown_as_expired() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = now_secs();
+        let (decided, expired, pending) = {
+            let mut s = state.lock().await;
+            let decided = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now, 3600)
+                .unwrap()
+                .id;
+            s.gate_escalations
+                .decide(&decided, false, "claude-code", "role:constellation:member",
+                        Channel::SelfWithdrawn, None, Some("false positive"), now)
+                .unwrap();
+            let expired = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now - 10, 1)
+                .unwrap()
+                .id;
+            let pending = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now, 3600)
+                .unwrap()
+                .id;
+            (decided, expired, pending)
+        };
+        let decided_ptr = format!("hestia://escalation/{decided}#corroborate-or-dissent");
+        let expired_ptr = format!("hestia://escalation/{expired}#corroborate-or-dissent");
+        let pending_ptr = format!("hestia://escalation/{pending}#corroborate-or-dissent");
+        let unknown_ptr = "hestia://escalation/not-present#corroborate-or-dissent";
+        for (kind, pointer) in [
+            ("review_request", decided_ptr.as_str()),
+            ("review_request", expired_ptr.as_str()),
+            ("review_request.pr", expired_ptr.as_str()),
+            ("review_request", pending_ptr.as_str()),
+            ("review_request", unknown_ptr),
+            ("reply", decided_ptr.as_str()),
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": kind,
+                        "pointer_uri": pointer, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let pointers = |rows: &Value, key: &str| {
+            rows[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["pointer_uri"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for ptr in [&decided_ptr, &expired_ptr] {
+            assert!(pointers(&rows, "i_owe_moot").contains(ptr),
+                    "a live terminal escalation moots its transient ask: {rows}");
+        }
+        for ptr in [&pending_ptr, &unknown_ptr.to_string()] {
+            assert!(pointers(&rows, "i_owe").contains(ptr),
+                    "pending and UNKNOWN targets stay owed: {rows}");
+        }
+        assert!(rows["i_owe"].as_array().unwrap().iter().any(|r|
+                r["kind"] == "reply" && r["pointer_uri"] == decided_ptr),
+                "a durable reply remains content even when its target is terminal: {rows}");
+
+        {
+            let s = state.lock().await;
+            ensure_disposition(&s, "claude-code",
+                               &format!("hestia://escalation/{decided}#withdrawn"),
+                               "withdrawn-ruling-hash");
+        }
+        let late_ptr = format!("{decided_ptr};exact-reviewed-v2-late-follow-up");
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        {
+            let mut s = state.lock().await;
+            s.gate_escalations.reap(now + 7200, 0);
+        }
+        let after = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let durable = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == decided_ptr)
+            .unwrap_or_else(|| panic!("terminal evidence survives escalation eviction: {after}"));
+        assert!(durable["mooted_at"].is_string(), "{after}");
+        assert!(durable["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        let late = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling ask keeps durable mootness after reaping: {after}")
+            });
+        assert!(late["mooted_at"].is_string(), "{after}");
+        assert!(late["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        assert!(pointers(&after, "i_owe").contains(&expired_ptr),
+                "an unmarked expired row fails back to owed after its live evidence is gone: {after}");
+        assert!(!pointers(&after, "i_owe_moot").contains(&pending_ptr),
+                "a pending ask never becomes moot merely because its live row was reaped: {after}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
@@ -14593,6 +15251,9 @@ mod tests {
                     || l == "hestia_scope_status"
                     || l == "hestia_scope_arbitrate"
                     || l == "hestia_scope_claim"
+                    // dp 2026-11-05: ASKS (opens a request from the member's own refusal);
+                    // decides nothing. Held by `scope_escalate_*`.
+                    || l == "hestia_scope_escalate"
                     // dp 2026-10-05: gate-opened scope requests go to NOT-SAME peers. Held by
                     // the behavioural tests `scope_peer_decide_*` (self refused in both
                     // directions, asserted asker refused, record names peer and basis).
@@ -15722,6 +16383,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: role.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -16056,6 +16719,42 @@ mod tests {
         assert_eq!(s.sessions.len(), 2, "one session per (member, host session)");
         assert!(s.sessions.values().any(|session| session.plugin_id == "victim"));
         assert!(s.sessions.values().any(|session| session.plugin_id == "other-member"));
+    }
+
+    /// #824 stage A: the identity basis is explicit metadata, never a caller-selected
+    /// upgrade. Current sessions are asserted/A1, and Guard-A reuse cannot change that fact.
+    #[tokio::test]
+    async fn connect_labels_legacy_identity_basis_asserted_and_reuse_does_not_upgrade() {
+        let (_dir, shared) = make_shared_state();
+        let fresh = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(fresh["identityBasis"], "asserted");
+        assert!(fresh["canonicalPrincipal"].is_null());
+        let session_id = fresh["sessionId"].as_str().unwrap();
+        {
+            let s = shared.lock().await;
+            let stored = &s.sessions[&Uuid::parse_str(session_id).unwrap()];
+            assert_eq!(stored.identity_basis, crate::server::state::IdentityBasis::Asserted);
+            assert_eq!(stored.canonical_principal, None);
+        }
+
+        let reused = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["sessionId"], session_id);
+        assert_eq!(reused["identityBasis"], "asserted");
+        assert!(reused["canonicalPrincipal"].is_null());
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(dry["identityBasis"], "asserted");
+        assert!(dry["canonicalPrincipal"].is_null());
     }
 
     /// The declared constellation role must be READABLE BACK. Before this, a member
@@ -16643,9 +17342,9 @@ mod tests {
         };
 
         // The open's answer is lost; the re-issue folds into it and lookup finds it.
-        let first = tool_gate_escalation_claim(&shared, &claim("inv-1")).await.unwrap();
+        let first = gate_claim_and_escalate(&shared, &claim("inv-1")).await.unwrap();
         let esc_id = first["escalation_id"].as_str().unwrap().to_string();
-        let again = tool_gate_escalation_claim(&shared, &claim("inv-2")).await.unwrap();
+        let again = gate_claim_and_escalate(&shared, &claim("inv-2")).await.unwrap();
         assert_eq!(again["coalesced"], json!(true), "{again}");
         let looked = tool_gate_escalation_lookup(&shared, &json!({"request_key": key})).await.unwrap();
         assert_eq!(looked["escalation_id"], json!(esc_id));
@@ -16654,11 +17353,11 @@ mod tests {
         //     the society-safety begin_action (execution path). A NEW identical invocation
         //     must NOT inherit it.
         approve(shared.clone(), esc_id.clone()).await;
-        let spent = tool_gate_escalation_claim(&shared, &claim("inv-3")).await.unwrap();
+        let spent = gate_claim_and_escalate(&shared, &claim("inv-3")).await.unwrap();
         assert_eq!(spent["claimed"], json!(true), "{spent}");
         tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
                                            "correlation_key": "inv-3"})).await.unwrap();
-        let repeat = tool_gate_escalation_claim(&shared, &claim("inv-4")).await.unwrap();
+        let repeat = gate_claim_and_escalate(&shared, &claim("inv-4")).await.unwrap();
         assert_eq!(repeat["permits_write"], json!(false), "a delivered, executed permit is not inherited: {repeat}");
         assert!(repeat["reclaim_refused"].as_str().unwrap_or("").contains("reached execution"), "{repeat}");
 
@@ -16667,15 +17366,15 @@ mod tests {
         //     reclaims ONCE; a further retry is refused.
         let esc2 = repeat["escalation_id"].as_str().unwrap().to_string();
         approve(shared.clone(), esc2.clone()).await;
-        let spent2 = tool_gate_escalation_claim(&shared, &claim("inv-5")).await.unwrap();
+        let spent2 = gate_claim_and_escalate(&shared, &claim("inv-5")).await.unwrap();
         assert_eq!(spent2["claimed"], json!(true), "{spent2}");
         let observed_before = shared.lock().await.gate_escalations.get(&esc2).unwrap().observed_at;
-        let re = tool_gate_escalation_claim(&shared, &claim("inv-6")).await.unwrap();
+        let re = gate_claim_and_escalate(&shared, &claim("inv-6")).await.unwrap();
         assert_eq!(re["reclaimed"], json!(true), "{re}");
         assert_eq!(re["permits_write"], json!(true));
         assert_eq!(re["escalation_id"], json!(esc2));
         assert!(re["witnessEntryHash"].as_str().is_some(), "the reclaim is durably witnessed: {re}");
-        let twice = tool_gate_escalation_claim(&shared, &claim("inv-7")).await.unwrap();
+        let twice = gate_claim_and_escalate(&shared, &claim("inv-7")).await.unwrap();
         assert_eq!(twice["permits_write"], json!(false), "only once: {twice}");
         assert!(twice["reclaim_refused"].as_str().unwrap_or("").contains("already reclaimed"), "{twice}");
         // Lookup is read-only.
@@ -16685,9 +17384,9 @@ mod tests {
         // (c) THE SAME INVOCATION retried: its permit was delivered to it.
         let esc3 = twice["escalation_id"].as_str().unwrap().to_string();
         approve(shared.clone(), esc3.clone()).await;
-        let spent3 = tool_gate_escalation_claim(&shared, &claim("inv-8")).await.unwrap();
+        let spent3 = gate_claim_and_escalate(&shared, &claim("inv-8")).await.unwrap();
         assert_eq!(spent3["claimed"], json!(true), "{spent3}");
-        let same = tool_gate_escalation_claim(&shared, &claim("inv-8")).await.unwrap();
+        let same = gate_claim_and_escalate(&shared, &claim("inv-8")).await.unwrap();
         assert_eq!(same["permits_write"], json!(false), "{same}");
         assert!(same["reclaim_refused"].as_str().unwrap_or("").contains("same invocation"), "{same}");
 
@@ -16736,12 +17435,12 @@ mod tests {
         };
 
         // (a) the race: claim A, reclaim B BEFORE A begins.
-        let opened = tool_gate_escalation_claim(&shared, &claim("inv-A0")).await.unwrap();
+        let opened = gate_claim_and_escalate(&shared, &claim("inv-A0")).await.unwrap();
         let esc = opened["escalation_id"].as_str().unwrap().to_string();
         approve(shared.clone(), esc.clone()).await;
-        let a = tool_gate_escalation_claim(&shared, &claim("inv-A")).await.unwrap();
+        let a = gate_claim_and_escalate(&shared, &claim("inv-A")).await.unwrap();
         assert_eq!(a["claimed"], json!(true), "{a}");
-        let b = tool_gate_escalation_claim(&shared, &claim("inv-B")).await.unwrap();
+        let b = gate_claim_and_escalate(&shared, &claim("inv-B")).await.unwrap();
         assert_eq!(b["reclaimed"], json!(true), "B reclaims: A has not begun: {b}");
         let begin_a = tool_begin_action(&shared, &begin("inv-A")).await.unwrap();
         assert_eq!(begin_a["_hestia_error"]["code"], json!("hestia.invocation_superseded"),
@@ -16756,7 +17455,7 @@ mod tests {
         assert_eq!(row.event_data["fenced_invocation_key"], json!("inv-A"));
 
         // A third invocation cannot reclaim again, and B cannot be superseded.
-        let c = tool_gate_escalation_claim(&shared, &claim("inv-C")).await.unwrap();
+        let c = gate_claim_and_escalate(&shared, &claim("inv-C")).await.unwrap();
         assert_eq!(c["permits_write"], json!(false), "{c}");
 
         // (e) replay rebuilds the fence from the reclaimed row.
@@ -16774,18 +17473,18 @@ mod tests {
         // (b) the other order: claim D, begin D, then a reclaim is REFUSED.
         let e2 = c["escalation_id"].as_str().unwrap().to_string();
         approve(shared.clone(), e2.clone()).await;
-        let d = tool_gate_escalation_claim(&shared, &claim("inv-D")).await.unwrap();
+        let d = gate_claim_and_escalate(&shared, &claim("inv-D")).await.unwrap();
         assert_eq!(d["claimed"], json!(true), "{d}");
         let begin_d = tool_begin_action(&shared, &begin("inv-D")).await.unwrap();
         assert!(begin_d.get("actionId").is_some(), "{begin_d}");
-        let late = tool_gate_escalation_claim(&shared, &claim("inv-E")).await.unwrap();
+        let late = gate_claim_and_escalate(&shared, &claim("inv-E")).await.unwrap();
         assert_eq!(late["permits_write"], json!(false), "{late}");
         assert!(late["reclaim_refused"].as_str().unwrap_or("").contains("reached execution"), "{late}");
 
         // (d) eviction under pressure inside the window refuses the reclaim.
         let e3 = late["escalation_id"].as_str().unwrap().to_string();
         approve(shared.clone(), e3.clone()).await;
-        let g = tool_gate_escalation_claim(&shared, &claim("inv-G")).await.unwrap();
+        let g = gate_claim_and_escalate(&shared, &claim("inv-G")).await.unwrap();
         assert_eq!(g["claimed"], json!(true), "{g}");
         {
             let mut s = shared.lock().await;
@@ -16794,7 +17493,7 @@ mod tests {
                 s.gate_escalations.record_begin(&format!("filler-{i}"), now);
             }
         }
-        let h = tool_gate_escalation_claim(&shared, &claim("inv-H")).await.unwrap();
+        let h = gate_claim_and_escalate(&shared, &claim("inv-H")).await.unwrap();
         assert_eq!(h["permits_write"], json!(false), "evicted evidence is not recovery authority: {h}");
         assert!(h["reclaim_refused"].as_str().unwrap_or("").contains("evicted"), "{h}");
     }
@@ -16831,9 +17530,9 @@ mod tests {
                 }
                 a
             };
-            let opened = tool_gate_escalation_claim(&shared, &claim(&format!("{a_inv}-0"), declared)).await.unwrap();
+            let opened = gate_claim_and_escalate(&shared, &claim(&format!("{a_inv}-0"), declared)).await.unwrap();
             approve(shared.clone(), opened["escalation_id"].as_str().unwrap().to_string()).await;
-            let a = tool_gate_escalation_claim(&shared, &claim(a_inv, declared)).await.unwrap();
+            let a = gate_claim_and_escalate(&shared, &claim(a_inv, declared)).await.unwrap();
             assert_eq!(a["claimed"], json!(true), "{a}");
             let row = {
                 let s = shared.lock().await;
@@ -16842,7 +17541,7 @@ mod tests {
                     .find(|e| e.event_data["request_key"] == json!(key)).unwrap()
             };
             // B ALWAYS declares: the capability that matters is the ORIGINAL's.
-            let b = tool_gate_escalation_claim(&shared, &claim(b_inv, true)).await.unwrap();
+            let b = gate_claim_and_escalate(&shared, &claim(b_inv, true)).await.unwrap();
             let begin_a = tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
                                                               "correlation_key": a_inv})).await.unwrap();
             if declared {
@@ -16930,7 +17629,7 @@ mod tests {
         let codex = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
             .await.unwrap()["sessionId"].as_str().unwrap().to_string();
 
-        let claimed = tool_gate_escalation_claim(&shared, &json!({
+        let claimed = gate_claim_and_escalate(&shared, &json!({
             "plugin_id": "codex", "session_id": codex, "tool_name": "Edit",
             "marker": "pre_tool_use.py", "reason": "Edit -> a governance file",
         })).await.unwrap();
@@ -16989,7 +17688,7 @@ mod tests {
         let codex = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
             .await.unwrap()["sessionId"].as_str().unwrap().to_string();
 
-        let claimed = tool_gate_escalation_claim(&shared, &json!({
+        let claimed = gate_claim_and_escalate(&shared, &json!({
             "plugin_id": "codex", "session_id": codex, "tool_name": "Edit",
             "marker": "pre_tool_use.py", "reason": "Edit -> a governance file",
         })).await.unwrap();
@@ -17011,7 +17710,7 @@ mod tests {
         tool_connect(&shared2, &json!({"plugin_id": "kimi-code", "host_agent": "h"})).await.unwrap();
         let codex2 = tool_connect(&shared2, &json!({"plugin_id": "codex", "host_agent": "h"}))
             .await.unwrap()["sessionId"].as_str().unwrap().to_string();
-        let claimed2 = tool_gate_escalation_claim(&shared2, &json!({
+        let claimed2 = gate_claim_and_escalate(&shared2, &json!({
             "plugin_id": "codex", "session_id": codex2, "tool_name": "Edit",
             "marker": "pre_tool_use.py", "reason": "Edit -> a governance file",
         })).await.unwrap();
@@ -17121,7 +17820,7 @@ mod tests {
                 if !targets.is_null() {
                     args["resolved_targets"] = targets;
                 }
-                tool_gate_escalation_claim(&shared, &args).await.unwrap()
+                gate_claim_and_escalate(&shared, &args).await.unwrap()
             }
         };
         // The sovereign target is SECOND: every target is priced, not the first.
@@ -17195,13 +17894,13 @@ mod tests {
         };
 
         // A targetless claim opens the weak row; it is approved.
-        let first = tool_gate_escalation_claim(&shared, &claim("inv-1", false)).await.unwrap();
+        let first = gate_claim_and_escalate(&shared, &claim("inv-1", false)).await.unwrap();
         let weak_id = first["escalation_id"].as_str().unwrap().to_string();
         assert_eq!(shared.lock().await.gate_escalations.get(&weak_id).unwrap().bar, Bar::SingleApprover);
         approve(shared.clone(), weak_id.clone()).await;
 
         // SPEND: the same act, now carrying the sovereign target, must not consume it.
-        let stronger = tool_gate_escalation_claim(&shared, &claim("inv-2", true)).await.unwrap();
+        let stronger = gate_claim_and_escalate(&shared, &claim("inv-2", true)).await.unwrap();
         assert_eq!(stronger["claimed"], json!(false), "{stronger}");
         assert_eq!(stronger["permits_write"], json!(false), "{stronger}");
         assert_eq!(stronger["bar_shortfall"]["escalation_id"], json!(weak_id), "{stronger}");
@@ -17219,9 +17918,9 @@ mod tests {
         // RECLAIM: a targetless invocation spends the weak approval (control: its own price),
         // its answer is "lost" (no begin_action), and the retry carries the target. Recovery
         // of a lost answer never covers a stronger act.
-        let spent = tool_gate_escalation_claim(&shared, &claim("inv-3", false)).await.unwrap();
+        let spent = gate_claim_and_escalate(&shared, &claim("inv-3", false)).await.unwrap();
         assert_eq!(spent["claimed"], json!(true), "control: same act, own price: {spent}");
-        let retry = tool_gate_escalation_claim(&shared, &claim("inv-4", true)).await.unwrap();
+        let retry = gate_claim_and_escalate(&shared, &claim("inv-4", true)).await.unwrap();
         assert_ne!(retry["reclaimed"], json!(true), "{retry}");
         assert_eq!(retry["permits_write"], json!(false), "{retry}");
         assert!(retry["reclaim_refused"].as_str().unwrap_or("").contains("prices above"), "{retry}");
@@ -17244,7 +17943,7 @@ mod tests {
             let shared = shared.clone();
             let sid = sid.clone();
             async move {
-                tool_gate_escalation_claim(
+                gate_claim_and_escalate(
                     &shared,
                     &json!({
                         "plugin_id": "claude-code",
@@ -17367,7 +18066,7 @@ mod tests {
             let shared = shared.clone();
             let sid = sid.clone();
             async move {
-                let c = tool_gate_escalation_claim(
+                let c = gate_claim_and_escalate(
                     &shared,
                     &json!({
                         "plugin_id": "claude-code",
@@ -17482,7 +18181,7 @@ mod tests {
             let shared = shared.clone();
             let sid = sid.clone();
             async move {
-                let c = tool_gate_escalation_claim(
+                let c = gate_claim_and_escalate(
                     &shared,
                     &json!({
                         "plugin_id": "claude-code",
@@ -17605,7 +18304,7 @@ mod tests {
         // Nothing to claim, so this opens — the auto-open the gate performs on every refused
         // governance write. Same marker the open-door tests use, so `bar_for` selects the arm
         // that invites peers and the two doors are being asked the same question.
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex",
@@ -17663,7 +18362,10 @@ mod tests {
         // WHICH DOOR. Before this change the two payloads were distinguishable only by an
         // accident of which keys each happened to carry; unifying them destroys that
         // discriminator, so it is replaced with a deliberate one rather than lost.
-        assert_eq!(d["opened_via"], "claim", "{d}");
+        // dp 2026-11-05: an escalation of a refused claim is the member's deliberate act with
+        // an explicit act, so it is recorded as the member door ("open"), and says where from.
+        assert_eq!(d["opened_via"], "open", "{d}");
+        assert!(d["escalated_from"].as_str().is_some_and(|r| r.starts_with("refusal-")), "{d}");
 
         // AND NOBODY WAS WOKEN, because the asker is a bare string. This is not the fix
         // failing — it is the half of the remedy that lives in the hook, asserted so that the
@@ -17699,7 +18401,7 @@ mod tests {
             session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
         }
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex",
@@ -17786,7 +18488,7 @@ mod tests {
         // exactly the tier the old alphabetical tie-break decided by name length and luck.
         shared.lock().await.inbox_store.drain_member("kimi-code").unwrap();
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex",
@@ -17908,7 +18610,7 @@ mod tests {
             let sid = session_of["codex"].clone();
             let act = act.to_string();
             async move {
-                tool_gate_escalation_claim(
+                gate_claim_and_escalate(
                     &shared,
                     &json!({
                         "plugin_id": "codex",
@@ -17986,7 +18688,7 @@ mod tests {
             )
             .expect("the filler mints");
         }
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex",
@@ -18093,7 +18795,7 @@ mod tests {
 
         // A marker outside the two-factor list, so `bar_for` returns `SingleApprover` — the
         // same marker shape the live escalations above carried.
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex",
@@ -18246,7 +18948,7 @@ mod tests {
             );
         }
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "claude-code",
@@ -18404,7 +19106,7 @@ mod tests {
             s.inbox_store.drain_member("fresh-drain").unwrap();
         }
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "claude-code",
@@ -18491,7 +19193,7 @@ mod tests {
             session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
         }
 
-        let err = tool_gate_escalation_claim(
+        let err = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex",
@@ -18526,6 +19228,7 @@ mod tests {
         assert_eq!(row.event_data["proven_plugin_id"], "claude-code");
         assert_eq!(row.event_data["spent"], false);
         assert_eq!(row.event_data["request_key"], "a".repeat(64));
+        assert_eq!(row.event_data["request_key_basis"], "caller_supplied");
         // The chain is broadly readable; the session id is a live capability.
         let prefix = row.event_data["session_prefix"].as_str().unwrap();
         assert_eq!(prefix.len(), 8, "a prefix, not the whole session: {prefix}");
@@ -18541,7 +19244,7 @@ mod tests {
     /// Open + sovereign-approve, the setup half of the claim-joinability test below —
     /// a plain fn rather than a closure so the borrows across `.await` stay obvious.
     async fn open_and_sovereign_approve(shared: &SharedState, session: &str, marker: &str) {
-        let opened = tool_gate_escalation_claim(
+        let opened = gate_claim_and_escalate(
             shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -18584,6 +19287,133 @@ mod tests {
             .event_data
     }
 
+    // ---- dp, 2026-11-05: "all escalations should be deliberate acts by agent, with reason."
+
+    fn gov_claim_args(session: &str, marker: &str) -> serde_json::Value {
+        json!({
+            "plugin_id": "kimi-code",
+            "session_id": session,
+            "tool_name": "Edit",
+            "marker": marker,
+            "reason": format!("Edit -> {marker}"),
+            "detail": "Auto-opened by the gate on a refused write; the member stated no rationale",
+        })
+    }
+
+    async fn connect_as(shared: &SharedState, who: &str) -> String {
+        let r = tool_connect(shared, &json!({ "plugin_id": who, "host_agent": "h" })).await.unwrap();
+        r["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// The claim alone ASKS NOTHING: no escalation, no opened row, nobody invited. It answers
+    /// `not_asked` with a refusal id and the deliberate door, and a re-issue keeps the id.
+    #[tokio::test]
+    async fn gate_claim_alone_opens_no_escalation_and_names_the_deliberate_door() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let marker = "plugins/_shared/hestia_single_gate.py";
+        let r = tool_gate_escalation_claim(&shared, &gov_claim_args(&session, marker)).await.unwrap();
+        assert_eq!(r["not_asked"], json!(true), "{r}");
+        assert_eq!(r["permits_write"], json!(false));
+        assert!(r["escalation_id"].is_null(), "{r}");
+        let rid = r["refusal_id"].as_str().unwrap().to_string();
+        assert!(rid.starts_with("refusal-"), "{rid}");
+        let detail = r["detail"].as_str().unwrap();
+        assert!(detail.contains("nothing was sent to the operator or to any peer"), "{detail}");
+        assert!(detail.contains(&format!("hestia gate escalate {rid} --as kimi-code")), "{detail}");
+        // An older gate prints `error` when no id comes back; it must read true.
+        assert!(r["error"].as_str().unwrap().starts_with("not asked"), "{r}");
+        {
+            let s = shared.lock().await;
+            assert!(s.gate_escalations.pending(crate::server::gate_escalation::now_secs()).is_empty(), "nothing minted");
+            assert!(
+                !s.recent_chain(50).iter().any(|e| e.event_type == "gate_escalation_opened"),
+                "no opened row"
+            );
+        }
+        let again = tool_gate_escalation_claim(&shared, &gov_claim_args(&session, marker)).await.unwrap();
+        assert_eq!(again["refusal_id"], json!(rid), "a re-issue keeps the id: {again}");
+        assert_eq!(shared.lock().await.governance_refusals[&rid].reissues, 1);
+    }
+
+    /// The deliberate escalation opens the escalation the gate would have opened, with the
+    /// member's reason; a re-issue while it is pending folds into it; after approval the
+    /// gate's byte-identical re-issue spends it.
+    #[tokio::test]
+    async fn gate_escalate_opens_with_the_members_reason_and_the_reissue_claims_it() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let marker = "plugins/_shared/hestia_gate_core.py";
+        let r = tool_gate_escalation_claim(&shared, &gov_claim_args(&session, marker)).await.unwrap();
+        let rid = r["refusal_id"].as_str().unwrap().to_string();
+        let reason = "fixing the deny text the member sees after a refused write";
+        let opened = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": rid, "reason": reason,
+        })).await.unwrap();
+        assert_eq!(opened["claimed"], json!(false), "an escalation never permits: {opened}");
+        assert_eq!(opened["permits_write"], json!(false));
+        assert_eq!(opened["escalated_from"], json!(rid));
+        let esc_id = opened["escalation_id"].as_str().expect("opened").to_string();
+        {
+            let s = shared.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).unwrap();
+            assert_eq!(esc.stated_reason.as_deref(), Some(reason), "the member's reason, not the act");
+            assert!(esc.stated_detail.as_deref().unwrap_or("").contains("deliberate act"), "{:?}", esc.stated_detail);
+            assert_eq!(esc.act_text.as_deref(), Some(format!("Edit -> {marker}").as_str()), "the gate's act");
+            assert_eq!(esc.opened_via, crate::server::gate_escalation::OpenedVia::Open);
+            let row = s.recent_chain(50).into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened").expect("witnessed");
+            assert_eq!(row.event_data["escalated_from"], json!(rid));
+            assert_eq!(row.event_data["member_reason"], json!(reason));
+            assert!(!s.governance_refusals.contains_key(&rid), "escalated refusals are consumed");
+        }
+        // Pending: the gate's re-issue answers with the member's own ask, not a new refusal.
+        let fold = tool_gate_escalation_claim(&shared, &gov_claim_args(&session, marker)).await.unwrap();
+        assert_eq!(fold["coalesced"], json!(true), "{fold}");
+        assert_eq!(fold["escalation_id"], json!(esc_id));
+        // Approved: the byte-identical re-issue spends it.
+        shared.lock().await.gate_escalations.decide(
+            &esc_id, true, "operator", "role:constellation:sovereign",
+            crate::server::gate_escalation::Channel::OperatorSession, None, Some("ok"),
+            crate::server::gate_escalation::now_secs()).unwrap();
+        let spent = tool_gate_escalation_claim(&shared, &gov_claim_args(&session, marker)).await.unwrap();
+        assert_eq!(spent["claimed"], json!(true), "{spent}");
+        assert_eq!(spent["escalation_id"], json!(esc_id));
+    }
+
+    /// Only the refused member, with a real reason, on a live id.
+    #[tokio::test]
+    async fn gate_escalate_refuses_another_member_a_thin_reason_and_an_unknown_id() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let other = connect_as(&shared, "codex").await;
+        let r = tool_gate_escalation_claim(
+            &shared, &gov_claim_args(&session, "plugins/_shared/hestia_gate_mechanism.py")).await.unwrap();
+        let rid = r["refusal_id"].as_str().unwrap().to_string();
+        let thin = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": rid, "reason": "need it",
+        })).await.unwrap();
+        assert!(thin.to_string().contains("hestia.escalate_reason_thin"), "{thin}");
+        let theirs = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "codex", "session_id": other, "refusal_id": rid,
+            "reason": "a different member trying to ask for this write",
+        })).await.unwrap();
+        assert!(theirs.to_string().contains("hestia.escalate_not_yours"), "{theirs}");
+        let forged = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": other, "refusal_id": rid,
+            "reason": "a session that belongs to someone else",
+        })).await.unwrap();
+        assert!(forged.to_string().contains("hestia.escalate_asker_mismatch"), "{forged}");
+        let unknown = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": "refusal-000000000000",
+            "reason": "an id that was never recorded here",
+        })).await.unwrap();
+        assert!(unknown.to_string().contains("hestia.escalate_refusal_unknown"), "{unknown}");
+        let s = shared.lock().await;
+        assert!(s.gate_escalations.pending(crate::server::gate_escalation::now_secs()).is_empty(), "none of those opened anything");
+        assert!(s.governance_refusals.contains_key(&rid), "the refusal is still escalatable");
+    }
+
     /// The claim door's REFUSAL RESPONSE carries `decided_awaiting_claim`, and it is the
     /// same list `opened_payload` writes to the chain. Measured 2026-09-01 (`db0b02` →
     /// `c9af97ae`, finding `three-petitions-one-cp-the-daemon-knew-20260901.md`): the field
@@ -18606,7 +19436,7 @@ mod tests {
         // First refusal: nothing decided yet, so the key must be PRESENT and EMPTY. An
         // absent key and an empty list are the same row to a census, and a hook that
         // renders "nothing of yours to spend" has to be able to tell them apart.
-        let first = tool_gate_escalation_claim(
+        let first = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -18646,7 +19476,7 @@ mod tests {
         // The member re-issues with `&& echo LANDED` appended — a different digest (#539) —
         // under the same marker. Refused, a second petition opens, and THIS response is the
         // one surface the refused member is certainly reading.
-        let second = tool_gate_escalation_claim(
+        let second = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -18810,7 +19640,7 @@ mod tests {
             );
         }
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "claude-code",
@@ -18903,7 +19733,7 @@ mod tests {
 
         // The claiming call the hook makes: attempted act in `reason`, and the per-wake key
         // echoed in `host_session_id` — where it is CHECKED against the session, not used.
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -18943,7 +19773,7 @@ mod tests {
             .unwrap();
         let bare_session = r2["sessionId"].as_str().unwrap().to_string();
         open_and_sovereign_approve(&shared, &bare_session, "KINDS.md").await;
-        let sparse = tool_gate_escalation_claim(
+        let sparse = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -18969,7 +19799,7 @@ mod tests {
         // The explicit-null discipline this test exists to guard is still guarded, on the
         // field that can legitimately be absent: a caller may prove no host session. Claim
         // again, naming the act, with no host session sent.
-        let named = tool_gate_escalation_claim(
+        let named = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -19056,7 +19886,7 @@ mod tests {
             "act": ACT,
             "reason": WHY,
         });
-        let claimed = tool_gate_escalation_claim(&shared, &claim_args).await.unwrap();
+        let claimed = gate_claim_and_escalate(&shared, &claim_args).await.unwrap();
         assert_eq!(
             claimed["claimed"], true,
             "the explicit act must spend its approval: {claimed}"
@@ -19076,7 +19906,7 @@ mod tests {
         // Single use remains load-bearing: the same exact act cannot spend the approval twice.
         // `claim` is claim-or-open, so the retry opens a fresh pending ask rather than reusing
         // the approved id; both halves are asserted to distinguish those states.
-        let retry = tool_gate_escalation_claim(&shared, &claim_args).await.unwrap();
+        let retry = gate_claim_and_escalate(&shared, &claim_args).await.unwrap();
         assert_eq!(
             retry["claimed"], false,
             "the approval was already spent: {retry}"
@@ -19193,7 +20023,7 @@ mod tests {
             "a grant nobody has claimed carries no spend instant: {live}"
         );
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "claude-code",
@@ -19435,7 +20265,7 @@ mod tests {
             "marker": "hestia_governance_closure.py", "reason": act, "invocation_key": inv,
         });
 
-        let opened = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-open")).await.unwrap();
+        let opened = gate_claim_and_escalate(&shared, &claim(&asker, ACT, "inv-open")).await.unwrap();
         let id = opened["escalation_id"].as_str().unwrap().to_string();
         {
             let mut s = shared.lock().await;
@@ -19448,9 +20278,9 @@ mod tests {
             assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
         }
 
-        let sib = tool_gate_escalation_claim(&shared, &claim(&sibling, ACT, "inv-sib")).await.unwrap();
+        let sib = gate_claim_and_escalate(&shared, &claim(&sibling, ACT, "inv-sib")).await.unwrap();
         assert_ne!(sib["claimed"], json!(true), "a sibling session's re-issue claimed the asker's grant: {sib}");
-        let other = tool_gate_escalation_claim(&shared, &claim(&asker, "Bash: git apply /tmp/other.patch", "inv-other"))
+        let other = gate_claim_and_escalate(&shared, &claim(&asker, "Bash: git apply /tmp/other.patch", "inv-other"))
             .await.unwrap();
         assert_ne!(other["claimed"], json!(true), "a different act claimed the grant: {other}");
         {
@@ -19462,7 +20292,7 @@ mod tests {
         // Nova's review of #1363: observation only AFTER the authenticated session binding.
         // (a) No session at all: an unattributed caller naming the asker's member and exact act
         //     has no proven host session, so nothing is observed and nothing is claimed.
-        let anon = tool_gate_escalation_claim(&shared, &json!({
+        let anon = gate_claim_and_escalate(&shared, &json!({
             "plugin_id": "claude-code", "tool_name": "Bash", "marker": "hestia_governance_closure.py",
             "reason": ACT, "invocation_key": "inv-anon",
         })).await;
@@ -19473,7 +20303,7 @@ mod tests {
         //     refuses the call before observation, so the grant stays unobserved.
         let mut forged = claim(&asker, ACT, "inv-forged");
         forged["host_session_id"] = json!("hs-sibling");
-        let refused = tool_gate_escalation_claim(&shared, &forged).await;
+        let refused = gate_claim_and_escalate(&shared, &forged).await;
         assert!(refused.is_err(), "a mismatched host_session_id must be refused: {refused:?}");
         {
             let s = shared.lock().await;
@@ -19482,7 +20312,7 @@ mod tests {
                     "neither the unattributed nor the forged call may observe or spend: {e:?}");
         }
 
-        let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
+        let mine = gate_claim_and_escalate(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
         assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
         assert_eq!(mine["escalation_id"], json!(id), "{mine}");
     }
@@ -19621,7 +20451,7 @@ mod tests {
         let session = r["sessionId"].as_str().unwrap().to_string();
         open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -19673,7 +20503,7 @@ mod tests {
         let session = r["sessionId"].as_str().unwrap().to_string();
         open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
 
-        let err = tool_gate_escalation_claim(
+        let err = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -19707,6 +20537,7 @@ mod tests {
         assert_eq!(refused.event_data["proven_host_session_id"], "host-wake-proven");
         assert_eq!(refused.event_data["spent"], false);
         assert_eq!(refused.event_data["request_key"], "b".repeat(64));
+        assert_eq!(refused.event_data["request_key_basis"], "caller_supplied");
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_claimed"),
             "a refused claim must mint NO claimed row — a spend recorded for a write that \
@@ -19714,8 +20545,40 @@ mod tests {
         );
         drop(rows);
 
+        let err = gate_claim_and_escalate(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook>",
+                "host_session_id": "host-wake-asserted-elsewhere",
+            }),
+        )
+        .await
+        .expect_err("the derived-key arm must refuse the same mismatch");
+        assert!(err.to_string().contains("host session mismatch"), "{err}");
+        let rows = shared.lock().await.recent_chain(50);
+        let refused = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "host session mismatch"
+                    && e.event_data["request_key_basis"] == "derived_identity_mismatch"
+            })
+            .expect("a mismatch without a caller key must record its derived basis");
+        assert_eq!(
+            refused.event_data["request_key"],
+            crate::server::gate_escalation::request_key_for_act(
+                "kimi-code", "<gate-hook>", "Edit -> <gate-hook>", Some("host-wake-proven"),
+            )
+        );
+        assert_eq!(refused.event_data["spent"], false);
+        drop(rows);
+
         // And the approval was not burned by the refusal: the corrected claim still works.
-        let ok = tool_gate_escalation_claim(
+        let ok = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -19758,7 +20621,7 @@ mod tests {
         let session = r["sessionId"].as_str().unwrap().to_string();
         open_and_sovereign_approve(&shared, &session, "<gate-hook>").await;
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -19832,11 +20695,32 @@ mod tests {
                 "codex", "pre_tool_use.py", "Edit -> pre_tool_use.py", None,
             )
         );
+        assert_eq!(row.event_data["request_key_basis"], "derived_identity_mismatch");
         // O: a denied act leaves state bit-identical — nothing was opened.
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_opened"),
             "a refused open must not also open: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn refusal_request_key_basis_is_explicit() {
+        let (_dir, shared) = make_shared_state();
+        let s = shared.lock().await;
+        for (act, mismatch, expected) in [
+            (Some("Edit -> pre_tool_use.py"), false, "derived"),
+            (Some(""), false, "derived_without_act"),
+            (Some("Edit -> pre_tool_use.py"), true, "derived_identity_mismatch"),
+        ] {
+            let (key, basis) = refusal_request_key(
+                &s, "kimi-code", "pre_tool_use.py", act, None, None, mismatch);
+            assert!(crate::server::gate_escalation::valid_request_key(&key));
+            assert_eq!(basis, expected);
+        }
+        let supplied = "a".repeat(64);
+        let (_, basis) = refusal_request_key(
+            &s, "kimi-code", "pre_tool_use.py", Some(""), None, Some(&supplied), true);
+        assert_eq!(basis, "caller_supplied", "a caller key keeps its basis even across a mismatch");
     }
 
     #[tokio::test]
@@ -19847,6 +20731,10 @@ mod tests {
         })).await.unwrap();
         let session = r["sessionId"].as_str().unwrap().to_string();
 
+        // #1497 (dp, 2026-11-05): a claim with nothing approved or pending opens nothing and
+        // writes no chain row; the refusal is recorded in memory and answered `not_asked`.
+        // Identical retries collapse on ONE refusal id, the in-memory twin of the stable key.
+        let mut refusal_ids = Vec::new();
         for _ in 0..2 {
             let refused = tool_gate_escalation_claim(&shared, &json!({
                 "plugin_id": "kimi-code", "session_id": session,
@@ -19854,7 +20742,11 @@ mod tests {
                 "request_key": "d".repeat(64),
             })).await.unwrap();
             assert_eq!(refused["claimed"], false, "an unnamed act is refused: {refused}");
+            assert_eq!(refused["not_asked"], true, "and nothing was asked: {refused}");
+            refusal_ids.push(refused["refusal_id"].as_str().unwrap_or("").to_string());
         }
+        assert!(refusal_ids[0].starts_with("refusal-"), "{refusal_ids:?}");
+        assert_eq!(refusal_ids[0], refusal_ids[1], "a retry keeps its refusal id: {refusal_ids:?}");
         let err = tool_gate_escalation_open(&shared, &json!({
             "plugin_id": "kimi-code", "session_id": session,
             "role": "role:constellation:member", "tool_name": "Bash",
@@ -19867,15 +20759,51 @@ mod tests {
             .filter(|e| e.event_type == "gate_escalation_refused")
             .map(|e| e.event_data["request_key"].as_str().unwrap_or("").to_string())
             .collect();
-        assert_eq!(keys.len(), 3, "two claim refusals and one open refusal: {rows:?}");
+        assert_eq!(keys.len(), 1, "only the open refusal is on the chain: {rows:?}");
         let supplied = "d".repeat(64);
-        assert_eq!(keys.iter().filter(|key| key.as_str() == supplied.as_str()).count(), 2,
-                   "identical claim retries collapse on the supplied key: {keys:?}");
+        assert!(!keys.contains(&supplied), "an unasked claim refusal is not on the chain: {keys:?}");
         let derived = crate::server::gate_escalation::request_key_for_act(
             "kimi-code", "pre_tool_use.py", "", Some("wake-540"),
         );
         assert!(keys.contains(&derived), "the open refusal derives the same hook rule: {keys:?}");
         assert!(keys.iter().all(|key| crate::server::gate_escalation::valid_request_key(key)));
+        let open_row = rows.iter().find(|e| e.event_type == "gate_escalation_refused").unwrap();
+        assert_eq!(open_row.event_data["request_key_basis"], "derived_without_act");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_claimed"),
+                "#540 chain invariant: claimed without decided is zero");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_decided"),
+                "the fixture has not decided an escalation yet");
+        drop(rows);
+
+        let opened = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap();
+        let peer = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h",
+        })).await.unwrap();
+        let decided = tool_gate_arbitrate_escalation(&shared, &json!({
+            "escalation_id": esc_id, "approve": true,
+            "session_id": peer["sessionId"], "reason": "cross-peer approval for the claim invariant",
+        })).await.unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+        let claimed = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+
+        let rows = shared.lock().await.recent_chain(50);
+        let approved = rows.iter().filter(|e| {
+            e.event_type == "gate_escalation_decided" && e.event_data["status"] == "approved"
+        }).count();
+        let claimed = rows.iter().filter(|e| e.event_type == "gate_escalation_claimed").count();
+        assert_eq!(approved, 1, "the invariant needs a real approved decision: {rows:?}");
+        assert!(claimed <= approved,
+                "#540 chain invariant: every claimed row needs an approved decision: {rows:?}");
     }
 
     /// Negative control for both tests above. A row that appears no matter what the guard
@@ -19926,7 +20854,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let opened = tool_gate_escalation_claim(
+        let opened = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code", "session_id": session,
@@ -19973,7 +20901,7 @@ mod tests {
                     .to_string(),
             );
         }
-        let opened = tool_gate_escalation_claim(
+        let opened = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex", "session_id": sessions["codex"],
@@ -21250,7 +22178,7 @@ mod tests {
         .unwrap();
         let sid = conn["sessionId"].as_str().unwrap().to_string();
 
-        let claimed = tool_gate_escalation_claim(
+        let claimed = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code",
@@ -21451,6 +22379,8 @@ mod open_appeals_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: format!("lct:{m}"),
                     connected_at: Utc::now(),
                     host_session_id: None,
@@ -22415,7 +23345,7 @@ mod ladder_evidence_tests {
         let state = open_state(&dir);
         let src = write_src(dir.path(), "incoming.py", b"one\ntwo\n");
         let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
-        let _ = tool_gate_escalation_claim(&state, &json!({
+        let _ = gate_claim_and_escalate(&state, &json!({
             "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
             "marker": "plugins/*/hooks", "reason": act,
         })).await;
@@ -22430,7 +23360,9 @@ mod ladder_evidence_tests {
         let ev = &b["evidence"];
         assert_eq!(ev["act_text"], json!(act), "{ev}");
         assert!(!ev["write_effect"].is_null(), "the bound act is a measurable copy: {ev}");
-        assert_eq!(ev["escalation"]["opened_via"], json!("claim"), "{ev}");
+        // dp 2026-11-05: the claim door no longer opens; the member's deliberate escalation
+        // does, with an explicit act, which is the member door's shape.
+        assert_eq!(ev["escalation"]["opened_via"], json!("open"), "{ev}");
         assert_eq!(
             json!(crate::server::gate_escalation::EscalationStore::act_digest_of(&act)),
             ev["escalation"]["act_digest"], "{ev}"
@@ -22446,7 +23378,7 @@ mod ladder_evidence_tests {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
         let path = "/repo/deploy/install-members.sh";
-        let _ = tool_gate_escalation_claim(&state, &json!({
+        let _ = gate_claim_and_escalate(&state, &json!({
             "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Edit",
             "marker": "deploy/install-members.sh", "reason": path,
         })).await;
@@ -22532,6 +23464,8 @@ mod appeal_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: APPELLANT_ROLE.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -23659,6 +24593,126 @@ mod appeal_tests {
         );
     }
 
+    /// The dashboard escalation feed (#869) is tested in JS against
+    /// `tools/dashboard_escalation_feed_fixture.json`. That fixture is only worth what its
+    /// shapes are worth: the first version of the feed read a `granted` key no ruling row
+    /// has, and an `escalation_id` key no pending item has, and its hand-written fixtures
+    /// had both. This drives the REAL writers (open, peer approve, peer deny, self-withdraw,
+    /// one left pending), takes the snapshot `/api/dashboard` serves, and holds the
+    /// fixture to it: same rows, same keys, same dispositions. Regenerate with
+    /// `HESTIA_WRITE_FEED_FIXTURE=1` after a deliberate writer change.
+    #[tokio::test]
+    async fn the_dashboard_feed_fixture_matches_what_the_daemon_writes() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker = seat(&state, "claude-code").await;
+        let peer = seat(&state, "codex").await;
+        let open = |marker: &'static str| {
+            let state = state.clone();
+            async move {
+                let o = tool_gate_escalation_open(&state, &json!({
+                    "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": marker,
+                    "act": format!("policy_edit -> {marker}"),
+                    "reason": "the deny blocks a legitimate rule addition",
+                    "session_id": asker.to_string(),
+                })).await.unwrap();
+                o["escalation_id"].as_str().unwrap().to_string()
+            }
+        };
+        let rule = |id: String, approve: bool, sid: Uuid| {
+            let state = state.clone();
+            async move {
+                let r = tool_gate_arbitrate_escalation(&state, &json!({
+                    "escalation_id": id, "approve": approve, "session_id": sid.to_string(),
+                    "reason": "reviewed",
+                })).await.unwrap();
+                assert!(r.get("_hestia_error").is_none(), "{r}");
+            }
+        };
+        let approved = open("policy.json").await;
+        rule(approved.clone(), true, peer).await;
+        let denied = open("law.json").await;
+        rule(denied.clone(), false, peer).await;
+        let withdrawn = open("witness.py").await;
+        rule(withdrawn.clone(), false, asker).await;
+        let pending = open("pending.json").await;
+
+        let snap = serde_json::to_value(state.lock().await.dashboard_snapshot(200)).unwrap();
+        // Stable labels for the per-run ids, so the fixture is readable and diffable.
+        let ids = [
+            (&approved, "a0a0a0a0approved"),
+            (&denied, "d0d0d0d0denied00"),
+            (&withdrawn, "w0w0w0w0withdrwn"),
+            (&pending, "p0p0p0p0pending0"),
+        ];
+        let relabel = |v: &Value| -> Value {
+            let mut t = v.to_string();
+            for (real, label) in &ids {
+                t = t.replace(real.as_str(), label);
+            }
+            serde_json::from_str(&t).unwrap()
+        };
+        let mut recent: Vec<Value> = snap["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"].as_str().unwrap().starts_with("gate_escalation_"))
+            .map(|e| {
+                let mut e = relabel(e);
+                let pos = e["chain_position"].clone();
+                e["hash"] = json!(format!("hash-{pos}"));
+                e["prev_hash"] = json!("prev");
+                e["timestamp"] = json!("2026-11-23T00:00:00Z");
+                e
+            })
+            .collect();
+        recent.retain(|e| e.get("escalation_id").is_some());
+        let pending_items: Vec<Value> =
+            snap["pending_escalations"].as_array().unwrap().iter().map(relabel).collect();
+        let real = json!({"recent": recent, "pending_escalations": pending_items});
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tools/dashboard_escalation_feed_fixture.json");
+        if std::env::var_os("HESTIA_WRITE_FEED_FIXTURE").is_some() {
+            std::fs::write(&path, serde_json::to_string_pretty(&real).unwrap() + "\n").unwrap();
+        }
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let (want, got) = (fixture["recent"].as_array().unwrap(), real["recent"].as_array().unwrap());
+        assert_eq!(want.len(), got.len(), "fixture rows vs real rows: {got:#?}");
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!(keys(w), keys(g), "a feed row's keys drifted from the writer: {g:#}");
+            for k in ["event_type", "escalation_id", "plugin_id", "marker", "status",
+                      "decided_by", "decided_via", "bar", "bar_met"] {
+                assert_eq!(w.get(k), g.get(k), "{k} drifted from the writer: {g:#}");
+            }
+        }
+        // The two dispositions the feed must tell apart are on the ruling rows, as `status`.
+        let ruling = |id: &str| got.iter()
+            .find(|e| e["escalation_id"] == id && e["event_type"] == "gate_escalation_decided")
+            .unwrap_or_else(|| panic!("no ruling row for {id}: {got:#?}"));
+        assert_eq!(ruling("a0a0a0a0approved")["status"], "approved");
+        assert_eq!(ruling("d0d0d0d0denied00")["status"], "denied");
+        assert!(got.iter().all(|e| e.get("granted").is_none()), "no feed row carries `granted`");
+
+        let (want, got) = (
+            fixture["pending_escalations"].as_array().unwrap(),
+            real["pending_escalations"].as_array().unwrap(),
+        );
+        assert_eq!(want.len(), got.len(), "{got:#?}");
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!(keys(w), keys(g), "a pending item's keys drifted: {g:#}");
+            assert_eq!(w["id"], g["id"]);
+        }
+        assert_eq!(got[0]["id"], "p0p0p0p0pending0", "a pending item names its escalation `id`");
+    }
+
     /// Minting site C, the peer-ruling path (#459): a member ruling on an escalation
     /// tells the ASKER. Minted at the tool handler, the layer that holds
     /// `SharedState` — the store's `decide` has no inbox access.
@@ -24327,6 +25381,75 @@ mod appeal_tests {
         );
     }
 
+    /// #823: a factor whose own evidence append fails must not remain visible to the
+    /// decider. The retry writes one attributable event, and replay reconstructs that
+    /// same factor without manufacturing events for historical snapshot-only factors.
+    #[tokio::test]
+    async fn an_unwitnessed_corroboration_leaves_no_decision_relevant_factor() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let args = json!({
+            "escalation_id": esc_id, "session_id": peer_sid.to_string(),
+            "stance": "dissent", "argument": "the proposed rule is broader than its evidence",
+        });
+
+        // Let factor validation and state mutation succeed while the witness write fails.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let failed = tool_gate_escalation_corroborate(&state, &args).await;
+        assert!(failed.is_err(), "an unwitnessed factor cannot report success: {failed:?}");
+        {
+            let s = state.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).expect("the prior escalation remains");
+            assert!(esc.factors.is_empty(), "the failed factor never became live: {esc:?}");
+            // NOVA (#1650): the bar this factor WOULD meet (asserted after the retry) is not
+            // met by the transient one — an evidence append failure has no approval effect.
+            assert!(!esc.bar_met(), "an unwitnessed factor does not meet the bar: {esc:?}");
+            assert!(s.chain_store.read_recent(500).unwrap().iter()
+                .all(|e| e.event_type != "gate_escalation_corroborated"),
+                "the failed append left no canonical factor event");
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let recorded = tool_gate_escalation_corroborate(&state, &args).await.unwrap();
+        assert!(recorded["witnessEntryHash"].is_string(), "the retry is durable: {recorded}");
+        assert_eq!(recorded["factors_present"].as_array().unwrap().len(), 1);
+        let s = state.lock().await;
+        assert!(s.gate_escalations.get(&esc_id).unwrap().bar_met(),
+                "the same factor, once witnessed, meets the bar the failed attempt did not");
+        let mut chain = s.chain_store.read_recent(500).unwrap();
+        chain.reverse();
+        let events: Vec<_> = chain.iter()
+            .filter(|e| e.event_type == "gate_escalation_corroborated")
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one canonical factor record");
+        assert_eq!(events[0].event_data["corroborated_by"], "codex");
+        assert_eq!(events[0].event_data["stance"], "dissent");
+        assert_eq!(events[0].event_data["argument"], "the proposed rule is broader than its evidence");
+
+        let mut replayed = crate::server::gate_escalation::EscalationStore::default();
+        replayed.rehydrate(&chain, crate::server::gate_escalation::now_secs());
+        let replayed_esc = replayed.get(&esc_id).expect("the committed factor replays");
+        assert_eq!(replayed_esc.factors.len(), 1);
+        assert_eq!(replayed_esc.factors[0].by, "codex");
+        assert!(replayed_esc.factors[0].dissent);
+        assert_eq!(replayed_esc.factors[0].argument.as_deref(),
+                   Some("the proposed rule is broader than its evidence"));
+        assert_eq!(serde_json::to_value(&replayed_esc.factors).unwrap(),
+                   recorded["factors_present"]);
+    }
+
     /// Revised #480 review, defect 2: WITNESS IS FINALITY. If the
     /// `gate_escalation_decided` append fails, the decision must not stand — the
     /// store is rolled back to Pending, nothing is claimable, and the caller gets
@@ -24408,6 +25531,8 @@ mod vault_hst001_tests {
             assigned_role: "citizen".into(),
             constellation_role: "role:constellation:member".into(),
             role_basis: None,
+            identity_basis: crate::server::state::IdentityBasis::Asserted,
+            canonical_principal: None,
             soft_lct: format!("lct:test:{plugin_id}"),
             connected_at: chrono::Utc::now(),
             host_session_id: None,
@@ -24686,6 +25811,34 @@ mod authority_attribution_tests {
             format!("{r}").contains("pair_inbox_unattributed"),
             "an unattributed paired-channel drain must be refused: {r}"
         );
+    }
+
+    #[tokio::test]
+    async fn pair_inbox_rejects_a_cross_origin_stored_endpoint_before_dialing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat_session(&state, "bystander-member").await;
+        {
+            let mut s = state.lock().await;
+            let mut store = crate::hub::HubStore::default();
+            store.connections.push(crate::hub::HubConnection {
+                id: Uuid::new_v4(),
+                url: "https://hub.example".into(),
+                hub_lct_id: Uuid::new_v4(),
+                our_lct_id: Uuid::new_v4(),
+                connected_at: Utc::now(),
+                last_seen: None,
+                api_version: "v1".into(),
+                rest_endpoint: "https://evil.example/v1".into(),
+                hubs_joined: vec![],
+                member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            });
+            store.save(&mut s.vault).unwrap();
+        }
+        let err = tool_pair_inbox(&state, &json!({"session_id": sid.to_string()}))
+            .await
+            .expect_err("a stored cross-origin endpoint must be refused before dialing");
+        assert!(err.to_string().contains("cross-origin discovery endpoint refused"), "{err}");
     }
 
     /// The fifth site, caught in review of this PR's own "zero call sites" claim:
@@ -25690,8 +26843,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
         // returned as a bare error the caller might log and forget.
         Err(e) => {
-            let attempt_key = refusal_request_key(
-                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None,
+            let (attempt_key, basis) = refusal_request_key(
+                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None, false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
@@ -25699,7 +26852,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
                     "plugin_id": plugin_id,
                     "tool_name": tool_name,
                     "marker": marker,
-                    "request_key": attempt_key,
+                    "request_key": attempt_key, "request_key_basis": basis,
                     "why": e.to_string(),
                 }),
             );
@@ -26669,13 +27822,38 @@ fn valid_act_digest(args: &Value) -> Option<String> {
 ///   * a request still PENDING for (member, path) answers `pending` with ITS id — a re-issue
 ///     never mints a second ask (legion-being, #956: nine ids for three paths);
 ///   * a REFUSED request inside its window answers `refused` — re-issuing does not reopen it;
-///   * otherwise a request is OPENED, carrying the act, the rule, the tool and the session,
-///     and the operator rules it once / for the session / standing, at the breadth they choose.
+///   * otherwise NOTHING IS OPENED (dp, 2026-11-05, reversing the 10-05 auto-open: "don't do
+///     gate-generated scope requests to the operator. instead, deny with option to escalate. if
+///     the agent really needs it, they can escalate as a deliberate act. 'opened by the gate on
+///     a refused bash' is noise."). The refusal is RECORDED (`GateRefusal`: in no queue, shown
+///     to nobody) and answered `not_asked` with a `refusal_id`. The member may then escalate it
+///     DELIBERATELY with `hestia_scope_escalate` (CLI: `hestia scope escalate`), giving its own
+///     reason; only that opens a request, carrying the gate's act, rule, tool and digest, and a
+///     peer or the operator rules it once / for the session / standing, as before.
+///
+///     Why the reversal: every refusal became an ask nobody made. Test text that merely
+///     mentioned a system path, or one exploratory `find`, reached the operator's queue as
+///     "<member> wants <path>", read as intent, and to a new user looks like an agent probing.
+///     The asker side suffered too: cbp-being treated requests it never chose as open loops
+///     and pinged the operator about them every five minutes (2026-11-05).
 ///
 /// WHAT IT CANNOT DO, by construction (`no_mcp_tool_can_decide_a_scope_request` and the
 /// behavioural tests below): it never sets `granted`, never touches the standing store, and
 /// spends only a one-time approval an operator made for this member and this act.
 pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolResult {
+    scope_claim_inner(state, args, None).await
+}
+
+/// A member's deliberate escalation of a recorded refusal: its own reason, and the act exactly
+/// as the gate recorded it (already capped and masked, so it is not re-cut).
+struct ScopeEscalation {
+    refusal_id: String,
+    reason: String,
+    act: String,
+}
+
+async fn scope_claim_inner(state: &SharedState, args: &Value,
+                           escalation: Option<ScopeEscalation>) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
     use crate::server::state::{
         normalize_scope_path, GateDenyOrigin, ScopeRequest, ScopeRequestExt,
@@ -26710,12 +27888,17 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     // made a cut act indistinguishable from a complete one — the shape #648's scope-path
     // instance was refused over), then re-masked on receipt — the layer-2 parity
     // `policy_decision.attempted` already has (see `redact_secrets`).
-    let act_raw = optional_string(args, "act").unwrap_or_default();
-    let act = redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
-        act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
-    } else {
-        act_raw
-    });
+    let act = match &escalation {
+        Some(e) => e.act.clone(),
+        None => {
+            let act_raw = optional_string(args, "act").unwrap_or_default();
+            redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
+                act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
+            } else {
+                act_raw
+            })
+        }
+    };
     let spend = args.get("spend").and_then(Value::as_bool).unwrap_or(true);
     let role = optional_string(args, "role").unwrap_or_default();
     let host_session_id = optional_string(args, "host_session_id");
@@ -26904,7 +28087,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         }));
     }
 
-    // (5) THE CAP.
+    // (5) NOT ASKED. Without a deliberate escalation the refusal is recorded and nothing opens.
+    let Some(escalation) = escalation else {
+        return Ok(record_gate_refusal(&mut s, now, GateRefusalDraft {
+            plugin_id: &plugin_id, role: &role, raw_path: trimmed, path: &path,
+            origin: GateDenyOrigin {
+                rule: rule.clone(), tool: tool.clone(), act: act.clone(),
+                act_digest: act_digest.clone(), request_key: key.clone(),
+                host_session_id: host_session_id.clone(), subtree, reissues: 0, asker_basis,
+                escalated_from: None, member_reason: None,
+            },
+            once_only: unpriceable.is_some(),
+        }));
+    };
+
+    // (5b) THE CAP — on deliberate escalations now, which should never reach it.
     let open_by_gate = s
         .scope_requests
         .values()
@@ -26931,10 +28128,11 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
         format!("scope-{hex}")
     };
-    // The record's `reason` says what happened, in the gate's voice — never presented as the
-    // member's rationale, because the member did not choose to ask.
+    // The record's `reason` leads with the MEMBER's own words (it chose to ask), then the gate's
+    // account of the refused act, so the decider has both.
     let reason = format!(
-        "opened by the gate on a refused {} ({rule}){}; act: {act}",
+        "{}. Escalated by the member from a refused {} ({rule}){}; act: {act}",
+        escalation.reason,
         if tool.is_empty() { "act" } else { tool.as_str() },
         if subtree {
             " — a glob over this directory: only a recursive grant covers it"
@@ -26956,6 +28154,8 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         subtree,
         reissues: 0,
         asker_basis,
+        escalated_from: Some(escalation.refusal_id.clone()),
+        member_reason: Some(escalation.reason.clone()),
     };
     // WHO DECIDES (dp, 2026-10-05: "scope escalations should go to peers not to me"): the
     // NOT-SAME peers, invited exactly as gate escalations invite them. An asserted asker cannot
@@ -26982,6 +28182,8 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             "reason": reason,
             "expires_at": expires_at,
             "origin": "gate_deny",
+            "escalated_from": escalation.refusal_id,
+            "member_reason": escalation.reason,
             "rule": rule,
             "tool_name": tool,
             "act": act,
@@ -26989,8 +28191,9 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             "request_key": key,
             "host_session_id": host_session_id,
             "subtree": subtree,
-            "assurance": "A1 — opened by the plugin gate on a refusal; the member asked nothing. \
-                          Tamper-EVIDENT, not tamper-proof.",
+            "assurance": "A1 — opened by the member's deliberate escalation of a gate refusal; the \
+                          act is the gate's record, the reason is the member's. Tamper-EVIDENT, \
+                          not tamper-proof.",
         }),
     )?;
     s.scope_requests.insert(
@@ -27028,9 +28231,11 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
                                               "dispatch_error": e.to_string()})),
         }
     }
+    s.gate_refusals.remove(&escalation.refusal_id);
     Ok(json!({
         "verdict": "opened",
         "permits": false,
+        "escalated_from": escalation.refusal_id,
         "request_id": id,
         "path": path,
         "subtree": subtree,
@@ -27042,12 +28247,176 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
         "how_to_decide": scope_how_to_decide(&id, invited.is_empty(), unpriceable.is_some()),
         "detail": if invited.is_empty() {
-            "refused; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
+            "escalated; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
              unproven or no admissible peer exists), so the operator decides"
         } else {
-            "refused; a scope request was opened and NOT-SAME peers were invited to decide it"
+            "escalated; a scope request was opened and NOT-SAME peers were invited to decide it"
         },
     }))
+}
+
+/// What the gate knew about one refusal, before it is recorded.
+struct GateRefusalDraft<'a> {
+    plugin_id: &'a str,
+    role: &'a str,
+    raw_path: &'a str,
+    path: &'a str,
+    origin: crate::server::state::GateDenyOrigin,
+    once_only: bool,
+}
+
+/// The id a refusal is escalated by: derived from member, path and act, so re-issuing the same
+/// refused act finds the same id rather than minting another.
+fn gate_refusal_id(plugin_id: &str, path: &str, act_digest: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("hestia:gate-refusal\u{1f}{plugin_id}\u{1f}{path}\u{1f}{act_digest}").as_bytes());
+    let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("refusal-{hex}")
+}
+
+/// Record a refusal (no chain row: the policy decision is already witnessed, and this is the
+/// deny's memory, not an act) and answer `not_asked` with the way forward.
+fn record_gate_refusal(s: &mut super::state::ServerState, now: u64, d: GateRefusalDraft) -> Value {
+    use crate::server::state::{GateRefusal, GATE_REFUSAL_MAX, GATE_REFUSAL_TTL_SECS};
+    let id = gate_refusal_id(d.plugin_id, d.path, &d.origin.act_digest);
+    s.gate_refusals.retain(|_, r| r.expires_at > now);
+    if !s.gate_refusals.contains_key(&id) && s.gate_refusals.len() >= GATE_REFUSAL_MAX {
+        if let Some(oldest) = s.gate_refusals.values().min_by_key(|r| r.refused_at).map(|r| r.id.clone()) {
+            s.gate_refusals.remove(&oldest);
+        }
+    }
+    let expires_at = now + GATE_REFUSAL_TTL_SECS;
+    let reissues = s.gate_refusals.get(&id).map(|r| r.origin.reissues.saturating_add(1)).unwrap_or(0);
+    let mut origin = d.origin;
+    origin.reissues = reissues;
+    let key = origin.request_key.clone();
+    s.gate_refusals.insert(id.clone(), GateRefusal {
+        id: id.clone(), plugin_id: d.plugin_id.to_string(), role: d.role.to_string(),
+        raw_path: d.raw_path.to_string(), path: d.path.to_string(), origin,
+        refused_at: now, expires_at,
+    });
+    let cli = format!("hestia scope escalate {id} --as {} --reason '<what you are doing, and why \
+                       it needs this path>'", d.plugin_id);
+    json!({
+        "verdict": "not_asked",
+        "permits": false,
+        "refusal_id": id,
+        "path": d.path,
+        "request_key": key,
+        "expires_at": expires_at,
+        "once_only": d.once_only,
+        "escalate": {
+            "tool": "hestia_scope_escalate",
+            "args": {"refusal_id": id, "reason": "<what you are doing, and why it needs this path>"},
+            "cli": cli,
+        },
+        "detail": format!(
+            "refused; nothing was sent to the operator or to any peer. If the work does not need \
+             this path, nothing more is owed. If it does, escalate as a deliberate act: {cli} \
+             (or hestia_scope_escalate with refusal_id {id}). The refusal stays escalatable for \
+             {} h; re-issuing the act keeps the same id.", GATE_REFUSAL_TTL_SECS / 3600),
+    })
+}
+
+/// `hestia_scope_escalate` — a member turns ONE recorded gate refusal into a scope request, as a
+/// deliberate act with its own reason (dp, 2026-11-05). The request carries the gate's record of
+/// the act (so a one-time approval still binds to exactly that act) and the member's reason, and
+/// is decided exactly as a gate-opened request was: by a NOT-SAME peer, the operator overriding.
+/// Only the member the gate refused may escalate its refusal.
+pub(crate) async fn tool_scope_escalate(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    let asserted = require_string(args, "plugin_id")?;
+    let refusal_id = require_string(args, "refusal_id")?;
+    {
+        let s = state.lock().await;
+        if !s.gate_refusals.contains_key(&refusal_id) && s.governance_refusals.contains_key(&refusal_id) {
+            drop(s);
+            // A governance-write refusal: the member copied the other command. Other door.
+            return Box::pin(tool_gate_escalation_escalate(state, args)).await;
+        }
+    }
+    let reason = require_string(args, "reason")?.trim().to_string();
+    if reason.len() < 12 {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_escalate_reason_thin",
+            "the reason is too thin to decide on. Say what you are doing and why this path is \
+             needed for it; the decider has only this sentence and the refused act. Nothing was \
+             opened",
+            None,
+        ));
+    }
+    let session_id_arg = optional_session_id(args);
+    let refusal = {
+        let s = state.lock().await;
+        if let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+            if who.plugin_id != asserted {
+                return Ok(hestia_error_envelope(
+                    "hestia.scope_claim_asker_mismatch",
+                    "the session you presented belongs to a different member than the plugin_id \
+                     you asserted; nothing was opened",
+                    Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+                ));
+            }
+        }
+        match s.gate_refusals.get(&refusal_id) {
+            Some(r) if r.expires_at > now_secs() => r.clone(),
+            _ => {
+                return Ok(hestia_error_envelope(
+                    "hestia.scope_refusal_unknown",
+                    "no live refusal has this id (it lapsed, the daemon restarted, or it was \
+                     already escalated). Re-issue the act: its deny names a fresh refusal id. \
+                     Nothing was opened",
+                    Some(json!({ "refusal_id": refusal_id })),
+                ));
+            }
+        }
+    };
+    if refusal.plugin_id != asserted {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_escalate_not_yours",
+            "a refusal is escalated only by the member the gate refused; nothing was opened",
+            Some(json!({ "refusal_id": refusal_id })),
+        ));
+    }
+    let o = &refusal.origin;
+    let mut inner = json!({
+        "plugin_id": refusal.plugin_id,
+        "role": refusal.role,
+        "path": refusal.raw_path,
+        "rule": o.rule,
+        "tool_name": o.tool,
+        "act_digest": o.act_digest,
+        "spend": false,
+    });
+    if let Some(h) = &o.host_session_id {
+        inner["host_session_id"] = json!(h);
+    }
+    if let Some(sid) = &session_id_arg {
+        inner["session_id"] = json!(sid);
+    }
+    scope_claim_inner(state, &inner, Some(ScopeEscalation {
+        refusal_id: refusal.id.clone(), reason, act: o.act.clone(),
+    })).await
+}
+
+/// TEST SEAM: the flow a member takes now — the gate's claim, then (if it was only recorded) a
+/// deliberate escalation of that refusal. Tests of what happens AFTER a request exists use this.
+#[cfg(test)]
+pub(crate) async fn claim_and_escalate(state: &SharedState, args: &Value) -> ToolResult {
+    let first = tool_scope_claim(state, args).await?;
+    if first["verdict"] != json!("not_asked") {
+        return Ok(first);
+    }
+    let mut e = json!({
+        "plugin_id": args["plugin_id"],
+        "refusal_id": first["refusal_id"],
+        "reason": "test: the member escalates this refusal deliberately",
+    });
+    if let Some(sid) = args.get("session_id") {
+        e["session_id"] = sid.clone();
+    }
+    tool_scope_escalate(state, &e).await
 }
 
 /// The recipe a gate-opened scope request names. Peers first (dp, 2026-10-05); the operator is
@@ -27913,6 +29282,39 @@ cannot be reclaimed again.",
 }
 
 async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
+    gate_escalation_claim_inner(state, args, None).await
+}
+
+/// A member's deliberate escalation of one recorded governance-write refusal. The act, marker,
+/// targets and payload come from the gate's own claim call (`GovernanceRefusal::claim_args`);
+/// the member supplies only the reason, which the args already carry by the time they get here.
+struct GovEscalation {
+    refusal_id: String,
+    member_reason: String,
+}
+
+/// CLAIM, AND NOTHING ELSE UNLESS ASKED (dp, 2026-11-05: "auto escalation should be
+/// emergency-only (i can't think what, at the moment). all escalations should be deliberate
+/// acts by agent, with reason.").
+///
+/// This door was claim-or-OPEN: every refused governance write minted an escalation, invited
+/// peers and landed on the operator's queue as "auto-opened by the gate; the member stated no
+/// rationale". The ruling for scope requests the same day (#1497) applies here unchanged. Now:
+///   - an approval for this act is spent exactly as before;
+///   - a PENDING escalation for this act (one the member already opened) is answered with its
+///     id, as before — that is the member's own ask, not a new one;
+///   - otherwise the refusal is RECORDED (`GovernanceRefusal`, memory-only) and the answer is
+///     `not_asked` with a refusal id. Nothing is minted, witnessed as an ask, or sent to anyone.
+///     The member escalates as a deliberate act through `hestia_gate_escalation_escalate`.
+///
+/// No emergency auto-open path exists: dp could name no case for one, and a speculative one
+/// would be the auto-open again under another name. If one is ever named, it is a listed
+/// exception here, not a flag a caller can set.
+async fn gate_escalation_claim_inner(
+    state: &SharedState,
+    args: &Value,
+    escalation: Option<GovEscalation>,
+) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
 
     reject_unknown_keys(
@@ -28125,15 +29527,23 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         s.gate_escalations
             .observe_reissue(&plugin_id, h, &marker, attempted_act.as_deref(), now);
     }
-    if let Some(esc) = s.gate_escalations.claim_bound(
-        &plugin_id,
-        &marker,
-        attempted_act.as_deref(),
-        attempted_payload.as_deref(),
-        incoming_bar,
-        now,
-    )
-    {
+    // AN ESCALATION NEVER SPENDS. It is a request for a ruling, not the act; the write it names
+    // is permitted only when the gate re-issues it. So the spend and reclaim paths below are
+    // the claim's alone.
+    let spend_allowed = escalation.is_none();
+    let spendable = if spend_allowed {
+        s.gate_escalations.claim_bound(
+            &plugin_id,
+            &marker,
+            attempted_act.as_deref(),
+            attempted_payload.as_deref(),
+            incoming_bar,
+            now,
+        )
+    } else {
+        None
+    };
+    if let Some(esc) = spendable {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
         // without which the record would show a permission granted and never show it used.
@@ -28262,11 +29672,14 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             incoming_bar,
             now,
         ) {
-            Ok(prev) => {
+            Ok(prev) if spend_allowed => {
                 return commit_reclaim(&mut s, &prev, k, &tool_name, proven_host_session_id.as_deref(),
                                       invocation_key.as_deref(), now,
                                       |s, kind, payload| s.append_chain(kind, payload));
             }
+            // An escalation never reclaims (it is not the act). If a lost answer is reclaimable,
+            // the gate's re-issue of the write reclaims it before anything this opens is asked.
+            Ok(_) => {}
             // "no record" is the ordinary case (a first claim): not worth saying.
             Err(why) if why != "no record for this request key" => reclaim_refused = Some(why),
             Err(_) => {}
@@ -28342,8 +29755,40 @@ than this act now prices (its resolved targets reach a stronger one). It is not 
 record is not repriced; this ask needs its own approval at the stronger bar.",
         }));
 
-    // Nothing to claim, so this write is REFUSED. Opening an escalation is not a maybe — it is
-    // the paperwork attached to a refusal that already happened.
+    // Nothing to claim, so this write is REFUSED. Whether anything is ASKED is the member's
+    // choice (dp, 2026-11-05). Without a deliberate escalation, the only ask this door answers
+    // with is one the member already opened and is still pending (the fold below); otherwise
+    // the refusal is recorded and nothing is minted.
+    if escalation.is_none()
+        && s.gate_escalations
+            .coalesce_target(&plugin_id, &marker, attempted_act.as_deref(), &resolved_targets,
+                             Some(&attempted_binding), now)
+            .is_none()
+    {
+        return Ok(record_governance_refusal(&mut s, now, GovernanceRefusalDraft {
+            plugin_id: &plugin_id,
+            marker: &marker,
+            act_digest: attempted_act_digest.as_deref().unwrap_or(""),
+            payload_sha256: attempted_payload.as_deref(),
+            claim_args: args,
+            request_key: request_key.as_deref(),
+            reclaim_refused,
+            bar_shortfall,
+        }));
+    }
+    let (stated_reason, stated_detail) = match &escalation {
+        // The member's reason, and a detail saying who chose to ask. Written here rather than
+        // trusted from the args, so no caller can label its ask "escalated by the member".
+        Some(e) => (
+            Some(e.member_reason.clone()),
+            Some(format!(
+                "Escalated by the member, as a deliberate act, from refused write {}. The reason \
+                 is the member's own; approving authorises this one write.",
+                e.refusal_id
+            )),
+        ),
+        None => (stated_reason, stated_detail),
+    };
     match s
         .gate_escalations
         .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
@@ -28410,9 +29855,17 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
                     .map(|uuid| uuid.to_string())
                     .as_deref(),
             );
-            // THE DOOR (#1066): claim-or-open, where `reason` may BE the act.
-            s.gate_escalations
-                .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Claim);
+            // THE DOOR (#1066). A deliberate escalation carries an explicit act and a real
+            // rationale, which is the member door's shape (`Open`); `Claim` (where `reason` may
+            // BE the act) remains only for rows a pending-fold or an older daemon wrote.
+            s.gate_escalations.record_opened_via(
+                &esc.id,
+                if escalation.is_some() {
+                    crate::server::gate_escalation::OpenedVia::Open
+                } else {
+                    crate::server::gate_escalation::OpenedVia::Claim
+                },
+            );
             // Re-read AFTER the recording, same reason as the member door: `open`
             // returned a pre-recording clone and the payload is built from it.
             let esc = s
@@ -28460,7 +29913,14 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
                 .unwrap_or_else(|| json!([]));
             let mut payload = payload;
             payload["request_key"] = json!(request_key);
+            if let Some(e) = &escalation {
+                payload["escalated_from"] = json!(e.refusal_id);
+                payload["member_reason"] = json!(e.member_reason);
+            }
             let entry = s.append_chain("gate_escalation_opened", payload)?;
+            if let Some(e) = &escalation {
+                s.governance_refusals.remove(&e.refusal_id);
+            }
             if let Some(k) = &request_key {
                 s.gate_escalations.record_request_key(
                     k,
@@ -28486,6 +29946,7 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
                 "claimed": false,
                 "permits_write": false,
                 "request_key": request_key,
+                "escalated_from": escalation.as_ref().map(|e| e.refusal_id.clone()),
                 // Why the spent permit this request already holds could not be reused, when it
                 // could not (#1169). Absent on an ordinary first claim.
                 "reclaim_refused": reclaim_refused,
@@ -28542,15 +30003,15 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             }))
         }
         Err(e) => {
-            let attempt_key = refusal_request_key(
+            let (attempt_key, basis) = refusal_request_key(
                 &s, &plugin_id, &marker, attempted_act.as_deref(), session_id_arg.as_deref(),
-                request_key.as_deref(),
+                request_key.as_deref(), false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
                 json!({
                     "plugin_id": plugin_id, "tool_name": tool_name,
-                    "marker": marker, "request_key": attempt_key, "why": e.to_string(),
+                    "marker": marker, "request_key": attempt_key, "request_key_basis": basis, "why": e.to_string(),
                 }),
             );
             // Still a refusal of the write — reported as one rather than as a tool error the
@@ -28565,6 +30026,200 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             }))
         }
     }
+}
+
+/// What the claim door knew about one refused governance write, before it is recorded.
+struct GovernanceRefusalDraft<'a> {
+    plugin_id: &'a str,
+    marker: &'a str,
+    act_digest: &'a str,
+    payload_sha256: Option<&'a str>,
+    claim_args: &'a Value,
+    request_key: Option<&'a str>,
+    reclaim_refused: Option<&'static str>,
+    bar_shortfall: Option<Value>,
+}
+
+/// The id a governance refusal is escalated by: derived from member, marker, act and bytes, so
+/// re-issuing the same refused write finds the same id. Shares the `refusal-` prefix with scope
+/// refusals (either escalate door accepts either id); the domain string keeps them apart.
+fn governance_refusal_id(plugin_id: &str, marker: &str, act_digest: &str, payload: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!(
+        "hestia:governance-refusal\u{1f}{plugin_id}\u{1f}{marker}\u{1f}{act_digest}\u{1f}{}",
+        payload.unwrap_or("")
+    ).as_bytes());
+    let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("refusal-{hex}")
+}
+
+/// Record a refused governance write (no chain row: the closure's refusal is already witnessed
+/// by the gate, and this is the deny's memory, not an ask) and answer `not_asked`.
+fn record_governance_refusal(s: &mut super::state::ServerState, now: u64, d: GovernanceRefusalDraft) -> Value {
+    use crate::server::state::{GovernanceRefusal, GATE_REFUSAL_MAX, GATE_REFUSAL_TTL_SECS};
+    let id = governance_refusal_id(d.plugin_id, d.marker, d.act_digest, d.payload_sha256);
+    s.governance_refusals.retain(|_, r| r.expires_at > now);
+    if !s.governance_refusals.contains_key(&id) && s.governance_refusals.len() >= GATE_REFUSAL_MAX {
+        if let Some(oldest) = s.governance_refusals.values().min_by_key(|r| r.refused_at).map(|r| r.id.clone()) {
+            s.governance_refusals.remove(&oldest);
+        }
+    }
+    let expires_at = now + GATE_REFUSAL_TTL_SECS;
+    let reissues = s.governance_refusals.get(&id).map(|r| r.reissues.saturating_add(1)).unwrap_or(0);
+    // The session is the gate's per-call connect; the escalation presents its own.
+    let mut claim_args = d.claim_args.clone();
+    if let Some(o) = claim_args.as_object_mut() {
+        o.remove("session_id");
+    }
+    s.governance_refusals.insert(id.clone(), GovernanceRefusal {
+        id: id.clone(),
+        plugin_id: d.plugin_id.to_string(),
+        marker: d.marker.to_string(),
+        claim_args,
+        reissues,
+        refused_at: now,
+        expires_at,
+    });
+    let cli = format!("hestia gate escalate {id} --as {} --reason '<what you are doing, and why \
+                       it needs this write>'", d.plugin_id);
+    let detail = format!(
+        "refused; nothing was sent to the operator or to any peer. If the work does not need this \
+         write, nothing more is owed. If it does, escalate as a deliberate act: {cli} (or \
+         hestia_gate_escalation_escalate with refusal_id {id}), then re-issue the write \
+         byte-for-byte once it is approved. The refusal stays escalatable for {} h; re-issuing \
+         the write keeps the same id.", GATE_REFUSAL_TTL_SECS / 3600);
+    json!({
+        "claimed": false,
+        "permits_write": false,
+        "not_asked": true,
+        "refusal_id": id,
+        "escalation_id": Value::Null,
+        "request_key": d.request_key,
+        "reclaim_refused": d.reclaim_refused,
+        "bar_shortfall": d.bar_shortfall,
+        "expires_at": expires_at,
+        "escalate": {
+            "tool": "hestia_gate_escalation_escalate",
+            "args": {"refusal_id": id, "reason": "<what you are doing, and why it needs this write>"},
+            "cli": cli,
+        },
+        "detail": detail,
+        // MIXED VERSIONS: a gate hook older than this daemon reads `error` when no escalation id
+        // comes back, and prints "refused, and NO escalation was opened — <error>". This makes
+        // that line true and gives the old hook's member the way forward.
+        "error": format!("not asked — {detail}"),
+        "then": "the write is refused",
+    })
+}
+
+/// `hestia_gate_escalation_escalate` — a member turns ONE recorded governance-write refusal into
+/// an escalation, as a deliberate act with its own reason (dp, 2026-11-05: "all escalations
+/// should be deliberate acts by agent, with reason"). The escalation is the one the gate would
+/// have opened (same act, marker, targets, bytes, price and request key) plus the member's
+/// reason; it is decided exactly as before. Only the refused member may escalate its refusal.
+/// It never permits the write: the gate's byte-identical re-issue claims the approval.
+pub(crate) async fn tool_gate_escalation_escalate(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    let asserted = require_string(args, "plugin_id")?;
+    let refusal_id = require_string(args, "refusal_id")?;
+    let reason = require_string(args, "reason")?.trim().to_string();
+    let session_id_arg = optional_session_id(args);
+    let refusal = {
+        let s = state.lock().await;
+        if !s.governance_refusals.contains_key(&refusal_id) && s.gate_refusals.contains_key(&refusal_id) {
+            drop(s);
+            // A scope refusal: the member copied the other command. Same act, other door.
+            return Box::pin(tool_scope_escalate(state, args)).await;
+        }
+        if reason.len() < 12 {
+            return Ok(hestia_error_envelope(
+                "hestia.escalate_reason_thin",
+                "the reason is too thin to decide on. Say what you are doing and why this write \
+                 is needed for it; the decider has only this sentence and the refused act. \
+                 Nothing was opened",
+                None,
+            ));
+        }
+        if let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+            if who.plugin_id != asserted {
+                return Ok(hestia_error_envelope(
+                    "hestia.escalate_asker_mismatch",
+                    "the session you presented belongs to a different member than the plugin_id \
+                     you asserted; nothing was opened",
+                    Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+                ));
+            }
+        }
+        match s.governance_refusals.get(&refusal_id) {
+            Some(r) if r.expires_at > now_secs() => r.clone(),
+            _ => {
+                return Ok(hestia_error_envelope(
+                    "hestia.escalate_refusal_unknown",
+                    "no live refusal has this id (it lapsed, the daemon restarted, or it was \
+                     already escalated). Re-issue the write: its deny names a fresh refusal id. \
+                     Nothing was opened",
+                    Some(json!({ "refusal_id": refusal_id })),
+                ));
+            }
+        }
+    };
+    if refusal.plugin_id != asserted {
+        return Ok(hestia_error_envelope(
+            "hestia.escalate_not_yours",
+            "a refusal is escalated only by the member the gate refused; nothing was opened",
+            Some(json!({ "refusal_id": refusal_id })),
+        ));
+    }
+    let mut inner = refusal.claim_args.clone();
+    // The gate sends its act as `reason`; the escalation names it as `act` so `reason` can be the
+    // member's. `act` wins in the claim door, so the binding is unchanged.
+    let act = inner.get("act").cloned()
+        .filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+        .or_else(|| inner.get("reason").cloned());
+    if let Some(o) = inner.as_object_mut() {
+        if let Some(a) = act {
+            o.insert("act".into(), a);
+        }
+        o.insert("reason".into(), json!(reason));
+        // The escalating session proves the asker; the gate's host-session assertion belonged to
+        // the gate's own call and is not re-asserted here (the derived value is what lands).
+        o.remove("host_session_id");
+        match &session_id_arg {
+            Some(sid) => { o.insert("session_id".into(), json!(sid)); }
+            None => { o.remove("session_id"); }
+        }
+    }
+    gate_escalation_claim_inner(state, &inner, Some(GovEscalation {
+        refusal_id: refusal.id.clone(),
+        member_reason: reason,
+    })).await
+}
+
+/// TEST SEAM: the flow a member takes now — the gate's claim, then (if it was only recorded) a
+/// deliberate escalation of that refusal. Tests of what happens AFTER an escalation exists use it.
+#[cfg(test)]
+pub(crate) async fn gate_claim_and_escalate(state: &SharedState, args: &Value) -> ToolResult {
+    let first = tool_gate_escalation_claim(state, args).await?;
+    if first["not_asked"] != json!(true) {
+        return Ok(first);
+    }
+    let mut e = json!({
+        "plugin_id": args["plugin_id"],
+        "refusal_id": first["refusal_id"],
+        "reason": "test: the member escalates this refused write deliberately",
+    });
+    if let Some(sid) = args.get("session_id") {
+        e["session_id"] = sid.clone();
+    }
+    let mut opened = tool_gate_escalation_escalate(state, &e).await?;
+    // What the claim learned about earlier spends rides on the member's view of the refusal.
+    for k in ["reclaim_refused", "bar_shortfall"] {
+        if opened.get(k).map_or(true, Value::is_null) {
+            opened[k] = first[k].clone();
+        }
+    }
+    Ok(opened)
 }
 
 // ------------------------------------------- gate escalation: peer arbitration + discovery
@@ -28862,6 +30517,8 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                     "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
                     "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
                     "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                    "member_reason": r.ext.gate.as_ref().and_then(|g| g.member_reason.clone()),
+                    "escalated_from": r.ext.gate.as_ref().and_then(|g| g.escalated_from.clone()),
                     "invited_peers": r.ext.invited_peers,
                 })
             })
@@ -29358,6 +31015,16 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "bar_met_if_decided_now": updated.bar_met(),
                 }),
             );
+            let witness_hash = match entry {
+                Ok(e) => e.hash,
+                Err(append_err) => {
+                    s.gate_escalations.undo_corroborate(esc);
+                    return Err(anyhow::anyhow!(
+                        "corroboration NOT recorded — its witness append failed ({append_err}); \
+                         the escalation is unchanged and no factor was added"
+                    ));
+                }
+            };
             Ok(json!({
                 "escalation_id": updated.id,
                 // `corroborated` keeps its original meaning — "your CONCURRENCE landed" —
@@ -29372,7 +31039,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "post_claim": updated.consumed_at.is_some(),
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
-                "witnessEntryHash": entry.ok().map(|e| e.hash),
+                "witnessEntryHash": witness_hash,
                 "note": if dissent {
                     "your dissent is ON THE RECORD as evidence for review — never a veto: \
                      the sovereign decision stands or lands regardless, with your argument \
@@ -30934,6 +32601,71 @@ mod disposition_durability_tests {
             notes[0].pointer_uri.as_deref(),
             Some("hestia://escalation/esc-fail1#decided")
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_moot_update_rolls_back_and_rebuilds_after_restart() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, ruling_hash, ruling_pos) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            assert_eq!(project_dispositions(&handles.0, &handles.1).unwrap().projected, 0);
+            s.inbox_store.enqueue_member(
+                "kimi-code", "claude-code", "role:constellation:interactive-dev",
+                "review_request", Some("hestia://escalation/esc-rollback#corroborate-or-dissent"),
+                "ask-rollback", None,
+            ).unwrap();
+            let e = s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": "esc-rollback", "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit", "status": "approved", "decided_by": "operator",
+                }),
+            ).unwrap();
+            (handles.0, handles.1, e.hash, e.chain_position)
+        };
+
+        let injected = raw_inbox_conn(&dir);
+        injected.execute_batch(
+            "CREATE TRIGGER fail_moot_update BEFORE UPDATE OF mooted_at, moot_reason ON member_notices
+             BEGIN SELECT RAISE(FAIL, 'injected moot update'); END;",
+        ).unwrap();
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                ensure_disposition(&s, "kimi-code", "hestia://escalation/esc-rollback#decided", &ruling_hash),
+                None,
+            );
+        }
+        assert_eq!(count_dispositions(&injected, false), 0, "the disposition insert rolled back");
+        let mooted_at: Option<String> = injected.query_row(
+            "SELECT mooted_at FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(mooted_at.is_none(), "the failed moot update rolled back too");
+        injected.execute_batch("DROP TRIGGER fail_moot_update").unwrap();
+        assert_eq!(inbox.projection_cursor("disposition").unwrap(), Some(ruling_pos));
+
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1);
+        assert_eq!(pass.advanced_to, ruling_pos + 1);
+        drop(injected);
+        drop(state);
+
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.inbox_store.clone())
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 0);
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(count_dispositions(&conn, false), 1);
+        let moot_reason: String = conn.query_row(
+            "SELECT moot_reason FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(moot_reason.contains(&ruling_hash), "the rebuilt moot evidence lost its ruling: {moot_reason}");
     }
 
     /// Reviewer test 2: a restart between the ruling and the projection — the
@@ -34349,7 +36081,7 @@ mod concurrency_battery {
                 "plugin_id": m, "session_id": sid, "tool_name": "Bash",
                 "marker": "pre_tool_use.py", "reason": format!("Bash: git apply /tmp/p/{i}.patch"),
                 "request_key": key, "invocation_key": inv, "supersession": "hard_stop"});
-            let opened = tool_gate_escalation_claim(&state, &claim_args(format!("open-{i}"))).await.unwrap();
+            let opened = gate_claim_and_escalate(&state, &claim_args(format!("open-{i}"))).await.unwrap();
             let esc_id = opened["escalation_id"].as_str().unwrap_or_else(|| panic!("{opened}")).to_string();
             esc_ids.push((i, esc_id.clone(), claim_args));
         }
@@ -34414,7 +36146,7 @@ mod concurrency_battery {
                 let (st, id, args, sp) = (state.clone(), esc_id.clone(),
                                           claim_args(inv.clone()), spends.clone());
                 tasks.spawn(async move {
-                    let r = tool_gate_escalation_claim(&st, &args).await.unwrap();
+                    let r = gate_claim_and_escalate(&st, &args).await.unwrap();
                     let mut g = sp.lock().unwrap();
                     let e = g.entry(id).or_default();
                     if r["claimed"] == json!(true) {
@@ -34817,7 +36549,7 @@ mod durable_reads_tests {
                           "tool_name": "Bash", "act": "cat /srv/durable-claim.txt",
                           "act_digest": "a".repeat(64), "spend": false});
         let hold = durability.hold_flush_for_test();
-        let first = tool_scope_claim(&state, &args).await.unwrap();
+        let first = claim_and_escalate(&state, &args).await.unwrap();
         assert_eq!(first["verdict"], json!("opened"), "{first}");
         let st = state.clone();
         let a2 = args.clone();
@@ -34848,7 +36580,7 @@ mod durable_reads_tests {
 
         // 604 chars: whole under the record bound (the old silent take cut this at 400).
         let long_act = format!("cat {}", "q".repeat(600));
-        let opened = tool_scope_claim(
+        let opened = claim_and_escalate(
             &state,
             &json!({"plugin_id": "codex", "path": "/srv/depth.txt", "rule": "mrh.command",
                     "tool_name": "Bash", "act": long_act, "act_digest": "b".repeat(64),
@@ -34864,7 +36596,7 @@ mod durable_reads_tests {
 
         // Past SCOPE_ACT_MAX: the cut is allowed but must announce itself.
         let huge = "x".repeat(SCOPE_ACT_MAX + 50);
-        let opened = tool_scope_claim(
+        let opened = claim_and_escalate(
             &state,
             &json!({"plugin_id": "codex", "path": "/srv/depth2.txt", "rule": "mrh.command",
                     "tool_name": "Bash", "act": huge, "act_digest": "c".repeat(64),
@@ -34880,7 +36612,7 @@ mod durable_reads_tests {
 
         // Receipt-side value-masking fires on this field too (the gate masks first; the
         // daemon re-masks whatever it is handed).
-        let opened = tool_scope_claim(
+        let opened = claim_and_escalate(
             &state,
             &json!({"plugin_id": "codex", "path": "/srv/depth3.txt", "rule": "mrh.command",
                     "tool_name": "Bash", "act": "curl --token sekritexample https://x",
@@ -35570,8 +37302,8 @@ mod existence_first_tests {
         assert_eq!(r["verdict"], "not_opened", "{r}");
         assert_eq!(r["reason"], "nonexistent", "a missing path is not there: {r}");
         assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
-        let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
-        assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
+        let w = claim_and_escalate(&state, &claim("Write")).await.unwrap();
+        assert_eq!(w["verdict"], "opened", "a write may be creating it, once escalated: {w}");
     }
 
     /// The daemon's read-tool list must EQUAL the gate's (READ_ONLY_PATH_TOOLS ∪ every
@@ -35865,6 +37597,73 @@ mod verdict_feedback_tests {
             "different long attempts must not share a digest");
         assert_eq!(second["feedback"]["repeat_of"], Value::Null,
             "a shared capped prefix is not a repeated act: {second}");
+    }
+
+    /// NOVA's re-review of 7c73d48c9: a mask PAST the 400-char display cut. Two acts that differ
+    /// only in a credential value there share `feedback.act` (the digest is over the redacted
+    /// whole) while both rows' `attempted` prefixes are clean, so no reader of the row can see the
+    /// mask. The producer, which still holds the whole input, says so in `act_exact`, and the
+    /// retry predicate then refuses the digest as identity.
+    #[tokio::test]
+    async fn a_mask_past_the_display_cut_is_recorded_and_defeats_digest_identity() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let pad = "x".repeat(ATTEMPTED_MAX + 20);
+        let mut hashes = Vec::new();
+        for value in ["AAAA", "BBBB"] {
+            let mut args = witnessed("mrh.path");
+            args["tool_name"] = json!("Bash");
+            args["target"] = json!("curl");
+            args["session_id"] = json!("s-mask");
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            args["attempted"] = json!(format!("curl {pad} --token {value}"));
+            let got = tool_witness_decision(&state, &args).await.unwrap();
+            assert_eq!(got["recorded"], json!("appended"), "{got}");
+            hashes.push(got["witnessEntryHash"].as_str().unwrap().to_string());
+        }
+        let (a, b) = (row(&state, &hashes[0]).await, row(&state, &hashes[1]).await);
+        assert_eq!(a["feedback"]["act"], b["feedback"]["act"],
+            "precondition: the two tokens collapse to one redacted digest");
+        for r in [&a, &b] {
+            let shown = r["attempted"].as_str().unwrap();
+            assert!(!shown.contains("***") && !shown.contains("[REDACTED"),
+                "precondition: the mask is past the display cut: {shown}");
+            assert_eq!(r["act_exact"], json!(false), "the producer saw the mask: {r}");
+        }
+        let entries: Vec<_> = {
+            let s = state.lock().await;
+            s.recent_chain(500).into_iter().filter(|e| hashes.contains(&e.hash)).collect()
+        };
+        let role = a["role_lct"].as_str().unwrap_or_default().to_string();
+        let d = crate::derivation::derive_evidence("codex", &role, &entries);
+        assert!(!d.temperament.evidence.is_empty()
+                && d.temperament.evidence.iter().all(|e| e.contribution.starts_with("comply-after-deny")),
+            "two acts that share only a masked digest are not a retry: {d:?}");
+
+        // The same long attempt unmasked: the digest IS the act, and says so.
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["attempted"] = json!(format!("curl {pad} --verbose"));
+        let got = tool_witness_decision(&state, &args).await.unwrap();
+        let r = row(&state, got["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(true), "{r}");
+        // A gate summary bounded at its own cut is a digest of a summary, not of the act.
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["attempted"] = json!(format!("Bash: {} …", "x".repeat(214)));
+        let got = tool_witness_decision(&state, &args).await.unwrap();
+        let r = row(&state, got["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(false), "{r}");
+
+        // The daemon's own ruling path records the same provenance.
+        let sid = session(&state, "kimi-code").await;
+        let q = rule(&state, &sid, &format!("{DENY_CMD} {pad} --token CCCC"), None).await;
+        assert_eq!(q["decision"], json!("deny"), "precondition: {q}");
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert!(!r["attempted"].as_str().unwrap().contains("***"), "precondition: {r}");
+        assert_eq!(r["act_exact"], json!(false), "{r}");
+        let q = rule(&state, &sid, &format!("{DENY_CMD} {pad}"), None).await;
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(true), "{r}");
     }
 
     #[tokio::test]

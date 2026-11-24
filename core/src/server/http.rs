@@ -4441,6 +4441,52 @@ async fn config_put_seat(
         }
     }
 
+    // The role the seat RUNS AS, not the one its own document states: a shared HESTIA_ROLE wins
+    // over a seat's (`sc::effective`), so the gate and the receipt compare effective authority.
+    // For the shared set itself the document IS the effective value of every seat.
+    let previous_cfg = previous.as_ref()
+        .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok());
+    let inherited_role = if writing_shared { None } else {
+        match sc::load_shared(&s.vault) {
+            Some(Ok(c)) => c.env.get("HESTIA_ROLE").cloned(),
+            _ => None,
+        }
+    };
+    let previous_role = inherited_role.clone()
+        .or_else(|| previous_cfg.as_ref().and_then(|old| old.env.get("HESTIA_ROLE").cloned()));
+    let next_role = inherited_role.clone().or_else(|| cfg.env.get("HESTIA_ROLE").cloned());
+    let role_changed = previous_role != next_role;
+    // A SHARED write moves the effective role of every seat that inherits it, so its receipt
+    // names each seat whose effective role moves (NOVA, #1648 updated-head review): a seat's own
+    // HESTIA_ROLE stands only where the shared set states none (`sc::effective`).
+    let seat_role_transitions: Vec<serde_json::Value> = if !writing_shared { Vec::new() } else {
+        sc::declared_members(&s.vault).into_iter()
+            .filter(|m| !sc::is_shared(m))
+            .filter_map(|m| {
+                let own = s.vault.get_document(sc::SEAT_CONFIG_NS, &m)
+                    .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok())
+                    .and_then(|c| c.env.get("HESTIA_ROLE").cloned());
+                let before = previous_role.clone().or_else(|| own.clone());
+                let after = next_role.clone().or(own);
+                (before != after).then(|| serde_json::json!({
+                    "member": m, "previous_hestia_role": before, "next_hestia_role": after,
+                }))
+            })
+            .collect()
+    };
+    // The reason is for THIS act. `note` is stored in the document and the editor opens with it,
+    // so the stored note re-sent unchanged is the last change's reason, not this one's.
+    let previous_note = previous_cfg.as_ref().map(|old| old.note.trim()).unwrap_or("");
+    if role_changed && (cfg.note.trim().is_empty() || cfg.note.trim() == previous_note) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a new note is required to change HESTIA_ROLE — say why this capacity role \
+                          changes authority (the stored note is the previous change's reason)"
+            })),
+        );
+    }
+
     // WITNESS FIRST, the same ordering as every other authority write here: a failed vault write
     // must not leave the chain silent about an attempted change to what a seat runs with. The
     // record names the KEYS, never the values — a config document can carry a token, and the
@@ -4449,6 +4495,11 @@ async fn config_put_seat(
         "member": member,
         "shared": writing_shared,
         "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+        "previous_hestia_role": previous_role,
+        "next_hestia_role": next_role,
+        "role_changed": role_changed,
+        "hestia_role_inherited": inherited_role.is_some(),
+        "seat_role_transitions": seat_role_transitions,
         "note": cfg.note,
         "replaces": existed,
         "decided_by": "operator",
@@ -4953,6 +5004,52 @@ async fn scope_grant(
         .grants
         .iter()
         .any(|g| g.member == plugin_id && g.path == path);
+    // WHAT was replaced, not only THAT something was (NOVA, #1638): the same path with other
+    // modes, reach or expiry is a replacement -- last edit wins -- and never an overlap, so
+    // without the old row's terms the reader cannot see what the new grant narrowed or
+    // widened. `live: false` says the row being replaced had already lapsed.
+    let replaced_terms = s
+        .standing_scope
+        .grants
+        .iter()
+        .find(|g| g.member == plugin_id && g.path == path)
+        .map(|g| {
+            serde_json::json!({
+                "modes": g.modes.as_letters(),
+                "recursive": g.recursive,
+                "expires_at": g.expires_at,
+                "live": g.is_live(now),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let coverage_overlaps: Vec<serde_json::Value> = s
+        .standing_scope
+        .grants
+        .iter()
+        .filter(|g| g.member == plugin_id && g.is_live(now) && g.path != path)
+        .filter_map(|g| {
+            // A PATH relation, and named as one (NOVA, #1638): containment of paths alone.
+            // Modes, reach and expiry are NOT compared, so neither grant is implied redundant;
+            // the row carries the existing grant's own modes/reach/expiry for the reader to
+            // compare. This label is recorded in the witnessed intent, so it must not overclaim.
+            let relation = if g.covers(&path) {
+                "existing_path_covers_new"
+            } else if recursive
+                && crate::server::standing_scope::covers_path(&path, true, &g.path)
+            {
+                "new_path_covers_existing"
+            } else {
+                return None;
+            };
+            Some(serde_json::json!({
+                "path": g.path,
+                "relation": relation,
+                "recursive": g.recursive,
+                "modes": g.modes.as_letters(),
+                "expires_at": g.expires_at,
+            }))
+        })
+        .collect();
 
     // ORDER: INTENT → COMMIT → SUCCESS, via the one function that owns it
     // (`witness_and_commit_standing_grant`). This used to append `scope_granted` and THEN
@@ -4982,6 +5079,8 @@ async fn scope_grant(
         "standing": true,
         "standing_expires_at": expires_at,
         "replaces_existing": replaces,
+        "replaced_terms": replaced_terms.clone(),
+        "coverage_overlaps": coverage_overlaps.clone(),
         "member_known": member_known,
         "durability": "STANDING — written to the vault's standing-scope document; survives \
                        restart; revocable via /api/scope/standing/revoke; identity.json is \
@@ -5056,6 +5155,8 @@ async fn scope_grant(
             "expires_at": expires_at,
             "generation": s.standing_scope.generation,
             "replaced_existing": replaces,
+            "replaced_terms": replaced_terms,
+            "coverage_overlaps": coverage_overlaps,
             // Surfaced so a typo is visible at the moment it is made, not at the moment the
             // grant fails to help someone.
             "member_known": member_known,
@@ -7205,18 +7306,41 @@ async fn policy_set_preset(
             Json(serde_json::json!({"error": format!("unknown preset: {preset}")})),
         );
     }
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let mut s = state.lock().await;
+    let loosening = s.is_loosening(&preset);
+    let from_preset = s.vault.policy().active_preset.clone();
+    if loosening && reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required to loosen the society preset — it applies to every member"
+            })),
+        );
+    }
+    let durability = "until explicitly changed — the society baseline has no expiry; per-member grants are the expiring exception path";
     match policy_edit_recorded(
         &mut s,
         |v| v.set_active_preset(&preset),
         |st, out| {
             let _ = out;
-            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "preset", "preset": preset}), &gate)).map(|_| ())
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({
+                "change": "preset", "from_preset": from_preset, "preset": preset,
+                "reason": reason, "durability": durability,
+            }), &gate)).map(|_| ())
         },
     ) {
         Ok(out) => {
             let _ = &out;
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset})))
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true, "preset": preset, "from_preset": from_preset,
+                "reason": reason, "durability": durability,
+            })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
@@ -8835,7 +8959,11 @@ fn annotate_gate_verdicts(
             obj.insert("discovered".into(), serde_json::Value::Bool(is_discovered));
             // The daemon's judgement, rendered by the UIs as-is (#1156). Only a ratified
             // expectation can be forgotten at all.
-            let plugin_id = obj.get("plugin_id").and_then(|v| v.as_str()).map(str::to_string);
+            let plugin_id = obj.get("plugin_id").and_then(|v| v.as_str()).map(str::to_string)
+                .or_else(|| discovered.iter().find(|(_, d)| d == &path).map(|(id, _)| id.clone()));
+            if let Some(id) = plugin_id.as_ref() {
+                obj.insert("plugin_id".into(), serde_json::Value::String(id.clone()));
+            }
             let held = obj.get("status").and_then(|v| v.as_str()) != Some("unratified");
             let blocked = if held {
                 forget_blocked_reason(&path, plugin_id.as_deref(), discovered, declaring)
@@ -9609,6 +9737,230 @@ mod disposition_tests {
         assert_eq!(st, StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn grants_report_replacement_and_live_coverage_without_merging() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, root) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root", "recursive": true, "reason": "root"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{root}");
+        assert!(root["coverage_overlaps"].as_array().unwrap().is_empty(), "{root}");
+
+        let (st, child) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/child", "reason": "child"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{child}");
+        assert_eq!(child["coverage_overlaps"].as_array().unwrap().len(), 1, "{child}");
+        assert_eq!(child["coverage_overlaps"][0]["relation"], "existing_path_covers_new");
+        assert_eq!(child["coverage_overlaps"][0]["path"], "/w/root");
+        assert_eq!(child["replaced_existing"], serde_json::json!(false));
+
+        let (st, replaced) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/child", "reason": "new reason"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{replaced}");
+        assert_eq!(replaced["replaced_existing"], serde_json::json!(true));
+        assert_eq!(replaced["coverage_overlaps"].as_array().unwrap().len(), 1);
+
+        let (st, wider) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w", "recursive": true, "reason": "wider"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{wider}");
+        let overlaps = wider["coverage_overlaps"].as_array().unwrap();
+        assert_eq!(overlaps.len(), 2, "{wider}");
+        assert!(overlaps.iter().all(|row| row["relation"] == "new_path_covers_existing"), "{wider}");
+        assert_eq!(state.lock().await.standing_scope.grants.len(), 3,
+                   "coverage is reported, never silently merged");
+    }
+
+    /// The overlap row is a PATH relation carrying the existing grant's own terms, so the
+    /// reader compares modes, reach and expiry instead of inferring redundancy (NOVA, #1638).
+    #[tokio::test]
+    async fn a_coverage_overlap_carries_the_existing_grants_modes_reach_and_expiry() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, root) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root", "recursive": true, "modes": "r",
+            "expires_in_secs": 3600, "reason": "read the tree for an hour"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{root}");
+        let (st, child) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/child", "modes": "rw", "reason": "write one"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{child}");
+        let o = &child["coverage_overlaps"][0];
+        assert_eq!(o["relation"], "existing_path_covers_new", "{child}");
+        assert_eq!(o["modes"], "r", "the EXISTING grant's modes, not the new one's: {child}");
+        assert_eq!(o["recursive"], serde_json::json!(true), "{child}");
+        assert_eq!(o["expires_at"], root["expires_at"], "{child}");
+    }
+
+    /// An EXPIRED grant reaches nothing, so it overlaps nothing: a lapsed recursive row over
+    /// the new path must not be reported as covering it (the `is_live` filter).
+    #[tokio::test]
+    async fn an_expired_grant_is_not_reported_as_a_coverage_overlap() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "hub-being".into(), path: "/w/old".into(), granted_at: now - 7200,
+                granted_by: "operator".into(), reason: "lapsed".into(), expires_at: Some(now - 1),
+                request_id: None, recursive: true,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let (st, out) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/old/child", "reason": "after it lapsed"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(out["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "an expired row covers nothing: {out}");
+    }
+
+    /// The SAME path with different modes and expiry is a replacement, not an overlap: last
+    /// edit wins, one row remains, and it holds the new terms -- nothing merged.
+    #[tokio::test]
+    async fn the_same_path_with_other_modes_and_expiry_replaces_and_is_not_an_overlap() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, first) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/same", "modes": "r", "expires_in_secs": 3600,
+            "reason": "read for an hour"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        let (st, second) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/same", "modes": "rw", "reason": "read and write"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{second}");
+        assert_eq!(second["replaced_existing"], serde_json::json!(true), "{second}");
+        assert!(second["coverage_overlaps"].as_array().unwrap().is_empty(), "{second}");
+        // The OLD row's terms are reported, so the reader sees what changed (r+1h -> rw+none).
+        assert_eq!(second["replaced_terms"], serde_json::json!({
+            "modes": "r", "recursive": false, "expires_at": first["expires_at"], "live": true,
+        }), "{second}");
+        assert_eq!(first["replaced_terms"], serde_json::Value::Null, "{first}");
+        let s = state.lock().await;
+        let rows: Vec<_> = s.standing_scope.grants.iter()
+            .filter(|g| g.member == "hub-being" && g.path == "/w/same").collect();
+        assert_eq!(rows.len(), 1, "replaced, not merged or duplicated");
+        assert_eq!(rows[0].modes.as_letters(), "rw");
+        assert_eq!(rows[0].expires_at, None, "the new grant's expiry, not the old one's");
+    }
+
+    /// Containment is at the separator at the route too: `/w/a` (recursive) and `/w/ab` share
+    /// a string prefix and no path, in either order of granting.
+    #[tokio::test]
+    async fn a_sibling_prefix_is_not_a_coverage_overlap_in_either_direction() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, ab) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/ab", "reason": "sibling"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{ab}");
+        let (st, a) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/a", "recursive": true, "reason": "tree"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{a}");
+        assert!(a["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "new /w/a/** does not cover existing /w/ab: {a}");
+        let (st, abc) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/abc", "reason": "another sibling"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{abc}");
+        assert!(abc["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "existing /w/a/** does not cover new /w/abc: {abc}");
+    }
+
+    /// Replacing a LAPSED row says so: `replaced_existing` stays true (the row is replaced),
+    /// and `replaced_terms.live: false` keeps the reader from taking it as a narrowing of
+    /// reach that was in force.
+    #[tokio::test]
+    async fn replacing_a_lapsed_row_reports_its_terms_as_not_live() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "hub-being".into(), path: "/w/old".into(), granted_at: now - 7200,
+                granted_by: "operator".into(), reason: "lapsed".into(), expires_at: Some(now - 1),
+                request_id: None, recursive: true,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let (st, out) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/old", "modes": "r", "reason": "again, read only"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["replaced_existing"], serde_json::json!(true), "{out}");
+        assert_eq!(out["replaced_terms"], serde_json::json!({
+            "modes": "rwed", "recursive": true, "expires_at": now - 1, "live": false,
+        }), "{out}");
+    }
+
+    /// Coverage is LEXICAL over normalised paths (NOVA's normalisation ask): every spelling
+    /// is normalised before comparing (`normalize_scope_path`), so `/w/root//x/../child/.` is
+    /// `/w/root/child` -- covered by `/w/root/**`, and a replacement of an existing
+    /// `/w/root/child` rather than a second row or an overlap with itself.
+    #[tokio::test]
+    async fn coverage_compares_normalised_spellings() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, _) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/", "recursive": true, "reason": "tree"
+        })).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, child) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root//x/../child/.", "reason": "child"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{child}");
+        assert_eq!(child["path"], "/w/root/child", "{child}");
+        assert_eq!(child["coverage_overlaps"].as_array().unwrap().len(), 1, "{child}");
+        assert_eq!(child["coverage_overlaps"][0]["path"], "/w/root", "{child}");
+        let (st, again) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w//root/child", "reason": "same, respelled"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{again}");
+        assert_eq!(again["replaced_existing"], serde_json::json!(true), "{again}");
+        assert_eq!(again["coverage_overlaps"].as_array().unwrap().len(), 1,
+                   "only /w/root; the respelled row is the same row, not an overlap: {again}");
+        assert_eq!(state.lock().await.standing_scope.grants.len(), 2);
+    }
+
+    /// Symlinks are NOT resolved (`normalize_scope_path` is textual by design, state.rs: the
+    /// daemon records and the plugin gate enforces, and the two may not see the same mount).
+    /// So a grant under a symlink to a granted tree is reported as NO overlap, even though on
+    /// this filesystem it reaches the same file. The report under-claims; it never infers
+    /// reach, and the "Path overlap" label says which relation it is.
+    #[tokio::test]
+    async fn coverage_does_not_resolve_symlinks() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let fs = tempfile::tempdir().unwrap();
+        let root = fs.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("child"), b"x").unwrap();
+        let link = fs.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let (st, _) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": root.to_str().unwrap(), "recursive": true,
+            "reason": "tree"
+        })).await;
+        assert_eq!(st, StatusCode::OK);
+        let via_link = link.join("child");
+        assert!(via_link.exists(), "the link really reaches the granted tree");
+        let (st, out) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": via_link.to_str().unwrap(), "reason": "via link"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["path"], via_link.to_str().unwrap(), "recorded as spelled, not resolved");
+        assert!(out["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "lexical: a symlinked spelling is a different path: {out}");
+    }
+
     #[test]
     fn the_binding_ignores_clock_fields_and_treats_expired_as_none() {
         let row = serde_json::json!({"lifetime": "standing", "plugin_id": "m", "path": "/p",
@@ -9869,6 +10221,7 @@ mod disposition_tests {
         assert_eq!(rows[0]["discovered"], true);
         assert_eq!(rows[0]["deployment"], "match");
         assert_eq!(rows[1]["deployment"], "differs");
+        assert_eq!(rows[1]["plugin_id"], "codex", "an unratified row names its discovered member");
         assert_eq!(rows[2]["discovered"], false, "a stale expectation must be offered for forget");
         assert_eq!(rows[0]["status"], "verified", "the verdict shape is kept");
         assert_eq!(bulk["allowed"], false);
@@ -10357,6 +10710,142 @@ mod disposition_tests {
         assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
     }
 
+    #[tokio::test]
+    async fn role_changes_require_a_reason_and_are_witnessed() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                )
+            }
+        };
+        let refused = put(serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": ""},
+        })).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let accepted = put(serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"},
+                       "note": "review duty is deliberate"},
+        })).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let entries = state.lock().await.recent_chain(8);
+        let intent = entries.iter().find(|entry| entry.event_type == "config_seat_write_intent")
+            .expect("the role change is witnessed");
+        assert_eq!(intent.event_data["note"], "review duty is deliberate");
+        assert_eq!(intent.event_data["previous_hestia_role"], serde_json::Value::Null);
+        assert_eq!(intent.event_data["next_hestia_role"], "role:constellation:reviewer");
+        assert_eq!(intent.event_data["role_changed"], true);
+        assert!(intent.event_data["keys"].as_array().unwrap()
+            .iter().any(|key| key == "HESTIA_ROLE"));
+    }
+
+    /// The note is STORED in the document and the editor opens with it, so re-sending it
+    /// unchanged is the previous act's reason, not this one's (#1648 sweep finding 1).
+    #[tokio::test]
+    async fn a_role_change_needs_a_new_reason_not_the_stored_note() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                ).status()
+            }
+        };
+        let seat = |role: &str, note: &str| serde_json::json!({
+            "plugin_id": "claude-code", "config": {"env": {"HESTIA_ROLE": role}, "note": note},
+        });
+        assert_eq!(put(seat("role:constellation:member", "initial setup")).await, StatusCode::OK);
+        assert_eq!(put(seat("role:constellation:reviewer", "initial setup")).await, StatusCode::BAD_REQUEST,
+                   "the stored note is not a reason for a new role change");
+        assert_eq!(put(seat("role:constellation:reviewer", " initial setup ")).await, StatusCode::BAD_REQUEST,
+                   "nor is the stored note with whitespace around it");
+        assert_eq!(put(seat("role:constellation:reviewer", "review duty is deliberate")).await, StatusCode::OK);
+        // a no-op role save may keep the stored note
+        assert_eq!(put(seat("role:constellation:reviewer", "review duty is deliberate")).await, StatusCode::OK);
+    }
+
+    /// NOVA's ask on #1648: the gate and the receipt compare the role a seat RUNS AS. A shared
+    /// HESTIA_ROLE wins over a seat's own (`seat_config::effective`), so a seat inheriting it, a
+    /// seat dropping a shadowed override, and a shared change affecting every seat are each
+    /// judged on effective authority.
+    #[tokio::test]
+    async fn the_role_gate_compares_effective_roles_under_a_shared_role() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                let resp = axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                );
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        let last_intent = |state: SharedState| async move {
+            state.lock().await.recent_chain(16).into_iter()   // newest first
+                .find(|entry| entry.event_type == "config_seat_write_intent")
+                .map(|entry| entry.event_data).expect("a config write is witnessed")
+        };
+        // a seat override written BEFORE the shared set owned the key: it will be shadowed
+        let (st, out) = put(serde_json::json!({"plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": "review duty"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        // a shared role change affects every seat: it needs a reason
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:member"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:member"}, "note": "society floor"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!((rec["shared"].clone(), rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone()),
+                   (serde_json::json!(true), serde_json::Value::Null, serde_json::json!("role:constellation:member"), serde_json::json!(true)), "{rec}");
+        // ...and the receipt names the seat whose EFFECTIVE role the shared write moved
+        assert_eq!(rec["seat_role_transitions"], serde_json::json!([{"member": "claude-code",
+            "previous_hestia_role": "role:constellation:reviewer",
+            "next_hestia_role": "role:constellation:member"}]), "{rec}");
+        // ...and a stale shared note is no reason for the next shared change
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:witness"}, "note": "society floor"}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        // a seat inheriting the shared role cannot restate it
+        let (st, out) = put(serde_json::json!({"plugin_id": "kimi-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": "want review"}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert_eq!(out["shared_keys"], serde_json::json!(["HESTIA_ROLE"]), "{out}");
+        // a seat with no role of its own inherits: its receipt names the effective role, unchanged
+        let (st, out) = put(serde_json::json!({"plugin_id": "kimi-code",
+            "config": {"env": {"HESTIA_HARNESS_HOME": "/h/kimi"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!((rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone(), rec["hestia_role_inherited"].clone()),
+                   (serde_json::json!("role:constellation:member"), serde_json::json!("role:constellation:member"), serde_json::json!(false), serde_json::json!(true)), "{rec}");
+        // dropping the shadowed override changes no authority (shared already won): no reason
+        // is manufactured, and the receipt says the effective role did not move
+        let (st, out) = put(serde_json::json!({"plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_HARNESS_HOME": "/h/claude"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!((rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone()),
+                   (serde_json::json!("role:constellation:member"), serde_json::json!("role:constellation:member"), serde_json::json!(false)), "{rec}");
+        // the shared set DROPPING its role moves every inheriting seat to no role: the receipt
+        // names each one, not only `_shared`'s own transition
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {}, "note": "no society floor"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!(rec["seat_role_transitions"], serde_json::json!([
+            {"member": "claude-code", "previous_hestia_role": "role:constellation:member", "next_hestia_role": null},
+            {"member": "kimi-code", "previous_hestia_role": "role:constellation:member", "next_hestia_role": null},
+        ]), "{rec}");
+    }
+
     /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
     /// inherited by every seat with shared winning; a seat that restates a shared key is refused
     /// at the door; a shared write re-renders every seat in the same act; the list names the
@@ -10378,7 +10867,7 @@ mod disposition_tests {
         };
         // two seats first, each carrying only its own facts
         for (m, role) in [("claude-code", "role:constellation:interactive-dev"), ("codex", "role:constellation:member")] {
-            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": ""}})).await;
+            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": "test role assignment"}})).await;
             assert_eq!(st, StatusCode::OK);
         }
         // the shared set: society facts, and a token-shaped value that must never reach the chain
@@ -12768,7 +13257,7 @@ mod disposition_tests {
 
     async fn claim(state: &SharedState, member: &str, path: &str, act: &str, spend: bool)
         -> serde_json::Value {
-        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
             "act": act, "act_digest": digest_of(act), "spend": spend,
             "host_session_id": "sess-under-test",
@@ -12777,7 +13266,7 @@ mod disposition_tests {
 
     async fn batch(state: &SharedState, member: &str, op: &str, op_key: &str, paths: &[&str],
                    act: &str) -> serde_json::Value {
-        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "op": op, "op_key": op_key, "paths": paths,
             "act_digest": digest_of(act),
         })).await.expect("batch answers")
@@ -12800,21 +13289,21 @@ mod disposition_tests {
     #[tokio::test]
     async fn scope_claim_requires_a_complete_act_digest_and_binds_to_it() {
         let (_dir, state) = test_state().await;
-        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.command",
             "tool_name": "Write", "act": "Write -> /etc/review-probe"})).await.unwrap();
         assert_eq!(r["_hestia_error"]["code"], "hestia.scope_claim_act_digest_required", "{r}");
         assert!(state.lock().await.scope_requests.is_empty(), "nothing opened without a digest");
         // Same display summary, different complete act (Write contents): distinct digests.
         let summary = "Write -> /etc/review-probe";
-        let id = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let id = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
             "tool_name": "Write", "act": summary, "act_digest": digest_of("content: one"),
             "spend": false})).await.unwrap()["request_id"].as_str().unwrap().to_string();
         assert_eq!(decide(&state, serde_json::json!({
             "request_id": &id, "granted": true, "reason": "one write", "once": true})).await.0,
             StatusCode::OK);
-        let other = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let other = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
             "tool_name": "Write", "act": summary, "act_digest": digest_of("content: two"),
             "spend": true})).await.unwrap();
@@ -12836,7 +13325,7 @@ mod disposition_tests {
     /// Open a gate request as a PROVEN asker (session) and return (id, invited peers, response).
     async fn proven_claim(state: &SharedState, member: &str, sid: &str, path: &str)
         -> (String, Vec<String>, serde_json::Value) {
-        let r = crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "session_id": sid, "path": path, "rule": "mrh.command",
             "tool_name": "Bash", "act": format!("cat {path}"), "act_digest": digest_of(&format!("cat {path}")),
             "spend": false,
@@ -13324,7 +13813,7 @@ mod disposition_tests {
         let p = f.to_str().unwrap().to_string();
         // A READ, refused standing: the refusal records `r`.
         let act = format!("Read {p}");
-        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
             "act": &act, "act_digest": digest_of(&act), "spend": false,
             "host_session_id": "sess-under-test"})).await.unwrap();
@@ -13343,7 +13832,7 @@ mod disposition_tests {
                 "a w-only grant must not lift a refused read");
         assert_eq!(lifted_rows(&state).await, rows, "no lift row for a lift that did not happen");
         // The refused read is still answered from the record, not re-asked.
-        let again = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let again = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
             "act": &act, "act_digest": digest_of(&act), "spend": false,
             "host_session_id": "sess-under-test"})).await.unwrap();
@@ -13563,6 +14052,103 @@ mod disposition_tests {
         assert_eq!(opened.len(), 1, "one chain row for one ask");
         assert_eq!(opened[0].event_data["origin"], "gate_deny");
         assert!(!s.has_scope_grant("kimi-code", "/outside/mail/profile.ini"), "asking is not receiving");
+    }
+
+    // ---- dp, 2026-11-05: "don't do gate-generated scope requests to the operator. instead,
+    // deny with option to escalate. if the agent really needs it, they can escalate as a
+    // deliberate act." ----
+
+    fn gate_claim_args(member: &str, path: &str, act: &str) -> serde_json::Value {
+        serde_json::json!({
+            "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
+            "act": act, "act_digest": digest_of(act), "spend": false,
+            "host_session_id": "sess-under-test",
+        })
+    }
+
+    /// The gate's claim alone opens NOTHING: no request, no chain row, nobody invited. It
+    /// records the refusal and names the deliberate way forward; a re-issue keeps the same id.
+    #[tokio::test]
+    async fn scope_claim_alone_opens_nothing_and_names_the_escalation() {
+        let (_dir, state) = test_state().await;
+        let args = gate_claim_args("claude-code", "/srv/probe/apt", "grep -n apt /srv/probe/apt");
+        let a = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(a["verdict"], "not_asked", "{a}");
+        assert_eq!(a["permits"], false);
+        let rid = a["refusal_id"].as_str().expect("a refusal id").to_string();
+        assert!(rid.starts_with("refusal-"), "{rid}");
+        let detail = a["detail"].as_str().unwrap();
+        assert!(detail.contains("nothing was sent to the operator or to any peer"), "{detail}");
+        assert!(a["escalate"]["cli"].as_str().unwrap()
+                    .contains(&format!("hestia scope escalate {rid} --as claude-code")), "{a}");
+        let b = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(b["refusal_id"], rid.as_str(), "a re-issue keeps the same refusal id");
+        let s = state.lock().await;
+        assert!(s.scope_requests.is_empty(), "the gate opened nothing");
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type == "scope_requested"),
+                "no ask was recorded, because nobody asked");
+        assert_eq!(s.gate_refusals[&rid].origin.reissues, 1);
+    }
+
+    /// The member's deliberate escalation opens the request: its own reason first, the gate's
+    /// record of the act beside it, linked to the refusal, decided as before (peers, operator
+    /// override). The refusal is consumed: escalating it again finds nothing.
+    #[tokio::test]
+    async fn scope_escalate_opens_with_the_members_reason_and_the_gates_act() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "kimi-code").await;
+        let mut args = gate_claim_args("kimi-code", "/srv/data/report.csv", "cat /srv/data/report.csv");
+        args["session_id"] = serde_json::json!(sid);
+        let a = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        let rid = a["refusal_id"].as_str().unwrap().to_string();
+        let why = "summarising last week's report for the operator; this is the source file";
+        let e = crate::server::handler::tool_scope_escalate(&state, &serde_json::json!({
+            "plugin_id": "kimi-code", "session_id": sid, "refusal_id": rid, "reason": why,
+        })).await.unwrap();
+        assert_eq!(e["verdict"], "opened", "{e}");
+        assert_eq!(e["escalated_from"], rid.as_str());
+        let id = e["request_id"].as_str().unwrap().to_string();
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests[&id];
+            assert!(r.reason.starts_with(why), "the member's words lead: {}", r.reason);
+            assert!(r.reason.contains("act: cat /srv/data/report.csv"), "{}", r.reason);
+            let g = r.ext.gate.as_ref().unwrap();
+            assert_eq!(g.member_reason.as_deref(), Some(why));
+            assert_eq!(g.escalated_from.as_deref(), Some(rid.as_str()));
+            assert_eq!(g.act_digest, digest_of("cat /srv/data/report.csv"),
+                       "a one-time approval still binds to exactly the refused act");
+            assert_eq!(g.asker_basis, crate::arbiter::AskerBasis::Session);
+            let row = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_requested").unwrap();
+            assert_eq!(row.event_data["origin"], "gate_deny");
+            assert_eq!(row.event_data["member_reason"], why);
+            assert!(!s.gate_refusals.contains_key(&rid), "the refusal is consumed");
+        }
+        let again = crate::server::handler::tool_scope_escalate(&state, &serde_json::json!({
+            "plugin_id": "kimi-code", "session_id": sid, "refusal_id": rid, "reason": why,
+        })).await.unwrap();
+        assert_eq!(again["_hestia_error"]["code"], "hestia.scope_refusal_unknown", "{again}");
+    }
+
+    /// Only the refused member escalates its refusal; a thin reason opens nothing; an unknown
+    /// id says how to get a fresh one.
+    #[tokio::test]
+    async fn scope_escalate_refuses_another_member_a_thin_reason_and_an_unknown_id() {
+        let (_dir, state) = test_state().await;
+        let a = crate::server::handler::tool_scope_claim(
+            &state, &gate_claim_args("codex", "/srv/x", "cat /srv/x")).await.unwrap();
+        let rid = a["refusal_id"].as_str().unwrap().to_string();
+        let esc = |member: &str, id: &str, reason: &str| serde_json::json!({
+            "plugin_id": member, "refusal_id": id, "reason": reason});
+        let other = crate::server::handler::tool_scope_escalate(
+            &state, &esc("kimi-code", &rid, "I would like to read that file please")).await.unwrap();
+        assert_eq!(other["_hestia_error"]["code"], "hestia.scope_escalate_not_yours", "{other}");
+        let thin = crate::server::handler::tool_scope_escalate(&state, &esc("codex", &rid, "need it")).await.unwrap();
+        assert_eq!(thin["_hestia_error"]["code"], "hestia.scope_escalate_reason_thin", "{thin}");
+        let unknown = crate::server::handler::tool_scope_escalate(
+            &state, &esc("codex", "refusal-000000000000", "reading the config to fix the build")).await.unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.scope_refusal_unknown", "{unknown}");
+        assert!(state.lock().await.scope_requests.is_empty(), "none of these opened anything");
     }
 
     /// ONE-TIME: spent only by the act that was refused, once, and never served as policy.
@@ -14823,19 +15409,50 @@ mod operator_vault_tests {
     // governed state looks like AFTER — not merely whether the call returned an error.
 
     #[tokio::test]
+    async fn society_loosening_requires_reason_and_tightening_does_not() {
+        let (_dir, state) = test_state().await;
+        state.lock().await.vault.set_active_preset("strict").unwrap();
+        let refused = policy_set_preset(State(state.clone()), None,
+            Json(serde_json::json!({"preset": "permissive"}))).await.into_response();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.lock().await.vault.policy().active_preset, "strict");
+
+        let accepted = policy_set_preset(State(state.clone()), None,
+            Json(serde_json::json!({"preset": "permissive", "reason": "incident review"})))
+            .await.into_response();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = body_json(accepted).await;
+        assert_eq!(body["from_preset"], "strict");
+        assert_eq!(body["reason"], "incident review");
+        assert!(body["durability"].as_str().unwrap().contains("no expiry"));
+        let entries = state.lock().await.recent_chain(8);
+        let edit = entries.iter().find(|entry| entry.event_type == "policy_edit")
+            .expect("the preset transition is witnessed");
+        assert_eq!(edit.event_data["from_preset"], "strict");
+        assert_eq!(edit.event_data["preset"], "permissive");
+        assert_eq!(edit.event_data["reason"], "incident review");
+
+        state.lock().await.vault.set_active_preset("permissive").unwrap();
+        let tightened = policy_set_preset(State(state.clone()), None,
+            Json(serde_json::json!({"preset": "strict"}))).await.into_response();
+        assert_eq!(tightened.status(), StatusCode::OK);
+        assert_eq!(state.lock().await.vault.policy().active_preset, "strict");
+    }
+
+    #[tokio::test]
     async fn a_law_edit_whose_record_fails_leaves_the_law_as_it_was() {
         let (dir, state) = test_state().await;
         let before = state.lock().await.vault.policy().active_preset.clone();
         let other = crate::policy::PRESET_NAMES.iter().find(|p| **p != before).unwrap().to_string();
         let conn = fail_appends_of(dir.path(), "policy_edit");
-        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other})))
+        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other, "reason": "test policy change"})))
             .await.into_response();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body_json(r).await["error"].as_str().unwrap().contains("previous policy is restored"));
         assert_eq!(state.lock().await.vault.policy().active_preset, before, "the law changed unrecorded");
         // and the same edit, recordable, stands
         conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
-        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other})))
+        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other, "reason": "test policy change"})))
             .await.into_response();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(state.lock().await.vault.policy().active_preset, other);

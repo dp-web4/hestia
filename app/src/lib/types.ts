@@ -176,6 +176,13 @@ export interface PendingScopeRequest {
   tool?: string | null;
   act?: string | null;
   reissues?: number;
+  /**
+   * dp, 2026-11-05: the gate no longer opens requests; a member escalates one recorded refusal
+   * deliberately. Then this is the member's own reason, and `escalated_from` the refusal id.
+   * Absent on requests the gate opened under the 2026-10-05 auto-open.
+   */
+  member_reason?: string | null;
+  escalated_from?: string | null;
   /** The refused reach was a glob over this directory: only a recursive grant covers it. */
   subtree?: boolean;
   /** "This act once" is a choice only when the gate recorded an act to bind. */
@@ -426,6 +433,8 @@ export type GateVerdict = (
   | { status: "unratified"; path: string }
   | { status: "unreadable"; path: string; error: string }
 ) & {
+  /** Discovery fills this even when the verdict variant carries no expectation. */
+  plugin_id?: string;
   /** false = an expectation for a path no gate is wired at any more (offered for forget). */
   discovered?: boolean;
   /** Current bytes vs the deploy record. */

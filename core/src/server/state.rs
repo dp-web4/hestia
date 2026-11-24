@@ -22,6 +22,24 @@ use web4_trust_core::EntityTrust;
 use crate::storage::{ChainEntry, SqliteChainStore, TrustStore};
 use crate::vault::Vault;
 
+/// How the principal behind a session was established. `Asserted` is the legacy A1
+/// posture: caller labels describe the session but do not authenticate it. The other
+/// classes are explicit so strong enrollment can be added without a second identity model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityBasis {
+    Asserted,
+    Custodial,
+    ProofOfPossession,
+    PairedChannel,
+}
+
+impl Default for IdentityBasis {
+    fn default() -> Self {
+        Self::Asserted
+    }
+}
+
 /// Active plugin session, created on `hestia_connect`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -52,6 +70,14 @@ pub struct Session {
     /// fire's exports reads `null` even if every later connect supplied one
     /// (claude-code review of #238, point 2).
     pub role_basis: Option<String>,
+    /// Authentication evidence for THIS session, distinct from role provenance and from
+    /// `session_id`, which remains a correlation handle only. Legacy JSON defaults to A1.
+    #[serde(default)]
+    pub identity_basis: IdentityBasis,
+    /// The canonical member/LCT principal established by strong enrollment. `None` on
+    /// asserted sessions: a caller-supplied `plugin_id` is only their label.
+    #[serde(default)]
+    pub canonical_principal: Option<String>,
     pub soft_lct: String,
     pub connected_at: DateTime<Utc>,
     /// The caller's stable host-session id (e.g. Claude Code's `session_id`), if supplied. A
@@ -326,7 +352,62 @@ pub struct GateDenyOrigin {
     /// asserted asker's request is the operator's. Rows written before this field are asserted.
     #[serde(default)]
     pub asker_basis: crate::arbiter::AskerBasis,
+    /// The recorded refusal this request was escalated from (dp, 2026-11-05: the gate no longer
+    /// opens requests; the member escalates one deliberately). `None` on rows the gate opened
+    /// under the 2026-10-05 auto-open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_from: Option<String>,
+    /// The member's own reason for escalating: what the decider reads beside the act.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_reason: Option<String>,
 }
+
+/// A scope REFUSAL the gate recorded instead of opening a request (dp, 2026-11-05: "don't do
+/// gate-generated scope requests to the operator. instead, deny with option to escalate. if the
+/// agent really needs it, they can escalate as a deliberate act. 'opened by the gate on a
+/// refused bash' is noise.").
+///
+/// It holds what the gate knew (the act, the rule, the digest a one-time approval would bind to)
+/// so a DELIBERATE `hestia_scope_escalate` can open the request with the gate's evidence and the
+/// member's own reason. It sits in no queue, invites nobody and is shown to nobody: it is the
+/// deny's memory, not an ask. Memory-only and short-lived, like the requests it may become.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GateRefusal {
+    pub id: String,
+    pub plugin_id: String,
+    pub role: String,
+    /// The refused path as the gate sent it (a `/*` glob or the unenumerated sentinel kept).
+    pub raw_path: String,
+    pub path: String,
+    pub origin: GateDenyOrigin,
+    pub refused_at: u64,
+    pub expires_at: u64,
+}
+
+/// A GOVERNANCE-WRITE refusal the claim door recorded instead of opening an escalation (dp,
+/// 2026-11-05, extending the scope ruling: "auto escalation should be emergency-only (i can't
+/// think what, at the moment). all escalations should be deliberate acts by agent, with
+/// reason.").
+///
+/// `claim_args` is the gate's claim call verbatim (act, marker, resolved targets, payload hash,
+/// request key), so a DELIBERATE `hestia_gate_escalation_escalate` opens exactly the escalation
+/// the gate would have opened, priced and bound the same, with the member's reason added. Like
+/// `GateRefusal` it sits in no queue, invites nobody and is shown to nobody.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GovernanceRefusal {
+    pub id: String,
+    pub plugin_id: String,
+    pub marker: String,
+    pub claim_args: serde_json::Value,
+    pub reissues: u32,
+    pub refused_at: u64,
+    pub expires_at: u64,
+}
+
+/// How long a refusal stays escalatable. Re-issuing the act refreshes it.
+pub const GATE_REFUSAL_TTL_SECS: u64 = 2 * 3600;
+/// The most refusals held at once (all members); past it the oldest are dropped.
+pub const GATE_REFUSAL_MAX: usize = 512;
 
 /// What a retirement actually removed, by channel.
 #[derive(Debug, Default, Clone, serde::Serialize, PartialEq)]
@@ -651,6 +732,12 @@ pub struct ServerState {
     /// refused is as much of the account as the record of one that was granted, and a map
     /// keyed by target would let a re-ask overwrite a refusal.
     pub scope_requests: crate::server::published::Watched<HashMap<String, ScopeRequest>>,
+    /// Scope refusals the gate recorded (see `GateRefusal`), keyed by refusal id. Not published:
+    /// nothing reads them but `hestia_scope_escalate`.
+    pub gate_refusals: HashMap<String, GateRefusal>,
+    /// Governance-write refusals the claim door recorded (see `GovernanceRefusal`), keyed by
+    /// refusal id. Not published: nothing reads them but `hestia_gate_escalation_escalate`.
+    pub governance_refusals: HashMap<String, GovernanceRefusal>,
     /// STANDING scope grants — the third row of `POLICY_SCOPE_ASYMMETRY`: durable,
     /// operator-decided, vault-persisted (`scope`/`standing` document), generation-counted.
     /// Loaded at startup, written back through `persist_standing_scope` on every operator
@@ -1234,6 +1321,9 @@ impl ServerState {
             instance_grants: crate::server::published::Watched::new(restored_grants),
             // Same reasoning, same lifetime: a widening dies with the daemon.
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
+            // Refusals are the deny's memory, not asks: they die with the daemon.
+            gate_refusals: HashMap::new(),
+            governance_refusals: HashMap::new(),
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
             standing_scope: crate::server::published::Watched::new(standing_scope),
@@ -2668,6 +2758,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_json_defaults_to_asserted_identity_basis() {
+        let legacy = serde_json::json!({
+            "session_id": Uuid::nil(),
+            "plugin_id": "legacy-member",
+            "host_agent": "legacy-harness",
+            "assigned_role": "citizen",
+            "constellation_role": "role:constellation:member",
+            "soft_lct": "lct:test:legacy",
+            "connected_at": "2026-01-01T00:00:00Z",
+        });
+        let session: Session = serde_json::from_value(legacy).unwrap();
+        assert_eq!(session.identity_basis, IdentityBasis::Asserted);
+        assert_eq!(session.canonical_principal, None);
+        assert_eq!(session.plugin_id, "legacy-member");
+    }
+
+    #[test]
+    fn identity_basis_wire_names_cover_every_enrollment_class() {
+        for (basis, wire) in [
+            (IdentityBasis::Asserted, "asserted"),
+            (IdentityBasis::Custodial, "custodial"),
+            (IdentityBasis::ProofOfPossession, "proof_of_possession"),
+            (IdentityBasis::PairedChannel, "paired_channel"),
+        ] {
+            assert_eq!(serde_json::to_value(basis).unwrap(), wire);
+        }
+    }
+
+    #[test]
     fn startup_warms_configured_member_lcts_before_any_connect() {
         let dir = TempDir::new().unwrap();
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
@@ -3324,6 +3443,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test:a".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -3340,6 +3461,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test:b".into(),
                 connected_at: Utc::now() + chrono::Duration::seconds(1),
                 host_session_id: None,
