@@ -401,6 +401,12 @@ fn entry_feedback_act(e: &ChainEntry) -> Option<&str> {
     e.event_data.get("feedback")?.get("act")?.as_str().filter(|act| !act.is_empty())
 }
 
+/// The producer's word that `feedback.act` digests the unmasked, unbounded attempt
+/// (`handler::act_exact_of`). Only an explicit `true` counts.
+fn entry_act_exact(e: &ChainEntry) -> bool {
+    e.event_data.get("act_exact").and_then(Value::as_bool) == Some(true)
+}
+
 /// Derive temperament + collect adjudication evidence for one grain from a
 /// chain window (oldest-first order is established internally).
 /// Chain event type that records "identity A's evidence belongs to identity B".
@@ -701,7 +707,9 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         // `feedback.act` digests the WHOLE attempt, so truncation of the row's display text is
         // harmless on that branch — but it digests the REDACTED attempt (`act_digest`: "never a
         // proof"), so a redacted attempt on either side is no identity there either (NOVA's hold
-        // on 774053993).
+        // on 774053993). The display text cannot show a mask past its cut, so the producer
+        // records `act_exact` over the whole input and the digest counts only when both rows
+        // say true (NOVA's re-review of 7c73d48c9).
         let unredacted_act_text = |text: &str| {
             !text.trim_end().is_empty() && !text.contains("[REDACTED —") && !text.contains("***")
         };
@@ -726,8 +734,16 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
                     let attempted = entry_str(e, "attempted").unwrap_or_default();
                     let target = entry_str(e, "target").unwrap_or_default();
                     match (entry_feedback_act(deny), entry_feedback_act(e)) {
-                        (Some(a), Some(b)) => {
-                            a == b && denied_unredacted && unredacted_act_text(attempted)
+                        // Two whole-act digests that differ are two acts, whatever else agrees.
+                        (Some(a), Some(b)) if a != b => false,
+                        // Equal digests are identity only when BOTH producers said nothing was
+                        // masked or bounded anywhere in the whole input (`act_exact`). False or
+                        // absent (a row before the flag) falls through to the display-text branch
+                        // below, which only an untruncated, unmasked `attempted` can pass.
+                        (Some(_), Some(_))
+                            if entry_act_exact(deny) && entry_act_exact(e) =>
+                        {
+                            denied_unredacted && unredacted_act_text(attempted)
                         }
                         _ => denied_complete
                             && complete_act_text(attempted)
@@ -755,8 +771,8 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         // RECAST-AFTER-DENY — the gap kimi named, and the half that still selected for
         // the thing it was meant to discourage.
         //
-        // `retried` requires unredacted `attempted` on both decisions. With `feedback.act` on
-        // both, equal whole-attempt digests are the identity (a long verbatim retry's display
+        // `retried` requires unredacted `attempted` on both decisions. With `feedback.act` and
+        // `act_exact: true` on both, equal whole-attempt digests are the identity (a long verbatim retry's display
         // text is truncated, its digest is not); otherwise `attempted` must also be untruncated,
         // and identity is corroborated by exact command, payload hash, or a non-shell
         // resource-shaped target.
@@ -2369,6 +2385,7 @@ mod recast_tests {
         let with_feedback = |pos: u64, act: &str| {
             let mut entry = retry_policy(pos, &attempted, "same-target", "");
             entry.event_data["feedback"] = json!({"act": act});
+            entry.event_data["act_exact"] = json!(true);
             entry
         };
         let denied = with_feedback(1, "whole-act-one");
@@ -2407,5 +2424,36 @@ mod recast_tests {
             assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
                     "a matching digest over redacted attempts is not a retry ({denied:?} / {retry:?}): {d:?}");
         }
+    }
+
+    #[test]
+    fn retried_feedback_act_needs_the_producers_act_exact_on_both_sides() {
+        // NOVA's re-review of 7c73d48c9: the daemon caps `attempted` at 400 chars but digests the
+        // WHOLE redacted attempt, so a `--token VALUE` masked past the cap leaves a clean prefix
+        // on the row while two different tokens share one digest. The row cannot show that; only
+        // the producer's `act_exact` can. So does a gate summary cut at 220 with ` …`.
+        let daemon_capped = format!("{}…[truncated]", "x".repeat(400));
+        let gate_bounded = format!("Bash: {} …", "x".repeat(214));
+        let entry = |pos: u64, attempted: &str, exact: Option<bool>| {
+            let mut e = retry_policy(pos, attempted, "same-target", "");
+            e.event_data["feedback"] = json!({"act": "same-digest"});
+            if let Some(x) = exact {
+                e.event_data["act_exact"] = json!(x);
+            }
+            e
+        };
+        for attempted in [daemon_capped.as_str(), gate_bounded.as_str()] {
+            for (a, b) in [(None, None), (Some(false), Some(false)), (Some(true), Some(false)),
+                           (Some(false), Some(true)), (Some(true), None), (None, Some(true))] {
+                let d = derive("m", ROLE, &[entry(1, attempted, a), entry(2, attempted, b)]);
+                assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                        "an equal digest without act_exact on both sides ({a:?}/{b:?}) is not a \
+                         retry over {attempted:?}: {d:?}");
+            }
+        }
+        let d = derive("m", ROLE,
+                       &[entry(1, &daemon_capped, Some(true)), entry(2, &daemon_capped, Some(true))]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("retry-after-deny"),
+                "both producers vouch the digest is the whole act: {d:?}");
     }
 }

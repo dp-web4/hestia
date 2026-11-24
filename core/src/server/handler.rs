@@ -2010,6 +2010,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         &json!({"policy_version": policy_version, "role_lct": role_lct, "enforced": evaluation.enforced}),
     );
     feedback.act = Some(act);
+    // Whether that digest is an act IDENTITY: judged here over the whole input, where masking past
+    // the row's display cut is still visible (NOVA's re-review of 7c73d48c9). Null with no attempt.
+    let act_exact = full_command.zip(attempted_whole.as_deref()).map(|(raw, w)| act_exact_of(raw, w));
     let mut committed_feedback = None;
     let mut feedback_recorded = false;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
@@ -2094,6 +2097,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 // trace of the operation. Stored explicitly and scrubbed, so the UI has
                 // one field to read for every tool rather than a per-tool special case.
                 "attempted": attempted,
+                // True only when `feedback.act` digests the unmasked, unbounded attempt
+                // (`act_exact_of`); derivation scores a digest retry only on true on both sides.
+                "act_exact": act_exact,
                 // The verdict as feedback: level, serves, act key, doors, repeat_of (above).
                 "feedback": feedback.to_value(),
             });
@@ -3504,6 +3510,22 @@ fn redact_secrets(input: &str) -> String {
     fin.join(" ")
 }
 
+/// Is `feedback.act` — a digest over `redacted`, the whole attempt after `redact_secrets` — an
+/// IDENTITY of the act, so that two equal digests mean two equal acts? Only when nothing was
+/// masked or bounded anywhere in the input: not by this daemon (`redacted` differs from the
+/// whitespace-normalised `raw`), and not by the sender (its `***` value mask, `[REDACTED —`
+/// withholding, or `…` cut, which `attempted_summary` applies before the daemon sees the text).
+/// Decided at the producer over the whole input because the row's `attempted` is capped at
+/// `ATTEMPTED_MAX`: a mask past the cap is invisible to any reader of the row (NOVA's re-review
+/// of 7c73d48c9). Conservative: a command that merely contains `***` or `…` reads as not exact.
+fn act_exact_of(raw: &str, redacted: &str) -> bool {
+    let normalised = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    redacted == normalised
+        && !redacted.contains('…')
+        && !redacted.contains("[REDACTED —")
+        && !redacted.contains("***")
+}
+
 // =========================================================================
 // Appeals — filing, dispatch to a not-same arbiter, and the ruling
 // =========================================================================
@@ -4907,7 +4929,14 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     // intent — never persist an unbounded payload into a less-protected surface — by
     // requiring the SENDER to bound and scrub, and by clamping here regardless, since a
     // gate that over-shares must not be able to make the daemon over-store.
-    let attempted_whole = optional_string(args, "attempted").map(|a| redact_secrets(&a));
+    let attempted_raw = optional_string(args, "attempted");
+    let attempted_whole = attempted_raw.as_deref().map(redact_secrets);
+    // Judged over the WHOLE sent text: a gate's own mask or bound (`attempted_summary`'s
+    // `***`, `[REDACTED —`, ` …`) makes the digest below a digest of a summary, not of the act.
+    let act_exact = attempted_raw
+        .as_deref()
+        .zip(attempted_whole.as_deref())
+        .map(|(raw, w)| act_exact_of(raw, w));
     let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
             a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
@@ -5056,6 +5085,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "reason": reason,
         "payload_sha256": payload_sha256,
         "attempted": attempted,
+        "act_exact": act_exact,
         "rule_id": rule_id,
         "verdict_available": verdict_available,
     });
@@ -37042,6 +37072,73 @@ mod verdict_feedback_tests {
             "different long attempts must not share a digest");
         assert_eq!(second["feedback"]["repeat_of"], Value::Null,
             "a shared capped prefix is not a repeated act: {second}");
+    }
+
+    /// NOVA's re-review of 7c73d48c9: a mask PAST the 400-char display cut. Two acts that differ
+    /// only in a credential value there share `feedback.act` (the digest is over the redacted
+    /// whole) while both rows' `attempted` prefixes are clean, so no reader of the row can see the
+    /// mask. The producer, which still holds the whole input, says so in `act_exact`, and the
+    /// retry predicate then refuses the digest as identity.
+    #[tokio::test]
+    async fn a_mask_past_the_display_cut_is_recorded_and_defeats_digest_identity() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let pad = "x".repeat(ATTEMPTED_MAX + 20);
+        let mut hashes = Vec::new();
+        for value in ["AAAA", "BBBB"] {
+            let mut args = witnessed("mrh.path");
+            args["tool_name"] = json!("Bash");
+            args["target"] = json!("curl");
+            args["session_id"] = json!("s-mask");
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            args["attempted"] = json!(format!("curl {pad} --token {value}"));
+            let got = tool_witness_decision(&state, &args).await.unwrap();
+            assert_eq!(got["recorded"], json!("appended"), "{got}");
+            hashes.push(got["witnessEntryHash"].as_str().unwrap().to_string());
+        }
+        let (a, b) = (row(&state, &hashes[0]).await, row(&state, &hashes[1]).await);
+        assert_eq!(a["feedback"]["act"], b["feedback"]["act"],
+            "precondition: the two tokens collapse to one redacted digest");
+        for r in [&a, &b] {
+            let shown = r["attempted"].as_str().unwrap();
+            assert!(!shown.contains("***") && !shown.contains("[REDACTED"),
+                "precondition: the mask is past the display cut: {shown}");
+            assert_eq!(r["act_exact"], json!(false), "the producer saw the mask: {r}");
+        }
+        let entries: Vec<_> = {
+            let s = state.lock().await;
+            s.recent_chain(500).into_iter().filter(|e| hashes.contains(&e.hash)).collect()
+        };
+        let role = a["role_lct"].as_str().unwrap_or_default().to_string();
+        let d = crate::derivation::derive_evidence("codex", &role, &entries);
+        assert!(!d.temperament.evidence.is_empty()
+                && d.temperament.evidence.iter().all(|e| e.contribution.starts_with("comply-after-deny")),
+            "two acts that share only a masked digest are not a retry: {d:?}");
+
+        // The same long attempt unmasked: the digest IS the act, and says so.
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["attempted"] = json!(format!("curl {pad} --verbose"));
+        let got = tool_witness_decision(&state, &args).await.unwrap();
+        let r = row(&state, got["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(true), "{r}");
+        // A gate summary bounded at its own cut is a digest of a summary, not of the act.
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["attempted"] = json!(format!("Bash: {} …", "x".repeat(214)));
+        let got = tool_witness_decision(&state, &args).await.unwrap();
+        let r = row(&state, got["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(false), "{r}");
+
+        // The daemon's own ruling path records the same provenance.
+        let sid = session(&state, "kimi-code").await;
+        let q = rule(&state, &sid, &format!("{DENY_CMD} {pad} --token CCCC"), None).await;
+        assert_eq!(q["decision"], json!("deny"), "precondition: {q}");
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert!(!r["attempted"].as_str().unwrap().contains("***"), "precondition: {r}");
+        assert_eq!(r["act_exact"], json!(false), "{r}");
+        let q = rule(&state, &sid, &format!("{DENY_CMD} {pad}"), None).await;
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(true), "{r}");
     }
 
     #[tokio::test]
