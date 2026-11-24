@@ -9143,6 +9143,48 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
     Ok(out)
 }
 
+/// Witness is finality for a lease change (NOVA re-review of #1513, mirroring #1650's
+/// corroboration undo): when the `member_notice_claimed` / `member_notice_released` append
+/// fails, put the lease back to its exact prior owner/expiry while the state lock is still
+/// held, and say so. The restore is compare-and-swap against what this act wrote; if it does
+/// not apply (or `prior` is unknown) the answer is explicitly `lease_state: "uncertain"`.
+fn undo_unwitnessed_member_claim(
+    store: &crate::storage::SqliteInboxStore,
+    notice_id: u64,
+    to_plugin: &str,
+    action: &str,
+    written: &crate::storage::inbox::MemberNoticeLease,
+    prior: Option<&crate::storage::inbox::MemberNoticeLease>,
+    append_err: &anyhow::Error,
+) -> Value {
+    let restore = match prior {
+        Some(prior) => store
+            .restore_member_notice_lease(notice_id, to_plugin, written, prior)
+            .map_err(|e| e.to_string()),
+        None => Err("the prior lease was not readable before the change".to_string()),
+    };
+    let (lease_state, restore_error) = match &restore {
+        Ok(true) => ("restored_to_prior", None),
+        Ok(false) => ("uncertain", Some("the row changed after this act; nothing was restored".to_string())),
+        Err(e) => ("uncertain", Some(e.clone())),
+    };
+    hestia_error_envelope(
+        "hestia.member_claim_unwitnessed",
+        if lease_state == "restored_to_prior" {
+            "the lease change was NOT recorded — its witness append failed; the lease is back to its exact prior owner and expiry"
+        } else {
+            "the lease change was NOT recorded — its witness append failed, and the rollback could not be confirmed; treat the lease state as uncertain"
+        },
+        Some(json!({
+            "notice_id": notice_id,
+            "action": action,
+            "lease_state": lease_state,
+            "restore_error": restore_error,
+            "append_error": append_err.to_string(),
+        })),
+    )
+}
+
 async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
     use crate::storage::inbox::MemberNoticeClaimOutcome;
 
@@ -9196,6 +9238,12 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(denied);
     }
     let session = who.session_uuid.expect("attributed callers have a session");
+    // The exact lease before this act, read under the same state lock as the change, so a
+    // failed witness append can put it back (fresh claim, renewal, expired takeover, release).
+    let prior_lease = s
+        .inbox_store
+        .member_notice_lease(notice_id, &who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("reading member notice lease: {e}"))?;
     let outcome = if action == "release" {
         s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
     } else {
@@ -9214,7 +9262,7 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
             renewed,
             superseded_expired_claim,
         } => {
-            let entry = s.append_chain(
+            let entry = match s.append_chain(
                 "member_notice_claimed",
                 json!({
                     "notice_id": notice_id,
@@ -9226,7 +9274,19 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                     "renewed": renewed,
                     "superseded_expired_claim": superseded_expired_claim,
                 }),
-            )?;
+            ) {
+                Ok(entry) => entry,
+                Err(append_err) => {
+                    let written = crate::storage::inbox::MemberNoticeLease {
+                        claimed_by_session: Some(session.to_string()),
+                        claim_expires_at: Some(claim_expires_at.to_rfc3339()),
+                    };
+                    return Ok(undo_unwitnessed_member_claim(
+                        &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                        prior_lease.as_ref(), &append_err,
+                    ));
+                }
+            };
             Ok(json!({
                 "notice_id": notice_id,
                 "claimed": true,
@@ -9238,7 +9298,7 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
         }
         MemberNoticeClaimOutcome::Released { was_claimed } => {
             let witness = if was_claimed {
-                Some(s.append_chain(
+                match s.append_chain(
                     "member_notice_released",
                     json!({
                         "notice_id": notice_id,
@@ -9246,7 +9306,20 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                         "role_lct": who.role_lct,
                         "session_id": session,
                     }),
-                )?)
+                ) {
+                    Ok(entry) => Some(entry),
+                    Err(append_err) => {
+                        // An unwitnessed release must not free the notice for a sibling drain.
+                        let written = crate::storage::inbox::MemberNoticeLease {
+                            claimed_by_session: None,
+                            claim_expires_at: None,
+                        };
+                        return Ok(undo_unwitnessed_member_claim(
+                            &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                            prior_lease.as_ref(), &append_err,
+                        ));
+                    }
+                }
             } else {
                 None
             };
@@ -13553,6 +13626,111 @@ mod member_mesh_tests {
             .expect("claim was not witnessed");
         assert_eq!(event.event_data["notice_id"], json!(queued[0]));
         assert_eq!(event.event_data["plugin_id"], json!("kimi-code"));
+    }
+
+    /// NOVA re-review of #1513: a lease change whose witness append fails must not stay
+    /// effective. For each of fresh claim, renewal, expired takeover and release, inject a
+    /// failure on exactly that act's chain event, and require (a) an explicit unwitnessed
+    /// error with `lease_state: restored_to_prior`, (b) the row's owner/expiry byte-identical
+    /// to before, and (c) for release, that a sibling session still cannot drain the notice.
+    async fn unwitnessed_lease_change_rolls_back(arm: &str) {
+        let (dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let sibling = connect(&state, "kimi-code").await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let witness = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        witness.pragma_update(None, "key", hex::encode(key)).unwrap();
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "shared-context/forum/lease.md", "session_id": sender}),
+        )
+        .await
+        .unwrap();
+        let id = sent["queued_id"].as_u64().expect("notice queued");
+        let lease = || {
+            let state = state.clone();
+            async move {
+                state.lock().await.inbox_store.member_notice_lease(id, "kimi-code").unwrap()
+                    .expect("notice still undrained")
+            }
+        };
+        let claim = |session: &str, extra: Value| {
+            let state = state.clone();
+            let mut args = json!({"notice_id": id, "session_id": session});
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            async move { tool_member_claim(&state, &args).await.unwrap() }
+        };
+
+        // Arrange the lease the failing act starts from.
+        let (actor, extra, event) = match arm {
+            "fresh" => (&owner, json!({}), "member_notice_claimed"),
+            "renew" => {
+                let ok = claim(&owner, json!({"lease_secs": 120})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"lease_secs": 3600}), "member_notice_claimed")
+            }
+            "takeover" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                let inbox = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+                inbox.pragma_update(None, "key", hex::encode(key)).unwrap();
+                inbox.execute("UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                              rusqlite::params!["2000-01-01T00:00:00+00:00", id as i64]).unwrap();
+                (&sibling, json!({}), "member_notice_claimed")
+            }
+            "release" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"action": "release"}), "member_notice_released")
+            }
+            other => panic!("unknown arm {other}"),
+        };
+        let prior = lease().await;
+        assert_eq!(prior.claimed_by_session.is_some(), arm != "fresh", "{arm}: setup {prior:?}");
+
+        witness.execute_batch(&format!(
+            "CREATE TRIGGER fail_lease BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = '{event}'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;")).unwrap();
+        let r = claim(actor, extra).await;
+        witness.execute_batch("DROP TRIGGER fail_lease").unwrap();
+
+        assert_eq!(r["_hestia_error"]["code"], json!("hestia.member_claim_unwitnessed"),
+                   "{arm}: {r}");
+        assert_eq!(r["_hestia_error"]["data"]["lease_state"], json!("restored_to_prior"),
+                   "{arm}: {r}");
+        assert_eq!(lease().await, prior, "{arm}: the lease change stayed effective unwitnessed");
+        if arm == "release" {
+            let sibling_mail = tool_member_inbox(&state, &json!({"session_id": sibling}))
+                .await
+                .unwrap();
+            assert_eq!(sibling_mail["total"], json!(0),
+                       "an unwitnessed release let a sibling consume the notice: {sibling_mail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_fresh_claim_is_rolled_back() {
+        unwitnessed_lease_change_rolls_back("fresh").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_renewal_is_rolled_back_to_the_prior_expiry() {
+        unwitnessed_lease_change_rolls_back("renew").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_expired_takeover_is_rolled_back_to_the_prior_owner() {
+        unwitnessed_lease_change_rolls_back("takeover").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_release_is_rolled_back_and_blocks_sibling_drain() {
+        unwitnessed_lease_change_rolls_back("release").await;
     }
 
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an

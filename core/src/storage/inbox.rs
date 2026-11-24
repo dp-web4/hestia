@@ -1616,6 +1616,61 @@ impl SqliteInboxStore {
         Ok(outcome)
     }
 
+    /// The exact lease columns of one undrained local notice, as stored (raw strings, so a
+    /// restore writes back byte-identical values). `None` when the row is absent, drained,
+    /// forwarded, or not addressed to `to_plugin`. The handler reads this BEFORE a claim,
+    /// renewal, takeover or release so that a failed witness append can undo the change
+    /// (NOVA re-review of #1513: an unwitnessed lease change must not stay effective).
+    pub fn member_notice_lease(&self, id: u64, to_plugin: &str) -> Result<Option<MemberNoticeLease>> {
+        let conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        conn.query_row(
+            "SELECT claimed_by_session, claim_expires_at FROM member_notices
+             WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL AND drained_at IS NULL",
+            params![id as i64, to_plugin],
+            |row| {
+                Ok(MemberNoticeLease {
+                    claimed_by_session: row.get(0)?,
+                    claim_expires_at: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .context("reading member notice lease")
+    }
+
+    /// Compare-and-swap a lease back to `prior`, but only while the row still holds exactly
+    /// `written` (the change being undone) and is undrained. Returns whether the row was
+    /// restored; `false` means something else changed it meanwhile and the caller must
+    /// report the lease state as uncertain rather than claim a rollback it did not make.
+    pub fn restore_member_notice_lease(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        written: &MemberNoticeLease,
+        prior: &MemberNoticeLease,
+    ) -> Result<bool> {
+        let conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let changed = conn
+            .execute(
+                "UPDATE member_notices
+                 SET claimed_by_session = ?3, claim_expires_at = ?4
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL AND drained_at IS NULL
+                   AND claimed_by_session IS ?5 AND claim_expires_at IS ?6",
+                params![
+                    id as i64,
+                    to_plugin,
+                    prior.claimed_by_session,
+                    prior.claim_expires_at,
+                    written.claimed_by_session,
+                    written.claim_expires_at,
+                ],
+            )
+            .context("restoring member notice lease")?;
+        Ok(changed == 1)
+    }
+
     /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
     /// recipient-scoped (a member can never drain another member's mail).
     /// Same at-least-once failure bias as the hub-notice drain.
@@ -2176,6 +2231,13 @@ impl SqliteInboxStore {
 pub const MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS: i64 = 15 * 60;
 pub const MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS: i64 = 30;
 pub const MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS: i64 = 60 * 60;
+
+/// The raw lease columns of one notice (`claimed_by_session`, `claim_expires_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberNoticeLease {
+    pub claimed_by_session: Option<String>,
+    pub claim_expires_at: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberNoticeClaimOutcome {
