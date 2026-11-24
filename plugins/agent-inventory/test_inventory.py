@@ -1543,6 +1543,13 @@ def _being_cases(d, U, being):
     check("being: law defects stay with the affected member",
           [inventory.has_tag(row["findings"], "LAW-SOURCE") for row in rows], [False, True])
     check("being: expansion is the inventory aggregation shape", inventory.expand_being_record(r), rows)
+    live = "/Users/x/Library/LaunchAgents/com.web4.sage.mcnugget.plist"
+    check("being: a finding names its unit as a whole path, not a prefix of a retired copy",
+          (inventory.names_unit(f"launcher {live} is not enabled", live),
+           inventory.names_unit(f"LAW-SOURCE: '{live}' sets no HESTIA_HOME", live),
+           inventory.names_unit(f"launcher {live}.retired-2026-09-18 is not enabled", live),
+           inventory.names_unit(f"launcher {live}-next is not enabled", live)),
+          (True, True, False, False))
     multi = d / "multi-member.service"
     multi.write_text("ExecStart=python3 -m sage.gateway.heartbeat --member first-being --member second-being\n")
     ambiguous = being([multi])
