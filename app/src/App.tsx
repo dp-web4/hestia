@@ -13,6 +13,7 @@ import { Fleet } from "./pages/Fleet";
 import { Settings } from "./pages/Settings";
 import { OperatorBar } from "./components/OperatorBar";
 import { CompatBanner } from "./components/CompatBanner";
+import { GateIntegrityBanner } from "./components/GateIntegrityBanner";
 import { APP_VERSION } from "./lib/compat";
 import "./styles/global.css";
 
@@ -46,6 +47,7 @@ export default function App() {
         </nav>
         <main className="main-content">
           <CompatBanner />
+          <GateIntegrityBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/decide" element={<Decide />} />

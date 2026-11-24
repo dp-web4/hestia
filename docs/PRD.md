@@ -1,7 +1,7 @@
 # Hestia — Product Requirements Document
 
 **Status**: draft v5 (current-source reconciliation at `9a6a5c2`; requirements remain normative, implementation status is evidence-ranked below) · **Date**: 2026-08-08 · **Owner**: dp
-**Companions**: `STATUS_AUDIT_2026-08-08.md` (current evidence) · `PRD_GOVERNANCE.md` (the governance design) · `ARCHITECTURE.md` (how it works) · `APP_BUILD_PLAN.md` (app implementation and release state) · `PROTOCOL.md` (the wire) · this doc is the *what & why*.
+**Companions**: `PRD_READINESS.md` (generated, commit-pinned evidence ledger) · `STATUS_AUDIT_2026-08-08.md` (historical evidence snapshot) · `PRD_GOVERNANCE.md` (the governance design) · `ARCHITECTURE.md` (how it works) · `APP_BUILD_PLAN.md` (app implementation and release state) · `PROTOCOL.md` (the wire) · this doc is the *what & why*.
 
 ---
 
@@ -22,7 +22,7 @@ One rung never proves the next. The 2026-08-08 snapshot is:
 - **User evidence:** no clean-machine nontechnical cold run, owner-seat correct-deny transcript, or
   second-device constellation run yet.
 
-The reproducible matrix and issue dispositions live in `STATUS_AUDIT_2026-08-08.md`.
+The 2026-08-08 reproducible matrix and issue dispositions remain in `STATUS_AUDIT_2026-08-08.md` as a historical snapshot. The incrementally maintained capability ledger (a snapshot pinned to a source commit and measured-at time) is [`PRD_READINESS.md`](PRD_READINESS.md), generated from `PRD_READINESS.json` by `tools/prd_readiness.py`; it separates evidence rungs from requirement coverage and mechanically indexes open work.
 
 ## 1. One-line
 
