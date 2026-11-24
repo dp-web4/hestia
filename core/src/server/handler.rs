@@ -10261,41 +10261,54 @@ fn resolve_escalation_pointer_for_session(
             .cloned()
     };
     let opened = newest(&["gate_escalation_opened"]);
-    // A terminal event TYPE alone is not a valid ruling. Recovery follows the newest row that
-    // belongs to this opener and carries a recognizable decision, withdrawal, or expiry shape;
-    // a malformed later row cannot erase the fields of the latest valid one.
+    // A terminal event TYPE alone is not a valid ruling. Inspect the newest terminal candidate
+    // first: an unparseable newer ruling is UNKNOWN history, never permission to revive an older
+    // approval (#1661 review).
     let settled = opened.as_ref().and_then(|opened| {
         let opened_plugin = opened.event_data.get("plugin_id").and_then(Value::as_str);
         rows.iter().rev().find(|e| {
-            if e.chain_position <= opened.chain_position {
-                return false;
-            }
-            if opened_plugin.is_none()
-                || e.event_data.get("plugin_id").and_then(Value::as_str) != opened_plugin
-            {
-                return false;
-            }
-            let status = e.event_data.get("status").and_then(Value::as_str);
-            let decided_by = e
-                .event_data
-                .get("decided_by")
-                .and_then(Value::as_str)
-                .is_some_and(|by| !by.trim().is_empty());
-            match e.event_type.as_str() {
-                "gate_escalation_decided" => {
-                    matches!(status, Some("approved") | Some("denied")) && decided_by
-                }
-                "gate_escalation_withdrawn" => {
-                    status == Some("denied")
-                        && e.event_data.get("decided_via").and_then(Value::as_str)
-                            == Some("self_withdrawn")
-                        && decided_by
-                }
-                "gate_escalation_expired" => true,
-                _ => false,
-            }
+            e.chain_position > opened.chain_position
+                && opened_plugin.is_some()
+                && e.event_data.get("plugin_id").and_then(Value::as_str) == opened_plugin
+                && matches!(e.event_type.as_str(),
+                    "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired")
         }).cloned()
     });
+    if let Some(e) = settled.as_ref() {
+        let status = e.event_data.get("status").and_then(Value::as_str);
+        let decided_by = e
+            .event_data
+            .get("decided_by")
+            .and_then(Value::as_str)
+            .is_some_and(|by| !by.trim().is_empty());
+        let valid = match e.event_type.as_str() {
+            "gate_escalation_decided" => {
+                matches!(status, Some("approved") | Some("denied")) && decided_by
+            }
+            "gate_escalation_withdrawn" => {
+                status == Some("denied")
+                    && e.event_data.get("decided_via").and_then(Value::as_str)
+                        == Some("self_withdrawn")
+                    && decided_by
+            }
+            "gate_escalation_expired" => true,
+            _ => false,
+        };
+        if !valid {
+            let mut out = hestia_error_envelope(
+                "hestia.escalation_history_invalid",
+                &format!(
+                    "the newest terminal row for escalation {ptr} has an unrecognized status or decision shape; the older approval is not authoritative"
+                ),
+                Some(json!({"terminal_entry": chain_entry_json(e)})),
+            );
+            out["source"] = json!("witness_chain");
+            out["status"] = json!("unknown");
+            out["escalation_id"] = json!(ptr);
+            out["terminal_entry"] = chain_entry_json(e);
+            return out;
+        }
+    }
     // THE SPEND, which is not a settlement and must not be mistaken for one: a claimed entry
     // carries no `status`, and reading it as the settlement would render it `denied`.
     let claimed = newest(&["gate_escalation_claimed"]);
@@ -20414,18 +20427,6 @@ mod tests {
             }
             s.append_chain(
                 "gate_escalation_decided",
-                json!({"escalation_id": id, "plugin_id": "codex", "decided_by": "operator",
-                       "reason": "missing status must not become a denial"}),
-            )
-            .unwrap();
-            s.append_chain(
-                "gate_escalation_decided",
-                json!({"escalation_id": id, "plugin_id": "codex", "status": "revoked",
-                       "decided_by": "operator", "reason": "not a supported terminal status"}),
-            )
-            .unwrap();
-            s.append_chain(
-                "gate_escalation_decided",
                 json!({"escalation_id": id, "plugin_id": "kimi-code", "status": "approved",
                        "decided_by": "operator", "reason": "another member cannot settle this"}),
             )
@@ -20446,6 +20447,25 @@ mod tests {
         assert_eq!(denied["permits_write"], false, "{denied}");
         assert_eq!(denied["granted"], false, "{denied}");
 
+        for extra in [
+            json!({"escalation_id": id, "plugin_id": "codex", "decided_by": "operator",
+                   "reason": "missing status must not become a denial"}),
+            json!({"escalation_id": id, "plugin_id": "codex", "status": "revoked",
+                   "decided_by": "operator", "reason": "not a supported terminal status"}),
+        ] {
+            shared.lock().await.append_chain("gate_escalation_decided", extra).unwrap();
+            let unknown = tool_gate_escalation_poll(
+                &shared, &json!({"escalation_id": id, "session_id": session}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unknown["status"], "unknown", "{unknown}");
+            assert_eq!(unknown["history_lookup"], "opened", "{unknown}");
+            assert_eq!(unknown["reason"], Value::Null, "{unknown}");
+            assert_eq!(unknown["permits_write"], false, "{unknown}");
+            assert_eq!(unknown["granted"], false, "{unknown}");
+        }
+
         shared.lock().await.append_chain(
             "gate_escalation_withdrawn",
             json!({"escalation_id": id, "plugin_id": "codex", "status": "denied",
@@ -20464,6 +20484,22 @@ mod tests {
         assert_eq!(withdrawn["bar"], opened["bar"], "{withdrawn}");
         assert_eq!(withdrawn["permits_write"], false, "{withdrawn}");
         assert_eq!(withdrawn["granted"], false, "{withdrawn}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_open_ask_does_not_wait_as_live_pending() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        let polled = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["status"], "expired", "{polled}");
+        assert_eq!(polled["history_lookup"], "opened", "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["claim_window_secs_remaining"], 0, "{polled}");
+        assert!(polled["note"].as_str().unwrap().contains("no live ruling path"), "{polled}");
     }
 
     #[tokio::test]
@@ -28466,6 +28502,13 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         .as_ref()
         .map(|h| h["status"].clone())
         .unwrap_or_else(|| json!(live_status));
+    let reply_status = if esc.is_none() && history_lookup == "opened" && reply_status == "pending" {
+        // A recovered open record has no live ruling path. Do not keep `await_escalation`
+        // waiting as though this were a live pending row (#1661 review).
+        json!("expired")
+    } else {
+        reply_status
+    };
     let granted = live_status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false);
 
     Ok(json!({
@@ -28581,8 +28624,8 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
             None if history_lookup == "terminal" => "terminal record recovered from the witness \
                                                      chain; permits_write stays false because no \
                                                      spend authority is restored",
-            None if history_lookup == "opened" => "the escalation is on the witness chain but has \
-                                                   no valid terminal ruling; permits_write stays \
+            None if history_lookup == "opened" => "the recovered open record has no live ruling \
+                                                   path: treated as expired and permits_write stays \
                                                    false",
             None if history_lookup == "not_found" => "no escalation with this id exists in the \
                                                       live store or anywhere on the witness chain; \
