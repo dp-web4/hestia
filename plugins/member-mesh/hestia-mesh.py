@@ -594,7 +594,7 @@ def main():
                       f"--operation-id {op_id!r}; the daemon will recover the first result.")
         else:
             advice = ("  The request may have been COMMITTED. This send has no operation id, "
-                      "so retrying may duplicate it. Check unanswered (or peek) first.")
+                      "so retrying may duplicate it. Check unanswered first.")
         print(f"hestia-mesh: UNDETERMINED — {EP} did not answer in time: {u}\n{advice}",
               file=sys.stderr)
         sys.exit(4)

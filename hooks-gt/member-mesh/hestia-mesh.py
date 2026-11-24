@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: dfb4ff4ac958a32bec763900a933f139e25ab9fffd3d8e4ce72428ed06e1ff21  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 0d3892d100df7b63d2fabec3d94fa5fc6486641513a133c5077679810f61e6a9  (published ground truth; manifest: hooks-gt)
 """hestia-mesh — member-mesh CLI for a local hestia member (Kimi's send/receive surface).
 
 Usage:
@@ -595,7 +595,7 @@ def main():
                       f"--operation-id {op_id!r}; the daemon will recover the first result.")
         else:
             advice = ("  The request may have been COMMITTED. This send has no operation id, "
-                      "so retrying may duplicate it. Check unanswered (or peek) first.")
+                      "so retrying may duplicate it. Check unanswered first.")
         print(f"hestia-mesh: UNDETERMINED — {EP} did not answer in time: {u}\n{advice}",
               file=sys.stderr)
         sys.exit(4)

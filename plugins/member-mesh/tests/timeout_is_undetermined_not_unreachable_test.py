@@ -101,6 +101,9 @@ class TimeoutIsUndetermined(unittest.TestCase):
         # must say the write may have landed, or the caller duplicates it.
         self.assertIn("UNDETERMINED", slow.stderr)
         self.assertIn("may have been COMMITTED", slow.stderr)
+        self.assertIn("Check unanswered first.", slow.stderr)
+        self.assertNotIn("or peek", slow.stderr,
+                         "peek has no unanswered fold and is not a retry-safety check (#1088)")
         self.assertNotIn("UNDETERMINED", refused.stderr)
 
     def test_the_deadline_is_configurable_and_the_default_clears_the_measured_tail(self):
