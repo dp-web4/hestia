@@ -1543,6 +1543,11 @@ def _being_cases(d, U, being):
     check("being: law defects stay with the affected member",
           [inventory.has_tag(row["findings"], "LAW-SOURCE") for row in rows], [False, True])
     check("being: expansion is the inventory aggregation shape", inventory.expand_being_record(r), rows)
+    mixed = [dict(rows[0]), dict(rows[1])]
+    mixed[1]["governed"] = False
+    mixed[1]["unknown"] = ["one member has an unassessed fact"]
+    check("being: summary ids follow the member, not the shared atlas name",
+          inventory.classify(mixed)["unknown"], ["mcnugget-being"])
     multi = d / "multi-member.service"
     multi.write_text("ExecStart=python3 -m sage.gateway.heartbeat --member first-being --member second-being\n")
     ambiguous = being([multi])

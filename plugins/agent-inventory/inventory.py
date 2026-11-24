@@ -535,6 +535,7 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
             row.update({
                 "member": member,
                 "plugin": member,
+                "_expanded_member": True,
                 "members": [member],
                 "launchers": own,
                 "unknown": local(rec["unknown"]),
@@ -1968,34 +1969,35 @@ def classify(recs: list[dict]) -> dict:
         "ungovernable": [], "dormant_plugin": [], "unknown": [], "unprovisioned_being": [],
         "windows_host": []}
     for r in recs:
+        summary_id = r["member"] if r.get("_expanded_member") else r["agent"]
         if r["unknown"]:
-            gaps["unknown"].append(r["agent"])
+            gaps["unknown"].append(summary_id)
         if r.get("kind") == "being":
             # A being is never "ungovernable: no plugin exists" -- it needs none. Its one gap
             # is its own, with its own remedy (mint, join, admit, launch).
             if r.get("unprovisioned"):
-                gaps["unprovisioned_being"].append(r["agent"])
+                gaps["unprovisioned_being"].append(summary_id)
             continue
         # Its own bucket, and NOT in the elif chain: a stranger's dead gate is a real
         # finding with a remedy in someone else's repo, so it must not consume the slot
         # that would otherwise report an actual hestia gap on the same agent.
         if r["installed"] and r["miswired_3p"]:
-            gaps["miswired_3p"].append(r["agent"])
+            gaps["miswired_3p"].append(summary_id)
         if r["installed"] and r["miswired"]:
-            gaps["miswired"].append(r["agent"])
+            gaps["miswired"].append(summary_id)
         elif r["installed"] and r["partial"]:
             # The state worth having: observation wired, enforcement absent. It is where
             # a machine sits while it LOOKS covered.
-            gaps["partial"].append(r["agent"])
+            gaps["partial"].append(summary_id)
         elif r["installed"] and not r["governed"]:
             key = "ungoverned" if r["plugin_available"] else "ungovernable"
-            gaps[key].append(r["agent"])
+            gaps[key].append(summary_id)
         if r.get("windows_host_executable"):
             # An independent Windows presence remains a gap even when a Linux executable is also
             # installed and governed: that other copy cannot be gated by this seat's Linux hooks.
-            gaps["windows_host"].append(r["agent"])
+            gaps["windows_host"].append(summary_id)
         elif r["plugin_available"] and not r["installed"]:
-            gaps["dormant_plugin"].append(r["agent"])
+            gaps["dormant_plugin"].append(summary_id)
     return gaps
 
 
@@ -2259,8 +2261,8 @@ def main() -> int:
     installed = [r for r in recs if r["installed"]]
     governed = [r for r in installed if r["governed"]]
     gaps = classify(recs)
-    fragile = sorted({r["agent"] for r in installed
-                      if any(f.startswith("FRAGILE") for f in r["findings"])})
+    fragile = sorted({(r["member"] if r.get("_expanded_member") else r["agent"])
+                      for r in installed if any(f.startswith("FRAGILE") for f in r["findings"])})
 
     # Rule 4: report the scope achieved, so every number above is falsifiable by the
     # reader instead of trusted. `plugins_available` in particular is read from the
@@ -2388,13 +2390,15 @@ def main() -> int:
         "machine": platform.node(),
         "registry_known": len(known),
         # A. installed  B. available  C. governed
-        "installed": sorted(r["agent"] for r in installed),
+        "installed": sorted((r["member"] if r.get("_expanded_member") else r["agent"])
+                            for r in installed),
         "plugins_available": available,
-        "governed": sorted(r["agent"] for r in governed),
+        "governed": sorted((r["member"] if r.get("_expanded_member") else r["agent"])
+                           for r in governed),
         "gaps": gaps,
         **hook_qualification(recs),
         # The same verdicts keyed by MEMBER id -- what the dashboard's chips and every grant use.
-        # `gaps` and `governed` stay keyed by atlas id for their existing readers.
+        # Expanded rows use that id in summaries too; legacy rows keep their atlas-id fallback.
         "members": member_states(recs),
         "fragile": fragile,
         "unknown": unknowns,

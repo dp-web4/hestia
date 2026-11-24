@@ -100,6 +100,16 @@ describe("Agents", () => {
     expect(document.querySelector('[data-agent="hub-being"]')).not.toBeNull();
   });
 
+  it("keeps the agent-name key on an ambiguous multi-member row", async () => {
+    const ambiguous: AgentRow = { ...being, agent: "multi", plugin: "", member: undefined };
+    operatorStatus.mockResolvedValue(signedIn);
+    agentsInventory.mockResolvedValue(inventory([ambiguous]));
+    getDashboard.mockResolvedValue({ retired: [] });
+    render(<Agents />);
+    expect(await screen.findByText("multi")).toBeTruthy();
+    expect(document.querySelector('[data-agent="multi"]')).not.toBeNull();
+  });
+
   it("flags an ungoverned agent with the inventory's findings in full", async () => {
     operatorStatus.mockResolvedValue(signedIn);
     agentsInventory.mockResolvedValue(inventory([claude, codex]));
