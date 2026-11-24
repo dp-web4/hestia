@@ -4040,7 +4040,8 @@
              (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
              r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>
            <div class="esc-meta scope-route">${scopeRouteText(r)}</div>`
-        : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>`;
+        : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>${
+             r.recursive ? '<div class="esc-meta">member asks for this path and below</div>' : ''}`;
       row.innerHTML = `
         <div class="esc-row-head">
           <span class="esc-tool">${fromGate ? 'refused' : 'read'}</span>
@@ -4082,6 +4083,9 @@
         o.value = JSON.stringify(opt); o.textContent = opt.label;
         breadth.appendChild(o);
       }
+      const askedReach = scopeBreadthOptions(path, !!r.subtree)
+        .find(opt => opt.grant_path === null && opt.recursive === !!r.recursive);
+      if (askedReach) breadth.value = JSON.stringify(askedReach);
       const syncBreadth = () => { breadth.disabled = duration.value === 'once'; };
       const chosenDuration = () => (onceOnly ? 'once' : duration.value);
       duration.addEventListener('change', syncBreadth);
