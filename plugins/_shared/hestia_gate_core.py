@@ -3518,7 +3518,8 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
         except _Unmodelled:
             bare_tokens = []                     # pass 3 returns the ordinary unenumerated refusal
         for kind, word, uglob in bare_tokens:
-            if kind == "sep" or (kind == "word" and head is None and word in _SHELL_KEYWORDS):
+            if kind == "sep" or (kind == "word" and head is None
+                                 and word.replace(_BRACE_OPEN, "") in _SHELL_KEYWORDS):
                 finish_bare_command()
                 head, operands, cp_target = None, [], False
                 redirect, pending, opts_done = None, None, False

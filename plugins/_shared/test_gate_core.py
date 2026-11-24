@@ -353,6 +353,26 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
               f"{command!r}: ok={ok}, offending={offending!r}, refused={refused!r}; "
               f"wanted {expected!r}")
 
+    grouped_cases = (
+        ("grouped_read", "{ cat notes.txt; }", "notes.txt"),
+        ("grouped_write", "{ rm -f remove.txt; }", "remove.txt"),
+        ("grouped_read_after_and", "true && { cat notes.txt; }", "notes.txt"),
+        ("grouped_tee_write", "{ tee tee-out.txt; }", "tee-out.txt"),
+        ("nested_grouped_read", "{ { cat notes.txt; }; }", "notes.txt"),
+        ("nested_grouped_write", "{ { rm -f remove.txt; }; }", "remove.txt"),
+        ("function_grouped_read", "f() { cat notes.txt; }; f", "notes.txt"),
+        ("function_grouped_write", "f() { rm -f remove.txt; }; f", "remove.txt"),
+        ("negated_grouped_read", "! { cat notes.txt; }", "notes.txt"),
+        ("timed_grouped_read", "time { cat notes.txt; }", "notes.txt"),
+        ("grouped_copy_write", f"{{ cp {ws}/source.txt copy-out.txt; }}", "copy-out.txt"),
+    )
+    for name, command, target in grouped_cases:
+        ok, offending, refused = reach(command)
+        expected = os.path.normpath(os.path.join(outside, target)).replace("\\", "/")
+        check(name, not ok and refused == expected,
+              f"{command!r}: ok={ok}, offending={offending!r}, refused={refused!r}; "
+              f"wanted {expected!r}")
+
     # The event cwd is only a POSSIBLE working directory. An existing in-scope interpretation
     # still wins, and a missing bare read target is not a new scope request (#1404).
     for base in (ws, outside):
@@ -371,6 +391,9 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
           G.command_scope_reach("cat notes.txt", permitted, ws, outside)[0])
     check("an_explicit_cwd_grant_admits_the_same_new_write",
           G.command_scope_reach("echo hi > permitted.txt", permitted, ws, outside)[0])
+    for name, command, _target in grouped_cases:
+        check(name + "_allowed_by_explicit_cwd_grant",
+              G.command_scope_reach(command, permitted, ws, outside)[0])
 
     prof = _profile(ws, scopes)
     v = G.evaluate(G.NormalizedEvent(tool="Bash", command="echo hi > evaluated.txt",
