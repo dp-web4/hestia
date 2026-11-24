@@ -1057,6 +1057,12 @@ pub struct RecentEntry {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bar_met: Option<bool>,
+    /// On a `gate_escalation_expired` row, WHICH lapse it was, as `record_newly_lapsed` writes
+    /// it: `"undecided"` (the deadline passed with no ruling) or `"approved_unclaimed"` (an
+    /// approval whose claim window passed unspent). Without it the feed cannot tell the two
+    /// apart and called an approved escalation "expired unruled".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lapse_kind: Option<String>,
 }
 
 /// Flatten a `ChainEntry` into the UI-facing `RecentEntry` shape.
@@ -1115,6 +1121,7 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
         bar: d.get("bar").and_then(|v| v.as_str()).map(String::from),
         status: d.get("status").and_then(|v| v.as_str()).map(String::from),
         bar_met: d.get("bar_met").and_then(|v| v.as_bool()),
+        lapse_kind: d.get("lapse_kind").and_then(|v| v.as_str()).map(String::from),
     }
 }
 
@@ -1151,6 +1158,8 @@ struct EventFields {
     #[serde(default, deserialize_with = "str_or_none")]
     status: Option<String>,
     bar_met: Option<bool>,
+    #[serde(default, deserialize_with = "str_or_none")]
+    lapse_kind: Option<String>,
 }
 
 /// `status` is a generic key. Escalation rulings write a string, but a row of another kind
@@ -1206,6 +1215,7 @@ pub fn flatten_row(r: crate::storage::chain::ChainRowRef<'_>) -> RecentEntry {
         bar: f.bar,
         status: f.status,
         bar_met: f.bar_met,
+        lapse_kind: f.lapse_kind,
     }
 }
 
@@ -2457,6 +2467,7 @@ mod tests {
             "bar": "single_approver",
             "status": "approved",
             "bar_met": true,
+            "lapse_kind": "approved_unclaimed",
         });
         let parsed = flatten_entry(crate::storage::ChainEntry {
             hash: "h".into(),
@@ -2487,8 +2498,9 @@ mod tests {
             assert_eq!(projected.bar.as_deref(), Some("single_approver"));
             assert_eq!(projected.status.as_deref(), Some("approved"));
             assert_eq!(projected.bar_met, Some(true));
+            assert_eq!(projected.lapse_kind.as_deref(), Some("approved_unclaimed"));
             let wire = serde_json::to_value(projected).unwrap();
-            for key in ["escalation_id", "marker", "decided_by", "decided_via", "bar", "status", "bar_met"] {
+            for key in ["escalation_id", "marker", "decided_by", "decided_via", "bar", "status", "bar_met", "lapse_kind"] {
                 assert!(wire.get(key).is_some(), "{key} must reach the browser");
             }
         }

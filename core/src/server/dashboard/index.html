@@ -3091,7 +3091,12 @@
     } else if (e.event_type === 'gate_escalation_expired') {
       status = 'expired';
       statusClass = 'warn';
-      disposition = 'expired unruled';
+      // WHICH lapse (`record_newly_lapsed`): an approval whose claim window passed unspent is
+      // NOT "unruled" -- it was ruled and never used. A row with no `lapse_kind` (written
+      // before the field existed, or a writer that omits it) claims neither.
+      disposition = e.lapse_kind === 'approved_unclaimed' ? 'approved, expired unclaimed'
+        : e.lapse_kind === 'undecided' ? 'expired unruled'
+        : 'expired';
     } else if (e.event_type === 'gate_escalation_claimed') {
       status = 'claimed';
       statusClass = 'ok';

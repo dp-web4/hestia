@@ -79,7 +79,8 @@ console.log(JSON.stringify({
   claimAfterRuling: view(projectEscalations(
     [asType(approvedOpen, 'gate_escalation_claimed', {chain_position: 99, hash: 'claim'}),
      ...rows('a0a0a0a0approved')], none)),
-  expired: view(projectEscalations([asType(approvedOpen, 'gate_escalation_expired', {chain_position: 99})], none)),
+  expired: view(projectEscalations([asType(approvedOpen, 'gate_escalation_expired', {chain_position: 99, lapse_kind: 'undecided'})], none)),
+  expiredNoKind: view(projectEscalations([asType(approvedOpen, 'gate_escalation_expired', {chain_position: 99})], none)),
   hostileDetail: escapeHtml(hostileView.detail),
   // NOVA 11-22: more than one eligible terminal event, in BOTH array orders. A later ruling
   // (a re-decide after appeal, or a lapse recorded after a ruling) is the current status.
@@ -91,7 +92,7 @@ console.log(JSON.stringify({
     return view(projectEscalations(rev ? list.reverse() : list, none));
   }),
   rulingThenExpiry: [false, true].map(rev => {
-    const list = [asType(approvedOpen, 'gate_escalation_expired', {chain_position: 51, hash: 'expiry'}),
+    const list = [asType(approvedOpen, 'gate_escalation_expired', {chain_position: 51, hash: 'expiry', lapse_kind: 'approved_unclaimed'}),
       ...rows('a0a0a0a0approved')];
     return view(projectEscalations(rev ? list.reverse() : list, none));
   }),
@@ -174,6 +175,9 @@ console.log(JSON.stringify({
         check("a lapse recorded after a ruling is the newest settlement, in either array order",
               all(len(v) == 1 and v[0]["hash"] == "expiry" and v[0]["status"] == "expired"
                   for v in got["rulingThenExpiry"]), got["rulingThenExpiry"])
+        check("an approval that lapsed unclaimed is not called unruled",
+              all(v[0]["detail"].endswith("approved, expired unclaimed") and "unruled" not in v[0]["detail"]
+                  for v in got["rulingThenExpiry"]), got["rulingThenExpiry"])
         check("of two claims the newer is the row, in either array order",
               all(len(v) == 1 and v[0]["hash"] == "claim-new" for v in got["twoClaims"]), got["twoClaims"])
         check("a feed crossing a page boundary picks the ruling however the pages are joined",
@@ -203,6 +207,8 @@ console.log(JSON.stringify({
               got["claimAfterRuling"][0]["hash"] == "hash-2"
               and got["claimAfterRuling"][0]["status"] == "approved", got["claimAfterRuling"])
         check("expiry is explicit and unruled", got["expired"][0]["detail"].endswith("expired unruled"))
+        check("an expiry row with no lapse_kind claims neither ruled nor unruled",
+              got["expiredNoKind"][0]["detail"].endswith("-> expired"), got["expiredNoKind"])
         check("a hostile marker is escaped on the rendered path",
               "<" not in got["hostileDetail"] and "&lt;img" in got["hostileDetail"], got["hostileDetail"])
         check("non-escalation rows pass through unchanged", got["untouched"] == [{
