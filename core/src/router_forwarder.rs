@@ -116,16 +116,8 @@ fn ingress_connection(binding: &RouterIngressBinding) -> HubConnection {
     }
 }
 
-fn abs_rest(conn: &HubConnection) -> String {
-    if conn.rest_endpoint.starts_with("http://") || conn.rest_endpoint.starts_with("https://") {
-        conn.rest_endpoint.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/{}",
-            conn.url.trim_end_matches('/'),
-            conn.rest_endpoint.trim_matches('/')
-        )
-    }
+fn abs_rest(conn: &HubConnection) -> Result<String> {
+    crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)
 }
 
 fn sha256_content(bytes: &[u8]) -> String {
@@ -140,7 +132,7 @@ async fn open_verified_channel(
 ) -> Result<(HubChannel, web4_core::crypto::KeyPair, String)> {
     let keypair = member_signing_keypair(vault, &conn.member_key_source)
         .with_context(|| format!("resolving credential for Hub member {}", conn.our_lct_id))?;
-    let rest = abs_rest(conn);
+    let rest = abs_rest(conn)?;
     let pinned = client
         .resolve_member_pubkey(&rest, conn.hub_lct_id, conn.our_lct_id)
         .await
