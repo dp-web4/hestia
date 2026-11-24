@@ -25,9 +25,57 @@ def once(text, old, new, count=1):
 
 
 def patch_core(src):
+    src = once(src, '''def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
+''', '''def _shell_without_comments(text: str) -> str:
+    out = []
+    quote = None
+    escaped = False
+    comment = False
+    word_start = True
+    for char in text:
+        if comment:
+            if char == "\\n":
+                comment = False
+                word_start = True
+                out.append(char)
+            else:
+                out.append(" ")
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            word_start = False
+            continue
+        if quote is not None:
+            out.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char == "\\\\":
+            out.append(char)
+            escaped = True
+            word_start = False
+            continue
+        if char in ("'", '"'):
+            quote = char
+            out.append(char)
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            comment = True
+            out.append(" ")
+            continue
+        out.append(char)
+        word_start = char.isspace() or char in ";|&()"
+    return "".join(out)
+
+
+def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
+''')
     src = once(src, '''        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;")
         lexer.whitespace_split = True
-''', '''        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\\n")
+''', '''        command = _shell_without_comments(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\\n")
         lexer.whitespace = " \\t\\r\\f\\v"
         lexer.commenters = ""
         lexer.whitespace_split = True
@@ -87,16 +135,19 @@ def patch_core(src):
             next_separator = (separators[segment_index]
                               if segment_index < len(separators) else None)
             if len(segment) == i + 2 and next_separator in ("&&", "||", ";", "\\n"):
-                candidate = os.path.realpath(os.path.join(
-                    current_cwd, os.path.expanduser(segment[i + 1])))
+                possible = list(dict.fromkeys([current_cwd] + alternate_cwds))
+                targets = [os.path.realpath(os.path.join(c, os.path.expanduser(segment[i + 1])))
+                           for c in possible]
                 if previous_separator in ("&&", "||") or next_separator == "||":
-                    if candidate != current_cwd and candidate not in alternate_cwds:
-                        alternate_cwds.append(candidate)
-                elif os.path.isdir(candidate):
-                    current_cwd = candidate
-                    alternate_cwds = []
-                elif next_separator == "&&" and segment_index == 0:
-                    skip_next = True
+                    keep = possible + targets
+                else:
+                    keep = [target if os.path.isdir(target) else original
+                            for original, target in zip(possible, targets)]
+                    if (not any(os.path.isdir(target) for target in targets)
+                            and next_separator == "&&" and segment_index == 0):
+                        skip_next = True
+                keep = list(dict.fromkeys(keep))
+                current_cwd, alternate_cwds = keep[0], keep[1:]
             continue
         program = (os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
                    if "/" in segment[i] else segment[i])
@@ -188,6 +239,32 @@ def patch_test(src):
                          scopes=[f"path:{root / 'granted'}"])
         check("an or-branch does not discard the cd target",
               verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        (root / "granted" / "sub").mkdir()
+        conditional_sequence = (
+            f"true && cd {shlex.quote(str(untrusted))}; cd sub; python3 probe.py")
+        verdict = signal(conditional_sequence, root / "granted", workspace=tmp, scopes=recursive)
+        check("a later cd preserves conditional cwd alternatives",
+              verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        other_second = root / "other" / "second"
+        other_second.mkdir(parents=True)
+        (other_second / "pyproject.toml").write_text("[project]\\n")
+        other_granted = root / "other" / "granted"
+        other_granted.mkdir()
+        (other_granted / "probe.py").write_text("print('other')\\n")
+        other_grants = [f"path:{root / 'granted'}", f"path:{other_second}"]
+        relative_sequence = (
+            f"true && cd {shlex.quote(str(other_second))} && cd ../granted && python3 probe.py")
+        verdict = signal(relative_sequence, root / "granted", workspace=tmp, scopes=other_grants)
+        check("a relative cd composes over every possible cwd",
+              verdict is not None and verdict.target == str(other_granted), repr(verdict))
+        commented_cd = f"# note; cd {shlex.quote(str(root / 'granted'))}\\npython3 probe.py"
+        verdict = signal(commented_cd, tmp)
+        check("a comment cannot manufacture a trusted cwd",
+              verdict is not None and verdict.target == str(root), repr(verdict))
+        quoted_hash = "echo '#'; python3 probe.py"
+        verdict = signal(quoted_hash, tmp)
+        check("a quoted hash does not start a comment",
+              verdict is not None and verdict.target == str(root), repr(verdict))
         planted = root / "python3"
         planted.symlink_to("/bin/true")
         check("a planted bare-name symlink cannot silence the advisory",
@@ -255,7 +332,7 @@ def run_acx(root, tmp):
 def main():
     original_core = show("HEAD:" + CORE)
     original_test = show(":" + TEST)
-    previous_body = (WT / "held/c063c5ce39475bdda9e0bb40292682da70c2e7c037f68df07fb336d33d07be33.patch").read_text()
+    previous_body = (WT / "held/a7a4d9b7752645fc726f3bae0b2709d120d7e27944f8f22c16f67886f293bc93.patch").read_text()
     previous_core = strict_apply(original_core, sections(previous_body)[CORE])
     patched_core, patched_test = patch_core(original_core), patch_test(original_test)
     work = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BUILD))
@@ -284,12 +361,9 @@ def main():
         print(withdrawn.stderr, end="", file=sys.stderr)
         assert withdrawn.returncode != 0, "the new controls do not fail on the withdrawn candidate"
         withdrawn_names = (
-            "a conditional cd adds an untrusted possible cwd",
-            "a cloned directory remains a possible cwd",
-            "a created directory remains a possible cwd",
-            "an or-branch does not discard the cd target",
-            "a planted bare-name symlink cannot silence the advisory",
-            "a comment does not swallow the newline before Python",
+            "a later cd preserves conditional cwd alternatives",
+            "a relative cd composes over every possible cwd",
+            "a comment cannot manufacture a trusted cwd",
         )
         missing = [name for name in withdrawn_names if name not in withdrawn.stdout]
         assert not missing, ("controls that pass on the withdrawn candidate", missing)
