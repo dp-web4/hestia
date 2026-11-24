@@ -1788,6 +1788,7 @@ impl ServerState {
                             "claimed_by": r.plugin_id,
                             "role": r.role,
                             "path": r.path,
+                            "recursive": r.recursive,
                             // THE BASIS. A scope request without its stated why is the
                             // "no reason" defect arriving on a second surface, and this one
                             // has no excuse — `reason` is REQUIRED at filing.
@@ -2334,6 +2335,7 @@ mod tests {
         // exercised, which is the defect this whole thread keeps finding.
         let mut older = mk("older", None, now + SCOPE_REQUEST_TTL_SECS);
         older.requested_at = now.saturating_sub(600);
+        older.recursive = true;
         state.scope_requests.insert("older".into(), older);
         state
             .scope_requests
@@ -2373,6 +2375,11 @@ mod tests {
         assert_eq!(row["path"], "/outside/pend.md");
         // Caller-asserted, and labelled so the UI cannot render a claim as an identity.
         assert_eq!(row["claimed_by"], "kimi-code");
+        assert_eq!(row["recursive"], false, "an exact ask stays exact on the wire");
+        let older = s.pending_scope_requests.iter()
+            .find(|r| r["request_id"] == "older").expect("the recursive pending fixture");
+        assert_eq!(older["recursive"], true,
+            "the browser cannot select the asked reach if the snapshot omits it");
         assert!(row.get("secs_remaining").is_some());
     }
 

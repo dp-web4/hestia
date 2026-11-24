@@ -159,8 +159,10 @@ export interface PendingScopeRequest {
   /** Caller-asserted, not authenticated — the same caveat as an escalation's asker. */
   claimed_by: string;
   role: string;
-  /** Exactly one path. Recursion is the operator's choice at decide time, never the asker's. */
+  /** One root path; `recursive` says whether the member asked for its subtree too. */
   path: string;
+  /** The requested reach. The decider may honor it or explicitly narrow it to exact. */
+  recursive?: boolean;
   /** The asker's own words. Shown whole: truncation is how a request gets ruled on its summary. */
   reason: string;
   requested_at: number;

@@ -229,9 +229,9 @@ pub struct ScopeRequest {
     pub decided_by: Option<String>,
     pub decided_at: Option<u64>,
     pub decision_reason: Option<String>,
-    /// Set by the OPERATOR at decide time, never by the asking member: a request names one
-    /// path (the doc comment above still holds), and whether the answer reaches the subtree
-    /// under it is the operator's explicit choice. Exact by default (dp, 2026-09-08).
+    /// Whether the member asked for the subtree under `path`, or only the path itself. Exact by
+    /// default (dp, 2026-09-08). The decider must explicitly honor that reach or narrow it to
+    /// exact; an omitted flag never infers a widening.
     #[serde(default)]
     pub recursive: bool,
     /// Set when the operator revokes a LIVE grant before it lapses (dp, 2026-09-15: "i want to
@@ -1687,7 +1687,7 @@ impl ServerState {
             .values()
             .any(|r| r.plugin_id == plugin_id && r.grants_for(&want, now, needed))
             // A STANDING grant answers the same question — "is there a grant of record for
-            // exactly this path" — so a member re-asking for a path it durably holds hears
+            // this reach" — so a member re-asking for a path it durably holds hears
             // `already_granted` instead of filing an ask nobody needs to rule on.
             || self.standing_scope.has_live_for(plugin_id, &want, now, needed)
     }
