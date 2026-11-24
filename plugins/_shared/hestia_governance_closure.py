@@ -586,24 +586,26 @@ def default_closure() -> Closure:
 # ── Bash write-position parsing ─────────────────────────────────────────────────────────────
 #
 # SUPPORTED GRAMMAR (REPAIR 2 — GPT fleet-review blocker 1). The classifier resolves write
-# positions for exactly ONE shape: SIMPLE COMMANDS with recognized verbs and LITERAL
-# (non-substitution) arguments, joined by the sequencing operators `;` `&&` `||` `|` `&`. A
-# leading `cd <literal dir>` adjusts the effective cwd for relative write targets that FOLLOW
-# it on the same command line (so `cd plugins/<m>/hooks && echo x > GATE` resolves into the
-# closure). Everything else is OUT OF GRAMMAR and its write set is undecidable:
-#   * a substitution/variable in a WRITE position (`> $VAR`, `> $(cmd)`, `cp x $DEST`);
-#   * a shell block / conditional governing the command (`if`/`while`/`for`/`case`/`{ }`/
-#     subshell) — control flow can hide or gate a write;
+# positions for SIMPLE COMMANDS with recognized verbs and LITERAL arguments, joined by `;`
+# `&&` `||` `|` `&`. Literal assignment positions contribute a UNION of possible values,
+# regardless of branch, pipeline, prefix or subshell execution order; references resolve
+# transitively and unquoted whitespace can split a value into multiple words. This deliberately
+# over-approximates later and skipped assignments rather than guessing which one ran. Any IFS
+# token or a glob-bearing value makes the affected expansion AMBIGUOUS instead:
+# if it reaches a write position, the whole act refuses unconditionally. Quote boundaries have
+# already been erased here, so double-quoted forms take that conservative path too; read-only
+# uses are unaffected. A leading `cd <literal dir>` adjusts the effective cwd for relative write
+# targets that FOLLOW it. Everything else is OUT OF GRAMMAR and its write set is undecidable:
+#   * an unresolved substitution/variable in a WRITE position (`> $VAR`, `> $(cmd)`);
+#   * an unmodelled shell block / conditional (`{ }`, function, select, arithmetic);
 #   * `bash -c` / `sh -c` / `eval` — the write happens inside an opaque string;
-#   * `git apply` / `git am` / `patch` — the write set lives inside patch CONTENT the
-#     classifier never sees.
+#   * an unreadable `git apply` / `git am` / `patch` input — the write set lives in CONTENT.
 # An out-of-grammar command is classified "write" (rule RULE_OUT_OF_GRAMMAR) IFF closure
-# vocabulary appears ANYWHERE in it (including inside a `-c`/`eval` string, which is
-# re-tokenized for the scan); otherwise it stays "none". This is the deliberate fail-closed
-# stance for indirection: we cannot see the write, so any closure mention denies — but a
-# benign out-of-grammar command that names nothing closure-ish is NOT refused (no new FP).
-# Reads are unaffected: a `>` inside a QUOTED argument or a heredoc body is never a write
-# position, so it never creates a write target (it may still classify "read", which is allowed).
+# vocabulary appears in a write-capable position (including inside a `-c`/`eval` string, which
+# is re-tokenized for the scan); otherwise it stays "none". Read-only heads and sources do not
+# make an unrelated destination governed; unknown commands and bare unresolved destinations
+# retain the deliberate fail-closed stance for indirection. Reads are unaffected: a `>` inside
+# a QUOTED argument or heredoc body never creates a write target.
 _PUNCT = "();<>|&"
 # The alphabet `_tokenize` actually hands shlex — "\n" is in it (#463). `_is_punct` keys on
 # THIS, not on `_PUNCT`: a token shlex assembled out of this alphabet must never read back as
@@ -728,17 +730,18 @@ _SUBSHELL_CMDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "busybox
 
 
 class _OpaqueWriter(Exception):
-    """A patch-applying command whose patch content cannot be read — write set unknowable."""
+    """A command whose write set is unknowable and must refuse unconditionally."""
     def __init__(self, source: str = "stdin"):
         self.source = source
 
 
-def _patch_write_targets(src_path: str) -> list:
+def _patch_write_targets(src_path: str, cwd=None) -> list:
     """Extract write targets from a readable diff/mbox: `+++ `/`--- ` headers (a/ b/
-    prefixes stripped, /dev/null skipped) plus git `rename to`/`copy to`. Raises
-    _OpaqueWriter when the file cannot be read — the caller fails closed."""
+    prefixes stripped, /dev/null skipped) plus git `rename to`/`copy to`. `cwd` resolves
+    only the patch source; the paths inside the diff stay as written. Raises _OpaqueWriter
+    when the file cannot be read — the caller fails closed."""
     try:
-        with open(os.path.expanduser(src_path), "r", encoding="utf-8",
+        with open(os.path.expanduser(_join_eff(cwd or "", src_path)), "r", encoding="utf-8",
                   errors="replace") as fh:
             text = fh.read(1_048_576)
     except OSError:
@@ -758,9 +761,10 @@ def _patch_write_targets(src_path: str) -> list:
 
 
 class _OutOfGrammar(Exception):
-    """Internal signal: this Bash command is outside the supported grammar, so its write set
-    cannot be resolved. The caller (_write_position_targets) turns it into the
-    RULE_OUT_OF_GRAMMAR posture — a write iff closure vocabulary appears anywhere."""
+    """Internal signal with any concrete targets found before undecidable variants."""
+    def __init__(self, targets=()):
+        super().__init__()
+        self.targets = list(targets)
 
 
 def _is_punct(tok: str) -> bool:
@@ -810,15 +814,138 @@ def _join_eff(eff: str, target: str) -> str:
     return os.path.normpath(os.path.join(eff, target))
 
 
+_OOG_GIT_READS = frozenset({
+    "show", "diff", "log", "rev-list", "grep", "ls-files", "cat-file", "rev-parse",
+    "status", "describe", "branch", "remote", "config",
+})
+_OOG_READ_HEADS = frozenset({
+    "grep", "cat", "diff", "head", "tail", "ls", "echo", "printf", "pwd", "test",
+    "true", "false", "cd",
+})
+_OOG_WRITE_HEADS = frozenset({
+    "cp", "mv", "install", "rsync", "ln", "tee", "dd", "truncate", "chmod", "chown",
+    "chgrp", "touch", "rm", "unlink", "rmdir", "shred", "sed", "git",
+})
+
+
+def _oog_redirects(words: list) -> list:
+    out = []
+    for i, t in enumerate(words[:-1]):
+        nxt = words[i + 1]
+        if ">" in t and "<" not in t and not _is_punct(nxt) and not nxt.isdigit():
+            command_sub = ("$(" in nxt or "`" in nxt
+                           or (nxt == "$" and i + 2 < len(words) and words[i + 2] == "("))
+            if command_sub:
+                out.extend(t for t in words if not _is_punct(t))
+            else:
+                out.append(nxt)
+    return out
+
+
+def _oog_simple_targets(words: list) -> list:
+    stripped = _strip_wrappers(words)
+    if not stripped:
+        return []
+    head = os.path.basename(stripped[0])
+    if head in _SUBSHELL_CMDS or head == "eval":
+        return []
+    if head in _OOG_READ_HEADS:
+        return []
+    if head == "sed":
+        # Read-only only when no in-place flag in ANY spelling (-i, -i.bak, -Ei, --in-place[=])
+        # and no script can write (`w`/`W` command, s///w flag, or an unread -f script file).
+        sargs = stripped[1:]
+        if any(a.startswith("--in-place") or (a[:1] == "-" and a[1:2] != "-" and "i" in a[1:])
+               for a in sargs):
+            try:
+                out = _command_write_targets(words)
+            except Exception:
+                out = []
+            return out or [t for t in words if not _is_punct(t)]
+        scripts, j = [], 0
+        while j < len(sargs):
+            a = sargs[j]
+            if a in ("-f", "--file") or a.startswith("--file=") or (a[:1] == "-" and a[1:2] != "-" and "f" in a[1:]):
+                return [t for t in words if not _is_punct(t)]
+            if a in ("-e", "--expression") or (a[:1] == "-" and a[1:2] != "-" and a.endswith("e")):
+                if j + 1 < len(sargs):
+                    scripts.append(sargs[j + 1])
+                j += 2
+                continue
+            if a.startswith("--expression="):
+                scripts.append(a.split("=", 1)[1])
+            elif a[:1] == "-" and a[1:2] != "-" and "e" in a[1:]:
+                scripts.append(a[a.index("e", 1) + 1:])
+            elif a in ("-l", "--line-length"):
+                j += 2
+                continue
+            elif a[:1] != "-" and not scripts:
+                scripts.append(a)
+            j += 1
+        if any(c in sc for sc in scripts for c in "wW"):
+            return [t for t in words if not _is_punct(t)]
+        return []
+    if head == "git":
+        i = 0
+        args = stripped[1:]
+        config_override = False   # -c / --config-env can name a program (diff.external, pager)
+        while i < len(args):
+            if args[i] in ("-c", "--config-env") or args[i].startswith(("--config-env=", "-c")):
+                config_override = True
+            if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+                i += 2
+                continue
+            if args[i].startswith("-"):
+                i += 1
+                continue
+            break
+        if i < len(args) and args[i] in _OOG_GIT_READS:
+            rest = args[i + 1:]
+            writes = config_override or any(
+                a.startswith(("--output", "-O", "--open-files-in-pager")) for a in rest)
+            if args[i] == "config" and any(
+                    a in ("-f", "--file") or a.startswith(("--file=", "-f")) for a in rest):
+                writes = True
+            if not writes:
+                return []
+            return [t for t in words if not _is_punct(t)]
+    try:
+        out = _command_write_targets(words)
+    except Exception:   # _OpaqueWriter et al.: every token stays visible to the vocab scan
+        return [t for t in words if not _is_punct(t)]
+    if any(isinstance(t, str) and t.startswith("$") and "/" not in t for t in out):
+        return [t for t in words if not _is_punct(t)] + out
+    if out or head in _OOG_WRITE_HEADS:
+        return out
+    return [t for t in words if not _is_punct(t)]
+
+
+def _oog_tokens(toks: list) -> list:
+    out, cur = [], []
+    for t in toks:
+        if t in _SEPARATORS:
+            out.extend(_oog_redirects(cur))
+            out.extend(_oog_simple_targets(cur))
+            cur = []
+        else:
+            cur.append(t)
+    out.extend(_oog_redirects(cur))
+    out.extend(_oog_simple_targets(cur))
+    return out
+
+
 def _vocab_tokens(command: str) -> list:
-    """Every token to scan for closure vocabulary on the out-of-grammar path — the outer
-    tokens PLUS the re-tokenized contents of any `-c`/`eval` string operand, so a bare
-    closure filename named inside an opaque string is still visible to the scan."""
+    """Write-capable tokens for the out-of-grammar path, not every read-only mention."""
     try:
         toks = _tokenize(command)
     except Exception:
         return command.split()
-    out = [t for t in toks if not _is_punct(t)]
+    if "$(" in command or "`" in command:
+        return [t for t in toks if not _is_punct(t)]
+    out = _oog_tokens(toks)
+    # An assignment-only segment has no command word, so _oog_tokens drops it -- but its value
+    # is what an unresolved $NAME (word-split, unresolvable, ...) expands to. Keep it visible.
+    out.extend(t for t in toks if isinstance(t, str) and _ASSIGN_RE.match(t))
     for i, t in enumerate(toks):
         base = os.path.basename(t) if isinstance(t, str) else ""
         if base in _SUBSHELL_CMDS or base == "eval":
@@ -827,11 +954,137 @@ def _vocab_tokens(command: str) -> list:
                     continue
                 if isinstance(s, str) and s:
                     try:
-                        out.extend(_tokenize(s))
+                        out.extend(_oog_tokens(_tokenize(s)))
                     except Exception:
                         out.append(s)
                 break
     return out
+
+
+_LITERAL_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+_IFS_WORD = re.compile(r"(?<![A-Za-z0-9_])IFS(?![A-Za-z0-9_])")
+_DYNAMIC_VARS = frozenset({
+    "PWD", "OLDPWD", "RANDOM", "SRANDOM", "SECONDS", "LINENO", "BASHPID", "REPLY",
+    "EPOCHSECONDS", "EPOCHREALTIME", "PPID", "UID", "EUID", "GROUPS", "HISTCMD", "OPTIND",
+    "OPTARG", "IFS", "PIPESTATUS", "FUNCNAME", "HOSTNAME",
+})
+_LITERAL_VARIANT_LIMIT = 256
+# Shell argv cannot contain NUL, so this marker cannot collide with a literal command word.
+_AMBIGUOUS_LITERAL = "\x00hestia-ambiguous-literal\x00"
+
+
+def _literal_assignment_values(toks: list) -> dict:
+    """Collect possible values from literal assignments and literal here-string reads."""
+    values = {}
+
+    def record(tok):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", tok)
+        if not m:
+            return
+        name, value = m.groups()
+        if name not in _DYNAMIC_VARS and not name.startswith(("BASH", "COMP_")):
+            values.setdefault(name, []).append(value)
+
+    def flush(segment):
+        if not segment:
+            return
+        words = segment
+        if words[0] in _SHELL_BLOCK_KEYWORDS:
+            words = _control_flow_remainder(words)
+            if not words:
+                return
+        if words[0] in {"export", "readonly", "declare", "typeset", "local"}:
+            for tok in words[1:]:
+                record(tok)
+            return
+        for tok in words:
+            if not _ASSIGN_RE.match(tok):
+                break
+            record(tok)
+        if words[0] == "read" and "<<<" in words:
+            k = words.index("<<<")
+            names = [t for t in words[1:k] if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t)]
+            if names and k + 1 < len(words):
+                if len(names) > 1 or "-a" in words[1:k]:
+                    for name in names:
+                        values.setdefault(name, []).append(_AMBIGUOUS_LITERAL)
+                else:
+                    values.setdefault(names[-1], []).append(words[k + 1])
+        elif words[0] == "read":
+            names = [t for t in words[1:] if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t)]
+            for name in names:
+                if name in values:
+                    values[name].append(None)
+
+    cur = []
+    for tok in toks:
+        if tok in _SEPARATORS:
+            flush(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    flush(cur)
+    return values
+
+
+def _expand_literal_text(text: str, values: dict, stack=()) -> list:
+    pieces = [""]
+    end = 0
+    for match in _LITERAL_VAR.finditer(text):
+        name = match.group(1) or match.group(2)
+        replacements = None
+        if name in values and name not in _DYNAMIC_VARS:
+            if name in stack:
+                replacements = ["${" + name + "}"]
+            else:
+                replacements = []
+                for raw in values[name]:
+                    if raw is None:
+                        replacements.append("${" + name + "}")
+                        continue
+                    residue = _LITERAL_VAR.sub("", raw)
+                    if any(c in residue for c in "*?["):
+                        replacements.append(_AMBIGUOUS_LITERAL + raw + _AMBIGUOUS_LITERAL)
+                        continue
+                    if any(c in residue for c in "$`{~"):
+                        replacements.append("${" + name + "}")
+                        continue
+                    replacements.extend(_expand_literal_text(raw, values, stack + (name,)))
+                replacements = list(dict.fromkeys(replacements))
+        if replacements is None:
+            replacements = [match.group(0)]
+        literal = text[end:match.start()]
+        pieces = [prefix + literal + replacement
+                  for prefix in pieces for replacement in replacements]
+        if len(pieces) > _LITERAL_VARIANT_LIMIT:
+            raise _OpaqueWriter("literal-expansion")
+        end = match.end()
+    suffix = text[end:]
+    return [piece + suffix for piece in pieces]
+
+
+def _literal_token_variants(toks: list, values: dict, ifs_touched: bool) -> list:
+    """Expand literals, marking IFS/glob ambiguity for the write-position checks."""
+    variants = [[]]
+    for tok in toks:
+        if _ASSIGN_RE.match(tok) or _is_punct(tok):
+            expansions = [[tok]]
+        else:
+            expansions = []
+            for text in _expand_literal_text(tok, values):
+                if text == tok:
+                    expansions.append([tok])
+                    continue
+                words = text.split() or [""]
+                if ifs_touched or _AMBIGUOUS_LITERAL in text:
+                    words = [_AMBIGUOUS_LITERAL + word + _AMBIGUOUS_LITERAL for word in words]
+                expansions.append(words)
+        variants = [variant + expansion for variant in variants for expansion in expansions]
+        if len(variants) > _LITERAL_VARIANT_LIMIT:
+            raise _OpaqueWriter("literal-expansion")
+    return variants
 
 
 def _tokenize(cmd: str) -> list:
@@ -863,10 +1116,12 @@ def _tokenize(cmd: str) -> list:
     token beginning with `#` cannot be distinguished from a QUOTED one (`echo "#x"`), and
     dropping on that guess would make everything after a quoted `#` invisible — trading a
     false refusal for a silent write, which is the wrong direction for this module. Left in,
-    a comment's words become an ordinary simple command whose head is `#`: harmless, and the
-    following line is still seen. The residual cost is a comment containing a redirect
-    (`# write with > here`) raising a phantom write target and refusing a benign command.
-    That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+    after a separator, a comment's words become an ordinary simple command whose head is `#`;
+    a same-line trailing comment instead becomes extra positional arguments to the preceding
+    command. Last-positional write verbs therefore treat the whole set as write targets when a
+    `#` token appears, so a comment's last word cannot hide a governed source. The residual cost
+    is a comment containing a redirect (`# write with > here`) raising a phantom write target and
+    refusing a benign command. That is a false POSITIVE, it fails closed, and it is preferred.
     `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
     """
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
@@ -1391,13 +1646,19 @@ def _last_positional_dest(pos: list) -> list:
     `cp G/x*`, `cp $X`, `set -- A B; cp "$@"` and `ln -f G/x*` all run as `CMD SRC DEST`, and DEST
     may be a closure file, so a non-literal lone word is out of grammar: a write iff closure
     vocabulary appears in the line (#1583). The test is inverted (allow plain, refuse the rest) so
-    no expansion form, in bash or zsh, needs listing."""
+    no expansion form, in bash or zsh, needs listing. A same-line comment becomes positionals too;
+    then only the union is safe, because the comment's last word must not hide a governed source."""
+    if any(isinstance(p, str) and _AMBIGUOUS_LITERAL in p for p in pos):
+        raise _OpaqueWriter("literal-expansion")
+    if any(isinstance(p, str) and p.startswith("#") for p in pos):
+        return pos
     if len(pos) == 1 and not _PLAIN_WORD.fullmatch(pos[0]):
         raise _OutOfGrammar()
     return [pos[-1]] if len(pos) >= 2 else []
 
 
-def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
+def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False,
+                           cwd=None) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
     destructive preset stays behind anything exotic)."""
@@ -1430,7 +1691,7 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         pin = _opt_value(args, "-i", "--input") or stdin_src
         if not pin:
             raise _OpaqueWriter()
-        return _patch_write_targets(pin)
+        return _patch_write_targets(pin, cwd=cwd)
     if name == "sed":
         # #1348: parsed against sed's option table (any spelling of -e/-f/-i), and a script
         # with a `w`/`W` command or `s///w` is out of grammar: it names a file to write.
@@ -1470,15 +1731,28 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         return _positionals(args)
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
+    if name in ("python", "python3", "perl", "node", "ruby"):
+        # Direct script invocation is a WRITE floor: a governed path in argv may be opened for
+        # writing by the script. Flags/-c/stdin and heredoc bodies are separate grammar (#1146).
+        if not args or args[0].startswith("-"):
+            return []
+        return _positionals(args)
     verb_out = _output_verb_write_targets(name, args, path_pinned)
     if verb_out is not None:
         return verb_out
     if name == "git":
-        # Skip global options to find the subcommand.
+        # Skip global options to find the subcommand. Each -C changes where a patch source is
+        # read AND where its targets land; successive relative -C values compose.
         i = 0
+        git_cwd = None
         while i < len(args):
             a = args[i]
-            if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            if a == "-C":
+                if i + 1 < len(args):
+                    git_cwd = _join_eff(git_cwd or cwd or "", args[i + 1])
+                i += 2
+                continue
+            if a in ("-c", "--git-dir", "--work-tree", "--namespace"):
                 i += 2
                 continue
             if a.startswith("-"):
@@ -1505,14 +1779,23 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             # The write set lives inside the named patch/mbox files (or stdin). Resolve by
             # reading them; unreadable/unknowable -> _OpaqueWriter -> unconditional fail-close.
             pfiles = [a for a in rest if not a.startswith("-")]
+            from_stdin = False
             if not pfiles and stdin_src:
                 pfiles = [stdin_src]
+                from_stdin = True
             if not pfiles:
                 raise _OpaqueWriter()
             out, resolved = [], False
             for pf in pfiles:
                 try:
-                    out.extend(_patch_write_targets(pf))
+                    # The shell opens `< patch` before git starts, so stdin belongs to the
+                    # shell's cwd, not -C. A positional patch is git's own operand and does.
+                    source_cwd = cwd if from_stdin else git_cwd or cwd
+                    targets = _patch_write_targets(pf, cwd=source_cwd)
+                    if git_cwd:
+                        targets = [os.path.abspath(os.path.expanduser(_join_eff(git_cwd, t)))
+                                   for t in targets]
+                    out.extend(targets)
                 except _OpaqueWriter:
                     # A BARE DIGIT THAT CANNOT BE OPENED IS A FILE DESCRIPTOR, not a patch
                     # file. `_tokenize` runs shlex with `punctuation_chars`, which splits
@@ -1584,8 +1867,25 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
     return []
 
 
+def _future_link_target(eff, cwd, target, links):
+    compare_base = eff or cwd or ""
+    for index in range(len(links) - 1, -1, -1):
+        dest, src, link_base = links[index]
+        root = os.path.abspath(os.path.expanduser(_join_eff(link_base, dest)))
+        candidate = os.path.abspath(os.path.expanduser(_join_eff(compare_base, target)))
+        if candidate != root and not candidate.startswith(root.rstrip(os.sep) + os.sep):
+            continue
+        source = os.path.abspath(os.path.expanduser(_join_eff(link_base, src)))
+        suffix = candidate[len(root):].lstrip(os.sep)
+        mapped = os.path.normpath(os.path.join(source, suffix)) if suffix else source
+        # Resolve chains recursively. Dropping the link just used guarantees termination, even
+        # when two destinations point at one another.
+        return _future_link_target(link_base, "", mapped, links[:index])
+    return _join_eff(eff, target)
+
+
 def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
-                          path_pinned: bool = False) -> str:
+                          path_pinned: bool = False, cwd=None, future_ln=None) -> str:
     """Resolve ONE simple command: detect out-of-grammar heads (shell block, `bash -c`,
     `eval`, `git apply`/`patch` — the last two via _command_write_targets), track `cd` into
     the effective cwd, else append this command's cd-resolved write targets. Returns the
@@ -1633,10 +1933,31 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
             eff = d if (os.path.isabs(d) or d.startswith("~")) \
                 else os.path.normpath(os.path.join(eff or ".", d))
         return eff
-    for tg in _command_write_targets(words, stdin_src, path_pinned):  # may raise (git apply/am, patch)
+    for tg in _command_write_targets(words, stdin_src, path_pinned, cwd=eff or cwd):  # may raise
+        if _AMBIGUOUS_LITERAL in tg or _AMBIGUOUS_LITERAL in eff:
+            raise _OpaqueWriter("literal-expansion")
         if _has_subst(tg):
             raise _OutOfGrammar()  # substitution in a write position
-        targets.append(_join_eff(eff, tg))
+        targets.append(_future_link_target(eff, cwd, tg, future_ln or []))
+    if base == "ln" and future_ln is not None:
+        args = stripped[1:]
+        pos = _positionals(args, opts_with_value=("-t", "--target-directory", "-S", "--suffix"))
+        tdir = _opt_value(args, "-t", "--target-directory")
+        sources = pos if tdir else (pos[:-1] or pos)
+        if tdir:
+            destinations = [os.path.join(tdir, os.path.basename(src)) for src in sources]
+        elif len(pos) == 1:
+            destinations = [os.path.basename(pos[0])]
+        elif len(pos) == 2:
+            destinations = [pos[-1]]
+        else:
+            destinations = [os.path.join(pos[-1], os.path.basename(src)) for src in sources]
+        for src, dest in zip(sources, destinations):
+            if _has_subst(src) or _has_subst(dest):
+                raise _OutOfGrammar()
+            # A link created now cannot be realpath'd yet. Later targets under its destination
+            # resolve to the source; unrelated later targets stay ordinary writes.
+            future_ln.append((dest, src, eff or cwd or ""))
     return eff
 
 
@@ -1667,23 +1988,40 @@ def _strip_heredoc_bodies(command: str) -> str:
     return "\n".join(out)
 
 
-def _bash_write_targets(command: str) -> list:
-    """All write-position arguments across a compound command: redirect targets plus each
-    simple command's write positions, each resolved against the cd-tracked effective cwd.
-    Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
-    any out-of-grammar construct (caller -> out-of-grammar posture)."""
+def _bash_write_targets(command: str, cwd=None) -> list:
+    """Union the write targets of every bounded literal-assignment variant."""
     toks = _tokenize(_strip_heredoc_bodies(command))
+    path_pinned = not _PATH_WORD.search(command)
+    if "'" in command:
+        return _bash_write_targets_resolved(toks, path_pinned, cwd=cwd)
+    values = _literal_assignment_values(toks)
+    ifs_touched = any(_IFS_WORD.search(tok) for tok in toks)
+    targets = []
+    deferred_oog = False
+    for variant in _literal_token_variants(toks, values, ifs_touched):
+        try:
+            targets.extend(_bash_write_targets_resolved(variant, path_pinned, cwd=cwd))
+        except _OutOfGrammar as exc:
+            targets.extend(exc.targets)
+            deferred_oog = True
+    if deferred_oog:
+        raise _OutOfGrammar(targets)
+    return list(dict.fromkeys(targets))
+
+
+def _bash_write_targets_resolved(toks: list, path_pinned: bool, cwd=None) -> list:
+    """Resolve one literal variant against redirects and the cd-tracked effective cwd."""
     targets, cur = [], []
     # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
     # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
     # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
     # <unreadable>` resolve to the weaker, vocabulary-conditional posture (#1348 replay).
     deferred_oog = False
+    future_ln = []
     stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
-    # A bare name run by find -exec / xargs is found through PATH; trust it only when no word of
-    # this line (heredoc bodies included, to err toward refusing) names PATH (Nova, #1356).
-    path_pinned = not _PATH_WORD.search(command)
+    # A bare name run by find -exec / xargs is found through PATH; the wrapper pins it only
+    # when no word of this line (heredoc bodies included) names PATH (Nova, #1356).
     i = 0
     while i < len(toks):
         t = toks[i]
@@ -1699,7 +2037,7 @@ def _bash_write_targets(command: str) -> list:
         if t in _SEPARATORS:
             if cur:
                 try:
-                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
+                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned, cwd=cwd, future_ln=future_ln)
                 except _OutOfGrammar:
                     deferred_oog = True
                 cur = []
@@ -1715,9 +2053,11 @@ def _bash_write_targets(command: str) -> list:
                     i += 2  # fd dup (2>&1) — not a file
                     continue
                 if nxt is not None and nxt not in _SEPARATORS and not _is_punct(nxt):
+                    if _AMBIGUOUS_LITERAL in nxt or _AMBIGUOUS_LITERAL in eff:
+                        raise _OpaqueWriter("literal-expansion")
                     if _has_subst(nxt):
-                        raise _OutOfGrammar()  # substitution in a redirect (write) position
-                    targets.append(_join_eff(eff, nxt))
+                        raise _OutOfGrammar(targets)  # unresolved redirect (write) position
+                    targets.append(_future_link_target(eff, cwd, nxt, future_ln))
                     i += 2
                     continue
                 i += 1
@@ -1733,11 +2073,11 @@ def _bash_write_targets(command: str) -> list:
         i += 1
     if cur:
         try:
-            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
+            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned, cwd=cwd, future_ln=future_ln)
         except _OutOfGrammar:
             deferred_oog = True
     if deferred_oog:
-        raise _OutOfGrammar()
+        raise _OutOfGrammar(targets)
     return targets
 
 
@@ -1763,7 +2103,7 @@ _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "Tod
 _COMPOSED_READ_TOOLS = frozenset({"search", "git_read"})
 
 
-def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
+def _write_position_targets(tool_name: str, tool_input: Any, cwd=None) -> tuple:
     """(targets, note). note is None or "unparseable" (Bash tokenizer failure: write
     positions undecidable, every raw token becomes a conservative candidate)."""
     if not isinstance(tool_input, dict):
@@ -1773,7 +2113,8 @@ def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
     if tool_name in _COMPOSED_READ_TOOLS:
         targets, note = [], None
         if isinstance(tool_input.get("command"), str) and tool_input["command"].strip():
-            targets, note = _write_position_targets("Bash", {"command": tool_input["command"]})
+            targets, note = _write_position_targets("Bash", {"command": tool_input["command"]},
+                                                     cwd=cwd)
         rest = [v for k in _PATH_KEYS
                 if k != "path" and isinstance((v := tool_input.get(k)), str) and v]
         return list(targets) + rest, note
@@ -1782,15 +2123,15 @@ def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
         if not isinstance(cmd, str) or not cmd.strip():
             return [], None
         try:
-            return _bash_write_targets(cmd), None
+            return _bash_write_targets(cmd, cwd=cwd), None
         except _OpaqueWriter as ow:
-            # Patch content unreadable: the write set is unknowable and NO vocabulary
-            # condition applies — classify() refuses unconditionally.
+            # Unreadable patch content, expansion overflow, or ambiguous IFS/glob expansion:
+            # the write set is unknowable and NO vocabulary condition applies.
             return [ow.source], "opaque-writer"
-        except _OutOfGrammar:
-            # Undecidable write set: hand the FULL vocabulary token list up, so classify()
-            # can fail closed iff closure vocabulary appears anywhere in the command.
-            return _vocab_tokens(cmd), "out-of-grammar"
+        except _OutOfGrammar as exc:
+            # Preserve concrete targets found in other literal variants, then add the
+            # write-capable vocabulary for the variant that stayed undecidable.
+            return list(exc.targets) + _vocab_tokens(cmd), "out-of-grammar"
         except Exception:
             return cmd.split(), "unparseable"
     # Write / Edit / NotebookEdit / unknown tools: the stated destination keys, and ONLY
@@ -1836,7 +2177,7 @@ def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure:
     internal error yields its single fail-closed verdict and stops. `classify` takes the
     first; `write_verdicts` takes them all. Internal errors fail CLOSED."""
     try:
-        targets, note = _write_position_targets(tool_name, tool_input)
+        targets, note = _write_position_targets(tool_name, tool_input, cwd=cwd)
         # OUT OF GRAMMAR (REPAIR 2): `targets` is the command's full vocabulary token list,
         # not resolved write positions; match with the BROADER read-position semantics (a
         # bare closure basename anywhere counts as vocabulary) and fail closed as a write if

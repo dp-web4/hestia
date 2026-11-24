@@ -2,14 +2,19 @@
 """REPAIR 2 acceptance — the explicit SUPPORTED-GRAMMAR contract for the closure classifier
 (GPT fleet-review blocker 1).
 
-The classifier resolves write positions for exactly ONE shape: simple commands with
-recognized verbs and LITERAL arguments, joined by `;` `&&` `||` `|` `&`, with a leading
-`cd <literal dir>` adjusting the effective cwd. Everything else is OUT OF GRAMMAR (a
-substitution/variable in a write position; a shell block/conditional; `bash -c`/`sh -c`/
-`eval`; `git apply`/`git am`/`patch`) and its write set is undecidable — so it is classified
-"write" (rule governance-closure-out-of-grammar) IFF closure vocabulary appears anywhere in
-the command, and "none" otherwise (a benign out-of-grammar command that names nothing
-closure-ish must NOT be refused — that re-creates the friction→bypass loop).
+The classifier resolves write positions for simple commands with recognized verbs and
+LITERAL arguments, joined by `;` `&&` `||` `|` `&`. Literal assignment positions contribute
+a UNION of possible values regardless of execution order, including branches, prefixes,
+pipelines, subshells and literal here-string reads; references resolve transitively. This
+is deliberately conservative about later and skipped assignments. Any IFS token and glob-bearing
+values make an expansion ambiguous: if it reaches a write position, the act
+is unconditionally opaque; double-quoted forms take the same path because quote boundaries
+are already erased, while read-only expansions stay benign. Other unresolved shapes are OUT
+OF GRAMMAR (an unresolved substitution/variable in a write position; an unmodelled shell
+block/conditional; `bash -c`/`sh -c`/`eval`) and their write set is undecidable — so they are
+classified "write" (rule governance-closure-out-of-grammar) IFF write-capable tokens carry
+closure vocabulary, and "none" otherwise. Unreadable patch input and expansion overflow are
+unconditionally opaque too.
 
 Two suites:
   1. EXPLICIT-ALL: every GPT bad shape as a named case, BOTH arms — a closure target => write,
@@ -71,6 +76,7 @@ RULE_W = WRT
 # Patch-content fixtures (GPT 2nd pass): a diff whose CONTENT targets the closure vs one
 # whose content is benign — the argv is identical in shape for both, which is the point.
 BENIGN_DIR = tempfile.mkdtemp(prefix="shell-grammar-patches-")
+REPO_DIR = tempfile.mkdtemp(prefix="shell-grammar-repos-")
 with open(os.path.join(BENIGN_DIR, "closure.patch"), "w", encoding="utf-8") as _fh:
     _fh.write("--- a/plugins/kimi/hooks/" + HOOK + chr(10)
               + "+++ b/plugins/kimi/hooks/" + HOOK + chr(10)
@@ -83,7 +89,7 @@ with open(os.path.join(BENIGN_DIR, "benign.patch"), "w", encoding="utf-8") as _f
 CASES = [
     # --- substitution / variable in a WRITE position ---
     ("subst_redirect_var__closure",
-     f"VAR={HOOKS}/{HOOK}; echo x > $VAR", "write", OOG),
+     f"VAR={HOOKS}/{HOOK}; echo x > $VAR", "write", WRT),
     ("subst_redirect_var__benign",
      "VAR=/tmp/out.txt; echo x > $VAR", "none", None),
     ("subst_cmdsub_redirect__closure",
@@ -94,6 +100,150 @@ CASES = [
      f"cp {SHARED_DIR}/{CORE} $DEST", "write", OOG),
     ("subst_cp_dest__benign",
      "cp a.txt $DEST", "none", None),
+    ("var_dest_then_grep__read_only_mention",
+     f"echo hi > $S/f; grep -c x {HOOKS}/{HOOK}", "not-write", None),
+    ("var_assigned_tmp_literal_in_command__read_only_mention",
+     f"S=/tmp/x; echo hi > $S/f; grep -c x {HOOKS}/{HOOK}", "not-write", None),
+    ("var_dest_then_cat__read_only_mention",
+     f"echo hi > $S/f; cat {HOOKS}/{HOOK}", "not-write", None),
+    ("sed_read_into_var_dest__read_only_mention",
+     f"sed -n '1,5p' {HOOKS}/{HOOK} > $S/copy.py", "not-write", None),
+    ("literal_assignment_governance_write",
+     "S=deploy; echo hi > $S/install-members.sh", "write", WRT),
+    ("literal_assignment_concatenated_governance_write",
+     "D=deploy/; F=install-members.sh; cp /tmp/evil.py $D$F", "write", WRT),
+    ("diff_read_source_into_var_dest__read_only_mention",
+     f"diff {HOOKS}/{HOOK} /tmp/other.py > $S/out", "not-write", None),
+    ("git_show_source_into_var_dest__read_only_mention",
+     f"git show origin/main:{HOOKS}/{HOOK} > $S/prior.py", "not-write", None),
+    ("cp_source_into_var_dest__read_only_mention",
+     f"cp /tmp/ro/{HOOKS}/{HOOK} $S/work/mech.py", "not-write", None),
+    ("unresolved_governed_basename_fails_closed",
+     f"echo hi > $S/{CORE}; grep -c x {HOOKS}/{HOOK}", "write", OOG),
+    ("single_quoted_variable_is_not_resolved",
+     "S=deploy; echo hi > '$S/install-members.sh'", "not-write", None),
+    ("double_quoted_literal_assignment_governance_write",
+     "S=deploy; echo hi > \"$S/install-members.sh\"", "write", WRT),
+    ("eval_read_only_grep_is_not_a_write",
+     f"eval 'grep {HOOKS}/{HOOK}'", "not-write", None),
+    ("unknown_writer_still_fails_closed",
+     f"sh -c 'edit {CORE}'", "write", OOG),
+    # --- #1092 follow-up: order/context-blind assignment + read-head write flags ---
+    ("assign_decoy_argument__closure",
+     f"S={HOOKS}; echo S=/tmp; echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_decoy_later_reassign__closure",
+     f"S={HOOKS}; echo hi > $S/{HOOK}; S=/tmp", "write", WRT),
+    ("assign_decoy_subshell__closure",
+     f"S={HOOKS}; (S=/tmp); echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_decoy_prefix_scoped__closure",
+     f"S={HOOKS}; S=/tmp true; echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_decoy_read__closure",
+     f"S=/tmp; read S <<< {HOOKS}; echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_word_split__closure",
+     f"S=\"/tmp/e {HOOKS}/{HOOK}\"; cp $S", "write", WRT),
+    ("union_skipped_conditional_assignment_still_contributes",
+     "D=deploy; false && D=docs; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_transitive_reassignment_contributes",
+     "X=deploy; D=docs; D=$X; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_pipeline_assignment_contributes",
+     "D=deploy; D=docs | cat; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_assignment_shaped_argument_stays_data",
+     "D=/tmp; echo D=deploy; echo x > $D/install-members.sh", "none", None),
+    ("union_literal_assignment_argument_does_not_hide_write",
+     "D=deploy; echo D=/tmp; echo x > $D/install-members.sh", "write", WRT),
+    ("union_later_governed_assignment_is_deliberately_conservative",
+     "D=/tmp; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_here_string_read_contributes",
+     "D=/tmp; read D <<< deploy; echo x > $D/install-members.sh", "write", WRT),
+    ("union_unknown_read_does_not_leave_only_stale_literal",
+     "D=deploy; read D; echo x > $D/install-members.sh", "write", OOG),
+    ("union_variant_overflow_is_unconditionally_opaque",
+     "A=deploy; B=install-members.sh; X=a; X=b; printf $X $X $X $X $X $X $X $X $X; "
+     "echo hi > $A/$B", "write", OPQ),
+    ("union_ifs_colon_split_is_opaque",
+     f"IFS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_prefix_tee_is_opaque",
+     f"IFS=,; S=\"{HOOKS}/{HOOK},x\"; echo hi | tee $S", "write", OPQ),
+    ("union_ifs_export_is_opaque",
+     f"export IFS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_read_is_opaque",
+     f"read IFS <<< :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_read_only_expansion_stays_benign",
+     "IFS=:; S=\"a:b\"; echo $S", "none", None),
+    ("union_multi_name_here_string_read_is_opaque",
+     f"read A B <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$B\"", "write", OPQ),
+    ("union_three_name_here_string_read_is_opaque",
+     f"read A B C <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$C\"", "write", OPQ),
+    ("union_read_r_multi_name_here_string_is_opaque",
+     f"read -r A B <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$B\"", "write", OPQ),
+    ("union_array_here_string_read_is_opaque",
+     f"read -a A <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$A\"", "write", OPQ),
+    ("union_ifs_append_is_opaque",
+     f"IFS+=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_for_binding_is_opaque",
+     f"for IFS in :; do S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S; done", "write", OPQ),
+    ("union_ifs_printf_binding_is_opaque",
+     f"printf -v IFS :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_export_is_opaque",
+     f"export I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_is_opaque",
+     f"declare I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_readonly_is_opaque",
+     f"readonly I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_typeset_is_opaque",
+     f"typeset I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_global_is_opaque",
+     f"declare -g I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_printf_is_opaque",
+     f"printf -v I\"\"FS :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_read_is_opaque",
+     f"read -r I\"\"FS <<< :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_nameref_is_opaque",
+     f"declare -n R=I\"\"FS; R=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_export_suffix_is_opaque",
+     f"export IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_suffix_is_opaque",
+     f"declare IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_readonly_suffix_is_opaque",
+     f"readonly IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_typeset_suffix_is_opaque",
+     f"typeset IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_global_suffix_is_opaque",
+     f"declare -g IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_printf_suffix_is_opaque",
+     f"printf -v IF\"\"S :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_read_suffix_is_opaque",
+     f"read -r IF\"\"S <<< :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_nameref_suffix_is_opaque",
+     f"declare -n R=IF\"\"S; R=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_backslash_declare_is_opaque",
+     f"declare I\\FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_name_boundary_does_not_overmatch",
+     "XIFS=:; S=deploy; echo x > $S/install-members.sh", "write", WRT),
+    ("union_ifs_double_quoted_expansion_is_conservative",
+     f"IFS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp \"$S\"", "write", OPQ),
+    ("union_glob_value_is_opaque",
+     f"S=\"{HOOKS}/pre_*\"; cp /tmp/e $S", "write", OPQ),
+    ("union_glob_double_quoted_value_is_conservative",
+     f"S=\"{HOOKS}/pre_*\"; cp /tmp/e \"$S\"", "write", OPQ),
+    ("union_glob_read_only_expansion_stays_benign",
+     f"S=\"{HOOKS}/pre_*\"; echo $S", "none", None),
+    ("oog_sed_inplace_suffix__closure",
+     f"echo hi > $X/f; sed -i.bak s/a/b/ {SHARED_DIR}/{CORE}", "write", OOG),
+    ("oog_sed_inplace_long__closure",
+     f"echo hi > $X/f; sed --in-place s/a/b/ {SHARED_DIR}/{CORE}", "write", OOG),
+    ("oog_sed_inplace_cluster__closure",
+     f"echo hi > $X/f; sed -Ei s/a/b/ {SHARED_DIR}/{CORE}", "write", OOG),
+    ("sed_w_command__closure",
+     f"sed -n \"w {SHARED_DIR}/{CORE}\" /dev/null", "write", OOG),
+    ("oog_sed_s_w_flag__closure",
+     f"echo hi > $X/f; sed \"s/x/y/w {SHARED_DIR}/{CORE}\" /dev/null", "write", OOG),
+    ("oog_git_diff_output__closure",
+     f"echo hi > $X/f; git diff --output={SHARED_DIR}/{CORE}", "write", OOG),
+    ("oog_git_config_file__closure",
+     f"echo hi > $X/f; git config -f {SHARED_DIR}/{CORE} a.b c", "write", OOG),
+    ("oog_git_c_external_diff__closure",
+     f"echo hi > $X/f; git -c diff.external=/tmp/w.sh diff {SHARED_DIR}/{CORE}", "write", OOG),
 
     # --- cd <literal> && write-relative ---
     ("cd_then_write_relative__closure",
@@ -145,6 +295,56 @@ CASES = [
      f"cp -t {SHARED_DIR} /tmp/a.py", "write", WRT),
     ("cp_t_dir__benign",
      "cp -t /tmp/dest a.py", "none", None),
+    ("python_direct_script_governed_argv__closure",
+     f"python /tmp/x/f.py {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_direct_script_governed_argv__closure",
+     f"python3 /tmp/x/f.py {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_cd_direct_script_governed_argv__closure",
+     f"cd /tmp && python3 /tmp/x/f.py {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_direct_script_absolute_governed_argv__closure",
+     f"python3 /tmp/x/f.py /tmp/symprobe/{SHARED_DIR}/{CORE}", "write", WRT),
+    ("perl_direct_script_governed_argv__closure",
+     f"perl /tmp/x/f.pl {SHARED_DIR}/{CORE}", "write", WRT),
+    ("node_direct_script_governed_argv__closure",
+     f"node /tmp/x/f.js {SHARED_DIR}/{CORE}", "write", WRT),
+    ("ruby_direct_script_governed_argv__closure",
+     f"ruby /tmp/x/f.rb {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_direct_script_benign_argv",
+     "python3 /tmp/x/f.py /tmp/notes.txt", "none", None),
+    ("python3_c_flag_is_not_direct_script_floor",
+     f"python3 -c 'print(1)'", "not-write", None),
+    ("ln_future_link_cp__closure",
+     f"ln -sfn {SHARED_DIR} /tmp/freshlink && cp /tmp/a.py /tmp/freshlink/{HOOK}", "write", WRT),
+    ("ln_future_link_redirect__closure",
+     f"ln -sfn {SHARED_DIR} /tmp/freshlink2; cat /tmp/a.py > /tmp/freshlink2/{HOOK}", "write", WRT),
+    ("ln_standalone_recon__read_only",
+     f"ln -sfn {SHARED_DIR} /tmp/recon-link", "not-write", None),
+    ("ln_multiple_sources_directory__closure",
+     f"ln -sfn {SHARED_DIR} /tmp/ordinary /tmp/bundle && cp /tmp/payload /tmp/bundle/_shared/notes.txt",
+     "write", WRT),
+    ("ln_one_arg_creates_basename_link__closure",
+     f"cd /tmp && ln -sfn {SHARED_DIR} && cp /tmp/payload /tmp/_shared/notes.txt", "write", WRT),
+    ("ln_target_directory_flag__closure",
+     f"ln -sfn {SHARED_DIR} -t /tmp/bundle && cp /tmp/payload /tmp/bundle/_shared/notes.txt",
+     "write", WRT),
+    ("ln_unrelated_later_write_stays_unrelated",
+     f"ln -sfn {SHARED_DIR} /tmp/recon && echo ok > /tmp/log", "not-write", None),
+    ("cp_trailing_comment_spaced__closure",
+     f"cp /tmp/a.py {HOOKS}/{HOOK}  # note", "write", WRT),
+    ("cp_trailing_comment_fused__closure",
+     f"cp /tmp/a.py {HOOKS}/{HOOK} #note", "write", WRT),
+    ("install_trailing_comment_spaced__closure",
+     f"install /tmp/a.py {HOOKS}/{HOOK}  # note", "write", WRT),
+    ("install_trailing_comment_fused__closure",
+     f"install /tmp/a.py {HOOKS}/{HOOK} #note", "write", WRT),
+    ("rsync_trailing_comment_spaced__closure",
+     f"rsync /tmp/a.py {HOOKS}/{HOOK}  # note", "write", WRT),
+    ("rsync_trailing_comment_fused__closure",
+     f"rsync /tmp/a.py {HOOKS}/{HOOK} #note", "write", WRT),
+    ("ln_trailing_comment_spaced__closure",
+     f"ln -sf /tmp/a.py {HOOKS}/{HOOK}  # note", "write", WRT),
+    ("ln_trailing_comment_fused__closure",
+     f"ln -sf /tmp/a.py {HOOKS}/{HOOK} #note", "write", WRT),
 
     # --- bash -c / sh -c / eval (opaque string) ---
     ("bash_c__closure",
@@ -167,6 +367,36 @@ CASES = [
      f"git apply {BENIGN_DIR}/closure.patch", "write", RULE_W),
     ("git_apply__benign_content",
      f"git apply {BENIGN_DIR}/benign.patch", "none", None),
+    ("git_apply_cd_relative__benign",
+     f"cd {BENIGN_DIR} && git apply benign.patch", "none", None),
+    ("git_apply_cd_relative__closure",
+     f"cd {BENIGN_DIR} && git apply closure.patch", "write", RULE_W),
+    ("git_apply_cd_relative_stdin__benign",
+     f"cd {BENIGN_DIR} && git apply < benign.patch", "none", None),
+    ("git_apply_cd_relative_stdin__closure",
+     f"cd {BENIGN_DIR} && git apply < closure.patch", "write", RULE_W),
+    ("patch_cd_relative_input__benign",
+     f"cd {BENIGN_DIR} && patch -p1 -i benign.patch", "none", None),
+    ("patch_cd_relative_input__closure",
+     f"cd {BENIGN_DIR} && patch -p1 -i closure.patch", "write", RULE_W),
+    ("patch_cd_relative_stdin__benign",
+     f"cd {BENIGN_DIR} && patch -p1 < benign.patch", "none", None),
+    ("patch_cd_relative_stdin__closure",
+     f"cd {BENIGN_DIR} && patch -p1 < closure.patch", "write", RULE_W),
+    ("git_apply_dash_c_relative__benign",
+     f"git -C {BENIGN_DIR} apply benign.patch", "none", None),
+    ("git_apply_dash_c_relative__closure",
+     f"git -C {BENIGN_DIR} apply closure.patch", "write", RULE_W),
+    ("git_apply_dash_c_shell_stdin__benign",
+     f"cd {BENIGN_DIR} && git -C {REPO_DIR} apply < benign.patch", "none", None),
+    ("git_apply_dash_c_shell_stdin__closure",
+     f"cd {BENIGN_DIR} && git -C {REPO_DIR} apply < closure.patch", "write", RULE_W),
+    ("git_am_dash_c_relative__closure",
+     f"git -C {BENIGN_DIR} am closure.patch", "write", RULE_W),
+    ("git_apply_cd_check_closure__read_only",
+     f"cd {BENIGN_DIR} && git apply --check closure.patch", "none", None),
+    ("git_apply_dash_c_check_closure__read_only",
+     f"git -C {BENIGN_DIR} apply --check closure.patch", "none", None),
     ("git_apply__missing_patch_fails_closed",
      "git apply /tmp/definitely-missing-xyz.patch", "write", OPQ),
     ("git_apply__no_input_at_all_fails_closed",
@@ -240,7 +470,7 @@ def _snapshot(root):
 
 def _setup_sandbox(root):
     """A fake closure layout the write-arm commands can safely touch."""
-    for sub in ("plugins/kimi/hooks", "plugins/_shared", "docs"):
+    for sub in ("plugins/kimi/hooks", "plugins/_shared", "docs", "deploy"):
         os.makedirs(os.path.join(root, sub), exist_ok=True)
     with open(os.path.join(root, "plugins/kimi/hooks", HOOK), "w") as fh:
         fh.write("orig\n")
@@ -280,6 +510,20 @@ _DIFF_CASES = [
     ("cp_into_shared", f"cp src.txt plugins/_shared/{CORE}", True),
     ("sed_bundled_in_place", _sed_bundled_in_place(), True),
     ("cd_then_relative", f"cd plugins/kimi/hooks && echo x > {HOOK}", True),
+    ("union_literal_deploy", "D=deploy; echo x > $D/install-members.sh", True),
+    ("union_skipped_conditional", "D=deploy; false && D=docs; echo x > $D/install-members.sh; D=deploy", True),
+    ("union_transitive_reassignment", "X=deploy; D=docs; D=$X; echo x > $D/install-members.sh; D=deploy", True),
+    ("union_pipeline_assignment", "D=deploy; D=docs | cat; echo x > $D/install-members.sh; D=deploy", True),
+    ("union_assignment_argument_does_not_hide", "D=deploy; echo D=docs; echo x > $D/install-members.sh", True),
+    ("union_literal_docs", "D=docs; echo x > $D/install-members.sh", False),
+    ("union_assignment_argument_stays_benign", "D=docs; echo D=deploy; echo x > $D/install-members.sh", False),
+    ("union_ifs_colon_split", f"IFS=:; S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S", True),
+    ("union_multi_name_read", f"read A B <<< \"junk plugins/kimi/hooks/{HOOK}\"; printf x > \"$B\"", True),
+    ("union_multi_name_read_r", f"read -r A B <<< \"junk plugins/kimi/hooks/{HOOK}\"; printf x > \"$B\"", True),
+    ("union_ifs_append", f"IFS+=:; S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S", True),
+    ("union_ifs_for_binding", f"for IFS in :; do S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S; done", True),
+    ("union_ifs_printf_binding", f"printf -v IFS :; S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S", True),
+    ("union_glob_value", f"S=\"plugins/kimi/hooks/pre_*\"; cp src.txt $S", True),
     ("redirect_benign", "echo hi > docs/readme.md", False),
     ("cp_benign", "cp src.txt docs/notes.txt", False),
 ]
@@ -344,8 +588,8 @@ def test_differential_against_real_shell():
 # the table and once for the comment explaining the table. That refusal is under appeal
 # (deny e7f64345, arbiter codex); harvesting is the honest way to need no exception.
 #
-# Seven real escalations feed the green arms, every one self-withdrawn by its own asker
-# within seconds, and each costing eight peer invitations:
+# These historical escalations feed the block arms. The two direct-interpreter rows move to the
+# write side under #1059; the rest stay read. Each was self-withdrawn and cost eight invitations:
 #   a3557a7f4f0ca71f 2026-09-04  python3 <shared test> | tail; for t in tests/*.py; do ...
 #   c83eccb2dc985f8a 2026-09-05  for r in <ranges>; do sed -n "${r}p" <shared file>; done
 #   0a850f87d37a908b 2026-09-05  for f in <deploy files>; do grep -n ... "$f"; done
@@ -359,10 +603,6 @@ def test_differential_against_real_shell():
 # whole wake on a co-seat. The cost of this FP is not bounded by the asker who pays it.
 _BLOCK_BODY_READS = [
     # (name, blocked form, the same body unblocked)
-    ("a3557a7f__interpreter_then_loop",
-     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
-     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
-     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
     ("c83eccb2__loop_sed_n_program_expansion",
      f'for r in 1-3 5-7; do echo "--- $r"; sed -n "${{r}}p" {SHARED_DIR}/{CORE}; done',
      f'sed -n "${{r}}p" {SHARED_DIR}/{CORE}'),
@@ -382,16 +622,25 @@ _BLOCK_BODY_READS = [
     ("71199e4b__loop_ls_over_config_paths",
      f'for p in {SHARED_DIR} {HOOKS}/{HOOK}; do echo "== $p"; ls -la $p; done',
      f'ls -la {SHARED_DIR} {HOOKS}/{HOOK}'),
-    ("ffcf0139__loop_running_these_very_suites",
-     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
-     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
-     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
     # Nesting and terminators: a block inside a block, and a redirect hanging off `done`
     # (harvested by _bash_write_targets BEFORE the segment is flushed, so stripping the
     # terminator must not lose it ─ the write arm for this shape is generated below).
     ("nested_blocks_read_only_body",
      f'for x in a; do if true; then grep -c def {SHARED_DIR}/{CORE}; fi; done',
      f'grep -c def {SHARED_DIR}/{CORE}'),
+]
+
+# Direct interpreter argv is a write floor under #1059, so these two historical read arms move
+# to the write side without changing their command text or weakening the block invariant.
+_BLOCK_BODY_WRITES = [
+    ("a3557a7f__interpreter_then_loop",
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
+     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
+    ("ffcf0139__loop_running_these_very_suites",
+     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
+     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
+     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
 ]
 
 
@@ -505,6 +754,7 @@ def test_block_and_its_unblocked_body_agree():
     """
     failures, coarser = [], []
     writes, unreached = _generated_write_pairs()
+    writes = _BLOCK_BODY_WRITES + writes
     if unreached:
         failures.append(f"no operand shape in _WRITE_SHAPES reaches the write position of "
                         f"{unreached} ─ those verbs are modelled by the classifier but "
@@ -552,9 +802,50 @@ def test_block_and_its_unblocked_body_agree():
     check("block_and_body_agree", not failures, "\n  ".join(failures))
 
 
+def test_patch_source_uses_classify_cwd():
+    cases = [
+        ("git_apply", "git apply benign.patch", "none", None),
+        ("git_apply_closure", "git apply closure.patch", "write", RULE_W),
+        ("git_apply_stdin", "git apply < benign.patch", "none", None),
+        ("git_apply_stdin_closure", "git apply < closure.patch", "write", RULE_W),
+        ("patch_input", "patch -p1 -i benign.patch", "none", None),
+        ("patch_input_closure", "patch -p1 -i closure.patch", "write", RULE_W),
+        ("patch_stdin", "patch -p1 < benign.patch", "none", None),
+        ("patch_stdin_closure", "patch -p1 < closure.patch", "write", RULE_W),
+    ]
+    for name, cmd, want_cls, want_rule in cases:
+        v = cls(cmd, cwd=BENIGN_DIR)
+        check(f"classify_cwd__{name}", (v.classification, v.rule) == (want_cls, want_rule), v)
+
+
+def test_same_call_link_chain_matches_real_shell():
+    sandbox = tempfile.mkdtemp(prefix="sym1047-chain-")
+    try:
+        gov = os.path.join(sandbox, "repo", "plugins", "_shared")
+        os.makedirs(gov)
+        payload = os.path.join(sandbox, "payload.txt")
+        with open(payload, "w", encoding="utf-8") as fh:
+            fh.write("witness\n")
+        a, b = os.path.join(sandbox, "a"), os.path.join(sandbox, "b")
+        cmd = f"ln -s {gov} {a} && ln -s {a} {b} && cp {payload} {b}/note.txt"
+        v = cls(cmd, cwd=sandbox)
+        p = subprocess.run(["bash", "-c", cmd], cwd=sandbox,
+                           capture_output=True, text=True, timeout=30)
+        check("real_link_chain_write_succeeds", p.returncode == 0, p.stderr)
+        with open(os.path.join(gov, "note.txt"), encoding="utf-8") as fh:
+            check("real_link_chain_reaches_governed_file", fh.read() == "witness\n")
+        check("classifier_follows_the_whole_link_chain",
+              v.classification == "write" and v.rule == WRT, v)
+    finally:
+        import shutil
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 ALL = [
     test_explicit_all_grammar_cases,
+    test_patch_source_uses_classify_cwd,
     test_differential_against_real_shell,
+    test_same_call_link_chain_matches_real_shell,
     test_block_and_its_unblocked_body_agree,
     test_a_write_through_a_loop_variable_stays_refused,
 ]
