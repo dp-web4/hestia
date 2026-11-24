@@ -4441,6 +4441,52 @@ async fn config_put_seat(
         }
     }
 
+    // The role the seat RUNS AS, not the one its own document states: a shared HESTIA_ROLE wins
+    // over a seat's (`sc::effective`), so the gate and the receipt compare effective authority.
+    // For the shared set itself the document IS the effective value of every seat.
+    let previous_cfg = previous.as_ref()
+        .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok());
+    let inherited_role = if writing_shared { None } else {
+        match sc::load_shared(&s.vault) {
+            Some(Ok(c)) => c.env.get("HESTIA_ROLE").cloned(),
+            _ => None,
+        }
+    };
+    let previous_role = inherited_role.clone()
+        .or_else(|| previous_cfg.as_ref().and_then(|old| old.env.get("HESTIA_ROLE").cloned()));
+    let next_role = inherited_role.clone().or_else(|| cfg.env.get("HESTIA_ROLE").cloned());
+    let role_changed = previous_role != next_role;
+    // A SHARED write moves the effective role of every seat that inherits it, so its receipt
+    // names each seat whose effective role moves (NOVA, #1648 updated-head review): a seat's own
+    // HESTIA_ROLE stands only where the shared set states none (`sc::effective`).
+    let seat_role_transitions: Vec<serde_json::Value> = if !writing_shared { Vec::new() } else {
+        sc::declared_members(&s.vault).into_iter()
+            .filter(|m| !sc::is_shared(m))
+            .filter_map(|m| {
+                let own = s.vault.get_document(sc::SEAT_CONFIG_NS, &m)
+                    .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok())
+                    .and_then(|c| c.env.get("HESTIA_ROLE").cloned());
+                let before = previous_role.clone().or_else(|| own.clone());
+                let after = next_role.clone().or(own);
+                (before != after).then(|| serde_json::json!({
+                    "member": m, "previous_hestia_role": before, "next_hestia_role": after,
+                }))
+            })
+            .collect()
+    };
+    // The reason is for THIS act. `note` is stored in the document and the editor opens with it,
+    // so the stored note re-sent unchanged is the last change's reason, not this one's.
+    let previous_note = previous_cfg.as_ref().map(|old| old.note.trim()).unwrap_or("");
+    if role_changed && (cfg.note.trim().is_empty() || cfg.note.trim() == previous_note) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a new note is required to change HESTIA_ROLE — say why this capacity role \
+                          changes authority (the stored note is the previous change's reason)"
+            })),
+        );
+    }
+
     // WITNESS FIRST, the same ordering as every other authority write here: a failed vault write
     // must not leave the chain silent about an attempted change to what a seat runs with. The
     // record names the KEYS, never the values — a config document can carry a token, and the
@@ -4449,6 +4495,11 @@ async fn config_put_seat(
         "member": member,
         "shared": writing_shared,
         "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+        "previous_hestia_role": previous_role,
+        "next_hestia_role": next_role,
+        "role_changed": role_changed,
+        "hestia_role_inherited": inherited_role.is_some(),
+        "seat_role_transitions": seat_role_transitions,
         "note": cfg.note,
         "replaces": existed,
         "decided_by": "operator",
@@ -10380,6 +10431,142 @@ mod disposition_tests {
         assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
     }
 
+    #[tokio::test]
+    async fn role_changes_require_a_reason_and_are_witnessed() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                )
+            }
+        };
+        let refused = put(serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": ""},
+        })).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let accepted = put(serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"},
+                       "note": "review duty is deliberate"},
+        })).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let entries = state.lock().await.recent_chain(8);
+        let intent = entries.iter().find(|entry| entry.event_type == "config_seat_write_intent")
+            .expect("the role change is witnessed");
+        assert_eq!(intent.event_data["note"], "review duty is deliberate");
+        assert_eq!(intent.event_data["previous_hestia_role"], serde_json::Value::Null);
+        assert_eq!(intent.event_data["next_hestia_role"], "role:constellation:reviewer");
+        assert_eq!(intent.event_data["role_changed"], true);
+        assert!(intent.event_data["keys"].as_array().unwrap()
+            .iter().any(|key| key == "HESTIA_ROLE"));
+    }
+
+    /// The note is STORED in the document and the editor opens with it, so re-sending it
+    /// unchanged is the previous act's reason, not this one's (#1648 sweep finding 1).
+    #[tokio::test]
+    async fn a_role_change_needs_a_new_reason_not_the_stored_note() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                ).status()
+            }
+        };
+        let seat = |role: &str, note: &str| serde_json::json!({
+            "plugin_id": "claude-code", "config": {"env": {"HESTIA_ROLE": role}, "note": note},
+        });
+        assert_eq!(put(seat("role:constellation:member", "initial setup")).await, StatusCode::OK);
+        assert_eq!(put(seat("role:constellation:reviewer", "initial setup")).await, StatusCode::BAD_REQUEST,
+                   "the stored note is not a reason for a new role change");
+        assert_eq!(put(seat("role:constellation:reviewer", " initial setup ")).await, StatusCode::BAD_REQUEST,
+                   "nor is the stored note with whitespace around it");
+        assert_eq!(put(seat("role:constellation:reviewer", "review duty is deliberate")).await, StatusCode::OK);
+        // a no-op role save may keep the stored note
+        assert_eq!(put(seat("role:constellation:reviewer", "review duty is deliberate")).await, StatusCode::OK);
+    }
+
+    /// NOVA's ask on #1648: the gate and the receipt compare the role a seat RUNS AS. A shared
+    /// HESTIA_ROLE wins over a seat's own (`seat_config::effective`), so a seat inheriting it, a
+    /// seat dropping a shadowed override, and a shared change affecting every seat are each
+    /// judged on effective authority.
+    #[tokio::test]
+    async fn the_role_gate_compares_effective_roles_under_a_shared_role() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                let resp = axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                );
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        let last_intent = |state: SharedState| async move {
+            state.lock().await.recent_chain(16).into_iter()   // newest first
+                .find(|entry| entry.event_type == "config_seat_write_intent")
+                .map(|entry| entry.event_data).expect("a config write is witnessed")
+        };
+        // a seat override written BEFORE the shared set owned the key: it will be shadowed
+        let (st, out) = put(serde_json::json!({"plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": "review duty"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        // a shared role change affects every seat: it needs a reason
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:member"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:member"}, "note": "society floor"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!((rec["shared"].clone(), rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone()),
+                   (serde_json::json!(true), serde_json::Value::Null, serde_json::json!("role:constellation:member"), serde_json::json!(true)), "{rec}");
+        // ...and the receipt names the seat whose EFFECTIVE role the shared write moved
+        assert_eq!(rec["seat_role_transitions"], serde_json::json!([{"member": "claude-code",
+            "previous_hestia_role": "role:constellation:reviewer",
+            "next_hestia_role": "role:constellation:member"}]), "{rec}");
+        // ...and a stale shared note is no reason for the next shared change
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:witness"}, "note": "society floor"}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        // a seat inheriting the shared role cannot restate it
+        let (st, out) = put(serde_json::json!({"plugin_id": "kimi-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": "want review"}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert_eq!(out["shared_keys"], serde_json::json!(["HESTIA_ROLE"]), "{out}");
+        // a seat with no role of its own inherits: its receipt names the effective role, unchanged
+        let (st, out) = put(serde_json::json!({"plugin_id": "kimi-code",
+            "config": {"env": {"HESTIA_HARNESS_HOME": "/h/kimi"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!((rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone(), rec["hestia_role_inherited"].clone()),
+                   (serde_json::json!("role:constellation:member"), serde_json::json!("role:constellation:member"), serde_json::json!(false), serde_json::json!(true)), "{rec}");
+        // dropping the shadowed override changes no authority (shared already won): no reason
+        // is manufactured, and the receipt says the effective role did not move
+        let (st, out) = put(serde_json::json!({"plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_HARNESS_HOME": "/h/claude"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!((rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone()),
+                   (serde_json::json!("role:constellation:member"), serde_json::json!("role:constellation:member"), serde_json::json!(false)), "{rec}");
+        // the shared set DROPPING its role moves every inheriting seat to no role: the receipt
+        // names each one, not only `_shared`'s own transition
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {}, "note": "no society floor"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!(rec["seat_role_transitions"], serde_json::json!([
+            {"member": "claude-code", "previous_hestia_role": "role:constellation:member", "next_hestia_role": null},
+            {"member": "kimi-code", "previous_hestia_role": "role:constellation:member", "next_hestia_role": null},
+        ]), "{rec}");
+    }
+
     /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
     /// inherited by every seat with shared winning; a seat that restates a shared key is refused
     /// at the door; a shared write re-renders every seat in the same act; the list names the
@@ -10401,7 +10588,7 @@ mod disposition_tests {
         };
         // two seats first, each carrying only its own facts
         for (m, role) in [("claude-code", "role:constellation:interactive-dev"), ("codex", "role:constellation:member")] {
-            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": ""}})).await;
+            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": "test role assignment"}})).await;
             assert_eq!(st, StatusCode::OK);
         }
         // the shared set: society facts, and a token-shaped value that must never reach the chain
