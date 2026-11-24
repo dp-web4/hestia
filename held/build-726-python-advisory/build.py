@@ -29,6 +29,7 @@ def patch_core(src):
         lexer.whitespace_split = True
 ''', '''        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\\n")
         lexer.whitespace = " \\t\\r\\f\\v"
+        lexer.commenters = ""
         lexer.whitespace_split = True
 ''')
     src = once(src, '''        if re.fullmatch(r"[&|;]+", word):
@@ -43,6 +44,7 @@ def patch_core(src):
         pythonpath = None
 ''', '''    invocations = []
     current_cwd = os.path.realpath(cwd)
+    alternate_cwds = []
     current_pythonpath = None
     skip_next = False
     for segment_index, segment in enumerate(segments):
@@ -87,15 +89,29 @@ def patch_core(src):
             if len(segment) == i + 2 and next_separator in ("&&", "||", ";", "\\n"):
                 candidate = os.path.realpath(os.path.join(
                     current_cwd, os.path.expanduser(segment[i + 1])))
-                exists = os.path.isdir(candidate)
-                if exists and previous_separator not in ("&&", "||") and next_separator != "||":
+                if previous_separator in ("&&", "||") or next_separator == "||":
+                    if candidate != current_cwd and candidate not in alternate_cwds:
+                        alternate_cwds.append(candidate)
+                elif os.path.isdir(candidate):
                     current_cwd = candidate
-                if (exists and next_separator == "||") or (not exists and next_separator == "&&"):
+                    alternate_cwds = []
+                elif next_separator == "&&" and segment_index == 0:
                     skip_next = True
             continue
-        program = os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
+        program = (os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
+                   if "/" in segment[i] else segment[i])
         if not re.fullmatch(r"(?:python|pypy)(?:[0-9]+(?:\\.[0-9]+)*)?(?:-dbg)?", program):
             continue
+''')
+    src = once(src, '''        script_dir = None
+        if script and not stop_at_cwd:
+            script_dir = os.path.dirname(os.path.realpath(os.path.join(current_cwd, script)))
+        invocations.append((isolated, script_dir, current_cwd, pythonpath))
+''', '''        for invocation_cwd in dict.fromkeys([current_cwd] + alternate_cwds):
+            script_dir = None
+            if script and not stop_at_cwd:
+                script_dir = os.path.dirname(os.path.realpath(os.path.join(invocation_cwd, script)))
+            invocations.append((isolated, script_dir, invocation_cwd, pythonpath))
 ''')
     src = once(src, '''    current = os.path.realpath(cwd)
     workspace = os.path.realpath(workspace)
@@ -111,8 +127,9 @@ def patch_core(src):
 ''', '''    Trust requires an explicit `path:` grant that reaches the actual script/import directory
     AND package evidence, never a marker or an exact grant on an ancestor alone. Existing denies
     keep precedence: this is called only after scope has admitted the act. Only direct interpreter
-    commands are parsed; `sh -c`, `uv run`, and command substitution are outside this advisory,
-    so no warning is not proof of import safety.
+    commands are parsed; `sh -c`, `uv run`, command substitution, `if`/`while` bodies, subshells,
+    `pushd`, and heredoc-fed interpreters are outside this advisory, so no warning is not proof
+    of import safety.
 ''')
 
 
@@ -151,6 +168,34 @@ def patch_test(src):
         check("a recursive grant still reaches a nested package directory",
               signal(unmarked_command, tmp, scopes=recursive) is None,
               repr(signal(unmarked_command, tmp, scopes=recursive)))
+        untrusted = root / "untrusted"
+        untrusted.mkdir()
+        (untrusted / "probe.py").write_text("print('untrusted')\\n")
+        conditional_untrusted = f"true && cd {shlex.quote(str(untrusted))} && python3 probe.py"
+        verdict = signal(conditional_untrusted, root / "granted", workspace=tmp,
+                         scopes=[f"path:{root / 'granted'}"])
+        check("a conditional cd adds an untrusted possible cwd",
+              verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        for label, prefix in (("cloned", "git clone example"), ("created", "mkdir -p")):
+            created = root / "granted" / (label + "-package")
+            command = f"{prefix} {created} && cd {created} && python3 setup.py install"
+            verdict = signal(command, root / "granted", workspace=tmp,
+                             scopes=[f"path:{root / 'granted'}"])
+            check(f"a {label} directory remains a possible cwd",
+                  verdict is not None and verdict.target == str(created), repr(verdict))
+        or_branch = f"cd {shlex.quote(str(untrusted))} || exit; python3 probe.py"
+        verdict = signal(or_branch, root / "granted", workspace=tmp,
+                         scopes=[f"path:{root / 'granted'}"])
+        check("an or-branch does not discard the cd target",
+              verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        planted = root / "python3"
+        planted.symlink_to("/bin/true")
+        check("a planted bare-name symlink cannot silence the advisory",
+              signal("python3 probe.py", tmp) is not None)
+        comment_newline = "echo hi # comment\\npython3 probe.py"
+        verdict = signal(comment_newline, tmp)
+        check("a comment does not swallow the newline before Python",
+              verdict is not None and verdict.target == str(root), repr(verdict))
         with tempfile.TemporaryDirectory() as ambient:
             exported = f"export PYTHONPATH={shlex.quote(ambient)}; python3 -c 'import x'"
 ''')
@@ -210,11 +255,14 @@ def run_acx(root, tmp):
 def main():
     original_core = show("HEAD:" + CORE)
     original_test = show(":" + TEST)
+    previous_body = (WT / "held/c063c5ce39475bdda9e0bb40292682da70c2e7c037f68df07fb336d33d07be33.patch").read_text()
+    previous_core = strict_apply(original_core, sections(previous_body)[CORE])
     patched_core, patched_test = patch_core(original_core), patch_test(original_test)
     work = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BUILD))
     try:
-        base, patched = work / "base", work / "patched"
+        base, previous, patched = work / "base", work / "previous", work / "patched"
         overlaid(base, original_core, patched_test)
+        overlaid(previous, previous_core, patched_test)
         overlaid(patched, patched_core, patched_test)
         before = run_acx(base, work / "base-tmp")
         print(before.stdout, end="")
@@ -231,6 +279,20 @@ def main():
         )
         missing = [name for name in required_names if name not in before.stdout]
         assert not missing, ("non-discriminating controls", missing)
+        withdrawn = run_acx(previous, work / "previous-tmp")
+        print(withdrawn.stdout, end="")
+        print(withdrawn.stderr, end="", file=sys.stderr)
+        assert withdrawn.returncode != 0, "the new controls do not fail on the withdrawn candidate"
+        withdrawn_names = (
+            "a conditional cd adds an untrusted possible cwd",
+            "a cloned directory remains a possible cwd",
+            "a created directory remains a possible cwd",
+            "an or-branch does not discard the cd target",
+            "a planted bare-name symlink cannot silence the advisory",
+            "a comment does not swallow the newline before Python",
+        )
+        missing = [name for name in withdrawn_names if name not in withdrawn.stdout]
+        assert not missing, ("controls that pass on the withdrawn candidate", missing)
         after = run_acx(patched, work / "patched-tmp")
         print(after.stdout, end="")
         print(after.stderr, end="", file=sys.stderr)
