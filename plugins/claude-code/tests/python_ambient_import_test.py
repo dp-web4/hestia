@@ -273,6 +273,38 @@ print(json.dumps({'pid': os.getpid(), 'decision': verdict.decision, 'rule': verd
               signal(trusted_cd, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
               repr(signal(trusted_cd, tmp, scopes=[f"path:{root / 'granted'}"])))
 
+        trusted_newline = f"cd {shlex.quote(str(root / 'granted'))}\npython3 probe.py"
+        check("a newline supplies the same command boundary as a semicolon",
+              signal(trusted_newline, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
+              repr(signal(trusted_newline, tmp, scopes=[f"path:{root / 'granted'}"])))
+        conditional = f"false && cd {shlex.quote(str(root / 'granted'))}; python3 probe.py"
+        verdict = signal(conditional, tmp, scopes=[f"path:{root / 'granted'}"])
+        check("a failed conditional cd cannot manufacture package trust",
+              verdict is not None and verdict.target == str(root), repr(verdict))
+        missing = f"cd {shlex.quote(str(root / 'missing'))} && python3 probe.py"
+        check("a failed cd stops the dependent interpreter invocation",
+              signal(missing, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
+              repr(signal(missing, tmp, scopes=[f"path:{root / 'granted'}"])))
+        nested = root / "granted" / "downloads" / "untrusted"
+        nested.mkdir(parents=True)
+        (nested / "pyproject.toml").write_text("[project]\nname='nested-untrusted'\n")
+        (nested / "probe.py").write_text("print('nested')\n")
+        nested_command = f"cd {shlex.quote(str(nested))} && python3 probe.py"
+        verdict = signal(nested_command, tmp, scopes=[f"path:{root / 'granted'}"])
+        check("an exact grant does not bless every nested package directory",
+              verdict is not None and verdict.target == str(nested), repr(verdict))
+        with tempfile.TemporaryDirectory() as ambient:
+            exported = f"export PYTHONPATH={shlex.quote(ambient)}; python3 -c 'import x'"
+            verdict = signal(exported, tmp, scopes=[f"path:{root / 'granted'}"])
+            check("an exported untrusted PYTHONPATH is not lost between segments",
+                  verdict is not None and verdict.target == ambient, repr(verdict))
+        check("pypy is an interpreter alias, not an unobserved Python runtime",
+              signal("pypy3 probe.py", tmp) is not None)
+        alias = root / "py"
+        alias.symlink_to(sys.executable)
+        check("a symlinked interpreter alias is resolved before matching",
+              signal(f"{shlex.quote(str(alias))} probe.py", tmp) is not None)
+
     print("ACX-07 — non-shell events never parse stdin as a shell command")
     with tempfile.TemporaryDirectory() as tmp:
         class NoRead:
