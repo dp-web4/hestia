@@ -425,6 +425,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install pytest for the collection-parity guard
+        # #1102: ci_execution_parity_test.py invokes pytest --collect-only. The other tests here
+        # remain stdlib-only; this dependency is for that one measurement, not the production code.
+        run: python3 -m pip install -q 'pytest>=8.0'
+
       - name: Run every discovered test file (tools/ci_discovery.py bare)
         shell: bash
         run: |
