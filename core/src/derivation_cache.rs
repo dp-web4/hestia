@@ -316,7 +316,8 @@ mod tests {
         s.append(
             "policy_decision",
             json!({"plugin_id": pid, "role_lct": ROLE, "decision": "deny", "enforced": true,
-                   "session_id": session, "tool_name": "Bash", "target": target}),
+                   "session_id": session, "tool_name": "Bash", "target": target,
+                   "attempted": format!("cat {target}")}),
             "lct:test",
         )
         .unwrap()
@@ -326,7 +327,8 @@ mod tests {
         s.append(
             "policy_decision",
             json!({"plugin_id": pid, "role_lct": ROLE, "decision": "allow", "enforced": true,
-                   "session_id": session, "tool_name": "Bash", "target": target}),
+                   "session_id": session, "tool_name": "Bash", "target": target,
+                   "attempted": format!("cat {target}")}),
             "lct:test",
         )
         .unwrap()
