@@ -179,11 +179,14 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Governance-surface escalations — the remedy every gate deny already names.
+    /// Governance-write and scope escalations: escalate a refusal, then poll, approve or deny it.
     ///
-    /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
-    /// subcommand was never written (#116). This is a client over tools the daemon
-    /// already ships — it adds no authority and can only reach verdicts the daemon
+    /// A gate deny names a refusal id. The refused member escalates it deliberately with
+    /// `hestia gate escalate <refusal_id> --as <member> --reason '...'` (dp, 2026-11-05: the
+    /// gate opens none on its own); a scope refusal id is accepted too and goes to
+    /// `hestia_scope_escalate`, or scope is asked for up front with `hestia_request_scope`.
+    /// Deciders rule with approve, deny and corroborate. This is a client over tools the
+    /// daemon already ships — it adds no authority and can only reach verdicts the daemon
     /// would already permit.
     Gate {
         #[command(subcommand)]
@@ -281,6 +284,25 @@ enum GateCmd {
         /// Why. Optional against a peer's ask; REQUIRED to withdraw your own.
         #[arg(long)]
         reason: Option<String>,
+    },
+
+    /// Ratify the exact gate bytes the daemon just verified. With no --path this is the bulk
+    /// arm, accepted only when every discovered gate matches the deploy record. Repeated
+    /// --path selects individual gates for a per-gate merge.
+    Ratify {
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`) whose public
+        /// half is law-listed in `operator_access`. Read, never printed.
+        #[arg(long, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+        /// Why these bytes are the ones you reviewed (single line, <=512 bytes)
+        #[arg(long)]
+        reason: String,
+        /// Discovered gate path to ratify; repeat for a per-gate merge
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Emit the daemon's response as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Add evidence WITHOUT deciding (#122 — approval accumulates as factors)
@@ -1271,6 +1293,9 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Deny { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, false, reason, asserted_id, &role,
                 ),
+                GateCmd::Ratify { key, reason, paths, json } => {
+                    gate_cli::ratify(&endpoint, &key, &reason, &paths, json)
+                }
                 GateCmd::Corroborate { escalation_id, stance, argument } => {
                     gate_cli::corroborate(&endpoint, &escalation_id, &stance, argument, asserted_id, &role)
                 }
@@ -2359,7 +2384,7 @@ fn cmd_lct_relay(
     let payload = hestia::lct_publish::relay_payload(&value, published_by, chrono::Utc::now())
         .map_err(|e| anyhow::anyhow!("relay refused: {e}"))?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
     println!(
         "Relaying {} to {} (hub {hub_id}) as {published_by} ...",
@@ -2465,7 +2490,7 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
     }
     let conn = conn_snapshot.expect("send path always has a connection");
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
 
     println!(
@@ -2933,7 +2958,7 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
     let hub_id = conn.hub_lct_id;
     let our_lct = conn.our_lct_id;
     let url = conn.url.clone();
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
 
     println!("Pushing {} field(s) to {} ...", fields.len(), url);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -2972,14 +2997,8 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
 }
 
 /// Resolve a possibly-relative rest endpoint against the connection base URL.
-fn abs_rest(base_url: &str, rest: &str) -> String {
-    if rest.starts_with("http://") || rest.starts_with("https://") {
-        rest.to_string()
-    } else if rest.is_empty() {
-        format!("{}/v1", base_url.trim_end_matches('/'))
-    } else {
-        format!("{}{}", base_url.trim_end_matches('/'), rest)
-    }
+fn abs_rest(base_url: &str, rest: &str) -> AnyResult<String> {
+    hestia::hub::absolute_rest_endpoint(base_url, rest)
 }
 
 /// Resolve the hub connection to operate on (sole connection, or by url/uuid).
@@ -3012,7 +3031,7 @@ fn cmd_hub_pair_request(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3060,7 +3079,7 @@ fn cmd_hub_pair_confirm(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3129,7 +3148,7 @@ fn cmd_hub_pair_revoke(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3190,7 +3209,7 @@ fn cmd_hub_send_secret(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3252,7 +3271,7 @@ fn cmd_hub_recv_secrets(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3510,7 +3529,7 @@ fn cmd_hub_notify(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3585,7 +3604,7 @@ fn cmd_hub_notifications(home: &std::path::Path, target: &str) -> AnyResult<()> 
         // Per-hub isolation: one unreachable hub must not drop the others' notices.
         let drained = (|| -> AnyResult<serde_json::Value> {
             let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-            let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+            let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
             let channel = rt.block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))?;
             rt.block_on(client.channel_query(
                 &rest, &channel, &keypair, conn.our_lct_id, "notifications", serde_json::json!({}),
@@ -3674,7 +3693,7 @@ fn cmd_receiver_bind(
         .context("resolving receiver mailbox credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint)?;
 
     // Verify both halves NOW; drain re-verifies them every pass.
     let discovered = rt.block_on(client.discover(&template.url))
@@ -3791,7 +3810,7 @@ fn cmd_receiver_router_join(
 
     let hubs = HubStore::load(&vault)?;
     let template = pick_connection(&hubs, target)?;
-    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint)?;
 
     let mut memberships = RouterMembershipStore::load(&vault)?;
     let existing = memberships
@@ -3992,7 +4011,7 @@ fn cmd_receiver_router_bind(
         .context("resolving router interface credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint)?;
     let discovered = rt.block_on(client.discover(&template.url))
         .context("re-discovering Hub before router interface bind")?;
     anyhow::ensure!(
@@ -4139,7 +4158,7 @@ fn cmd_receiver_router_certify(
         "router certificate endpoint advertises Hub {}, expected {}",
         discovered.hub_lct_id, membership.hub_lct_id
     );
-    let rest = abs_rest(&membership.hub_url, &membership.rest_endpoint);
+    let rest = abs_rest(&membership.hub_url, &membership.rest_endpoint)?;
     let pinned = rt.block_on(client.resolve_member_pubkey(
         &rest,
         membership.hub_lct_id,
@@ -4248,7 +4267,7 @@ fn cmd_receiver_neighbor(
         .context("resolving local router interface credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+    let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint)?;
     let ours = rt.block_on(
         client.resolve_member_pubkey(&rest, iface.hub_lct_id, iface.hub_member_lct)
     ).with_context(|| format!("resolving local Hub pin for {}", iface.hub_member_lct))?;
@@ -4430,7 +4449,7 @@ fn receiver_cutover_preflight(
                                 table.router_ingress_by_id(n.interface_binding_id)
                             {
                                 let client = HubClient::new();
-                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint)?;
                                 let runtime = tokio::runtime::Runtime::new();
 
                                 // Peer proof: dual signatures + exact routing
@@ -5269,7 +5288,7 @@ fn cmd_constellation_add_remote(
     // the peer's acts against, and the same one `cosign-serve` signs with. Taking
     // it from here rather than from the peer means the peer publishes nothing —
     // there is no CLI that prints a member's own pubkey.
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let pubkey = rt
@@ -5386,7 +5405,7 @@ fn cmd_constellation_enroll(
     let hub_store = HubStore::load(&vault)?;
     let conn = pick_connection(&hub_store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -5412,7 +5431,7 @@ fn cmd_constellation_revoke_device(
     let hub_store = HubStore::load(&vault)?;
     let conn = pick_connection(&hub_store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(client.revoke_device(&rest, conn.hub_lct_id, conn.our_lct_id, &keypair, device))
@@ -5426,7 +5445,7 @@ fn cmd_constellation_enrolled(home: &std::path::Path, target: &str) -> AnyResult
     let vault = open_vault(home)?;
     let hub_store = HubStore::load(&vault)?;
     let conn = pick_connection(&hub_store, target)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let resp = rt.block_on(client.list_enrolled_devices(&rest, conn.hub_lct_id, conn.our_lct_id))
@@ -5506,7 +5525,7 @@ fn cmd_constellation_present(
         }
     }
 
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let pair_id = uuid::Uuid::new_v4();
@@ -5570,7 +5589,7 @@ fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> Any
         store.save(&mut vault)?;
     }
     let roster: Vec<uuid::Uuid> = store.members.iter().map(|m| m.lct_id).collect();
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
@@ -5703,7 +5722,7 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
     let conn = pick_connection(&hub_store, target)?;
     let member_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
     let my_lct = conn.our_lct_id; // the identity the owner enrolled + pairs against
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
@@ -6075,7 +6094,7 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
         api_version,
         // Discovery may advertise a relative rest path (e.g. "/v1"); store it
         // absolute so request builders always have a base.
-        rest_endpoint: abs_rest(url, &info.endpoints.rest),
+        rest_endpoint: abs_rest(url, &info.endpoints.rest)?,
         hubs_joined: vec![],
         member_key_source: Default::default(),
     };
@@ -6195,7 +6214,7 @@ fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> A
             "not connected to {target} — run `hestia hub connect <url>` first"
         ))?;
         let c = &store.connections[pos];
-        (pos, c.hub_lct_id, abs_rest(&c.url, &c.rest_endpoint), c.url.clone())
+        (pos, c.hub_lct_id, abs_rest(&c.url, &c.rest_endpoint)?, c.url.clone())
     };
 
     let (member_lct, keypair) = ensure_member_identity(&mut vault)?;
@@ -6534,4 +6553,42 @@ mod member_key_source_tests {
 
     // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
+}
+
+
+#[cfg(test)]
+mod gate_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn gate_help_distinguishes_governance_escalations_from_scope_requests() {
+        let mut gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let mut bytes = Vec::new();
+        gate.write_long_help(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("governance-write"), "{text}");
+        assert!(text.contains("hestia_request_scope"), "{text}");
+        assert!(!text.contains("on every refusal"), "{text}");
+        // Since dp 2026-11-05 the deny names a refusal id and the refused member's
+        // remedy is `gate escalate`; approve is the decider's verb, and it exists.
+        assert!(text.contains("hestia gate escalate <refusal_id>"), "{text}");
+        assert!(!text.contains("never written"), "{text}");
+    }
+
+    #[test]
+    fn gate_short_about_does_not_claim_every_deny_names_it() {
+        // `hestia --help` prints the `about` line in the command list, so the
+        // every-refusal claim must be absent there too, not only in long help.
+        let gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let about = gate.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(!about.contains("every gate deny"), "{about}");
+        assert!(about.contains("escalate"), "{about}");
+    }
 }

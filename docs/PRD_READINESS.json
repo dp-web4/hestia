@@ -1,0 +1,674 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "ref": "origin/main",
+    "commit": "185dc82fbc37c6e4d6916f44b12cda3fa8b59e59",
+    "measured_at": "2026-11-24T00:51:24Z"
+  },
+  "rows": [
+    {
+      "id": "5.1",
+      "title": "Install & onboard",
+      "rung": "source",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "UX",
+        "evidence-only"
+      ],
+      "unknown": "No current clean-machine, non-technical first-run reaches society + identity + open vault without builder help.",
+      "issues": [
+        1568,
+        1495,
+        716
+      ],
+      "pull_requests": [
+        1567
+      ],
+      "evidence": [
+        {
+          "rung": "source",
+          "path": "docs/PRD_FIRST_USER_APP_2026-11-11.md",
+          "text": "Current first-user requirements and the clean-machine acceptance path are specified; this is source evidence, not a completed onboarding run."
+        },
+        {
+          "rung": "source",
+          "path": "app/src/App.tsx",
+          "text": "The app shell is present at the baseline. The active first-run PR is deliberately not counted as merged evidence."
+        }
+      ]
+    },
+    {
+      "id": "5.2",
+      "title": "Find & connect hubs",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "UX",
+        "evidence-only"
+      ],
+      "unknown": "No current guided public/private hub join plus sealed member exchange is demonstrated for a fresh outside user.",
+      "issues": [
+        1493,
+        1269,
+        1210
+      ],
+      "pull_requests": [],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/hub.rs",
+          "text": "Hub client behavior is present on the baseline; this does not establish the guided end-to-end join."
+        },
+        {
+          "rung": "merged",
+          "path": "plugins/member-mesh/hestia-mesh.py",
+          "text": "Member messaging and its regression suite are merged, while routing and receiving follow-ups remain open."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1613",
+          "text": "Hub CLI and router REST endpoints are confined (#351), merged 2026-11-23; this hardens the hub surface and does not establish the guided join."
+        }
+      ]
+    },
+    {
+      "id": "5.3",
+      "title": "Manage local orchestrators",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "UX"
+      ],
+      "unknown": "Current start/stop/observe behavior and plain-language health have not been exercised as one outside-user workflow.",
+      "issues": [
+        670,
+        726,
+        760
+      ],
+      "pull_requests": [
+        1627
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/orchestrators.rs",
+          "text": "Local orchestrator control exists at the baseline."
+        },
+        {
+          "rung": "merged",
+          "path": "plugins/_shared/seat_gate_boundary_test.py",
+          "url": "https://github.com/dp-web4/hestia/actions/runs/44873991884/job/136754524363",
+          "text": "The common-gate boundary is covered by the successful baseline plugin-test job; remaining scope and runtime-signal defects stay row-linked."
+        }
+      ]
+    },
+    {
+      "id": "5.4",
+      "title": "Build a device constellation",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "UX",
+        "evidence-only"
+      ],
+      "unknown": "No current second-device pairing, co-signed custody transfer, version-compatibility display, and lost-device revocation run is recorded.",
+      "issues": [
+        984,
+        1485
+      ],
+      "pull_requests": [],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/constellation.rs",
+          "text": "Constellation mechanics are merged at the baseline."
+        },
+        {
+          "rung": "merged",
+          "path": "core/src/pairing.rs",
+          "text": "Pairing mechanics are merged; no second-device user observation is inferred from their presence."
+        }
+      ]
+    },
+    {
+      "id": "5.5",
+      "title": "Vault",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "evidence-only"
+      ],
+      "unknown": "Transport-authenticated entitlement, legacy migration, both issuance axes, and the two fail-direction criteria are not demonstrated as one current vault acceptance.",
+      "issues": [
+        1479,
+        832,
+        356,
+        581
+      ],
+      "pull_requests": [
+        1511,
+        1587
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/vault/rules.rs",
+          "text": "Vault release-rule mechanics are present on main; #356 records why the normative projection is not complete."
+        },
+        {
+          "rung": "merged",
+          "path": "core/src/vault/entry.rs",
+          "text": "Credential state and policy fields are inspectable at the baseline, not evidence of transport-authenticated release."
+        }
+      ]
+    },
+    {
+      "id": "5.6",
+      "title": "Governance / the conscience",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "security/governance correctness",
+        "deployment truth",
+        "evidence-only"
+      ],
+      "unknown": "Every consequential surface is not yet proven preflight, atomic, and self-witnessing on the installed authority path.",
+      "issues": [
+        940,
+        956,
+        696,
+        1278,
+        716
+      ],
+      "pull_requests": [
+        1628,
+        1614
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "plugins/_shared/hestia_governance_closure_test.py",
+          "url": "https://github.com/dp-web4/hestia/actions/runs/44873991884/job/136754524363",
+          "text": "The baseline closure suite and common classifier are exercised in CI; this sweep also reproduced all 39 closure tests locally."
+        },
+        {
+          "rung": "merged",
+          "path": "plugins/_shared/seat_gate_boundary_test.py",
+          "text": "The thin-shim/common-authority boundary has a merged contract, while deployment and witness gaps remain explicit blockers."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1629",
+          "text": "The operator-signed ratify CLI (#1378) merged 2026-11-23; #716's installed-authority ratification and #940/#956's floor and TTL defects remain open."
+        }
+      ]
+    },
+    {
+      "id": "5.7",
+      "title": "Session coordination",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "UX"
+      ],
+      "unknown": "No current mixed-vendor concurrent work-claim and disposition-delivery run demonstrates collision-free coordination.",
+      "issues": [
+        361,
+        1251,
+        1389,
+        320
+      ],
+      "pull_requests": [
+        1506
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/server/handler.rs",
+          "text": "Session own/siblings and coordination handlers are present on the baseline."
+        },
+        {
+          "rung": "merged",
+          "path": "core/src/server/state.rs",
+          "text": "Session state is inspectable in current source; collision and retention issues remain open rather than being inferred away."
+        }
+      ]
+    },
+    {
+      "id": "5.8",
+      "title": "Trust & identity",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "UX",
+        "evidence-only"
+      ],
+      "unknown": "Human-facing verified-device identity and independently observed revision/self-correction behavior are not demonstrated end to end.",
+      "issues": [
+        689,
+        1202,
+        578
+      ],
+      "pull_requests": [
+        1630,
+        1631,
+        1632,
+        1533
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/derivation.rs",
+          "text": "Trust derivation is merged at the baseline; active revision, lineage, and self-correction PRs are not counted as merged."
+        },
+        {
+          "rung": "merged",
+          "path": "core/src/reputation.rs",
+          "text": "Witness-derived reputation machinery is present, while per-member indexing and canonical outward identity remain open."
+        }
+      ]
+    },
+    {
+      "id": "5.9",
+      "title": "Channels",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "UX"
+      ],
+      "unknown": "The complete tiered disclosure contract, witnessed deep inquiry, refusal record, and external served plane are not demonstrated together.",
+      "issues": [
+        563,
+        1493
+      ],
+      "pull_requests": [
+        1531
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/profile.rs",
+          "text": "Profile links, visibility, and verification substrate are merged; the full channels requirement remains broader than that substrate."
+        },
+        {
+          "rung": "merged",
+          "path": "docs/PRD_ROLE_SCOPE_BRIDGE.md",
+          "text": "Role-mediated disclosure is specified in a merged companion PRD, not treated as proof of an enforcing external plane."
+        }
+      ]
+    },
+    {
+      "id": "6.seamless",
+      "title": "NFR \u2014 seamless",
+      "rung": "source",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "UX",
+        "evidence-only"
+      ],
+      "unknown": "No genuinely non-technical user completes install \u2192 hub \u2192 device \u2192 agent in one sitting with zero builder-answered questions.",
+      "issues": [
+        1568,
+        1495
+      ],
+      "pull_requests": [
+        1567
+      ],
+      "evidence": [
+        {
+          "rung": "source",
+          "path": "app/src/App.tsx",
+          "text": "The interactive app surface exists, but source presence is not a usability observation."
+        },
+        {
+          "rung": "source",
+          "path": "docs/PRD_FIRST_USER_APP_2026-11-11.md",
+          "text": "The first-user flow and its acceptance bar are current source artifacts; the clean-machine run remains owed."
+        }
+      ]
+    },
+    {
+      "id": "6.robust",
+      "title": "NFR \u2014 robust",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "deployment truth",
+        "evidence-only"
+      ],
+      "unknown": "Combined restart, network loss, device loss, and bit-identical denied-act behavior are not observed on the shipping pair.",
+      "issues": [
+        1479,
+        1480,
+        1233
+      ],
+      "pull_requests": [
+        1487
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/tests/persistence.rs",
+          "text": "Persistence behavior has a merged regression artifact."
+        },
+        {
+          "rung": "merged",
+          "path": "tools/upgrade_path_test.py",
+          "text": "Upgrade behavior is mechanically covered, while rejected-save, verifier, and restart-lifetime defects remain linked."
+        }
+      ]
+    },
+    {
+      "id": "6.secure",
+      "title": "NFR \u2014 secure / fail secure, never fragile",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "security/governance correctness",
+        "evidence-only"
+      ],
+      "unknown": "The complete legitimate-credential-read corpus and transport-authenticated adversarial acceptance are not demonstrated.",
+      "issues": [
+        832,
+        1278,
+        581
+      ],
+      "pull_requests": [
+        1587
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "plugins/_shared/hestia_governance_closure_test.py",
+          "text": "Two-directional read/write controls are merged; known identity and fallback defects prevent a whole-requirement pass claim."
+        },
+        {
+          "rung": "merged",
+          "path": "core/src/vault/gate_integrity.rs",
+          "text": "Gate-integrity state is represented in the vault, not proof of authenticated connect or a correctly deployed engine."
+        }
+      ]
+    },
+    {
+      "id": "6.small-fast",
+      "title": "NFR \u2014 small & fast",
+      "rung": "UNKNOWN",
+      "coverage": "unknown",
+      "gaps": [
+        "product functionality",
+        "evidence-only"
+      ],
+      "unknown": "No current v0.3.0 daemon size, sub-second operation matrix, phone run, or Jetson run was measured in this sweep.",
+      "issues": [
+        716
+      ],
+      "pull_requests": [],
+      "evidence": []
+    },
+    {
+      "id": "6.cross-platform",
+      "title": "NFR \u2014 cross-platform, one codebase",
+      "rung": "public",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "deployment truth",
+        "evidence-only"
+      ],
+      "unknown": "No current public desktop/iOS artifact or same-commit laptop, phone, and Jetson run demonstrates the full matrix.",
+      "issues": [
+        342,
+        1495
+      ],
+      "pull_requests": [
+        1508
+      ],
+      "evidence": [
+        {
+          "rung": "public",
+          "url": "https://github.com/dp-web4/hestia/releases/tag/app-v0.1.2",
+          "text": "An Android app artifact is publicly released; it does not establish desktop, iOS, or version-matched multi-device coverage."
+        },
+        {
+          "rung": "source",
+          "path": "app/src-tauri/tests/operator_live.rs",
+          "text": "The shipping client has live contract tests in source, separate from the public-artifact evidence above."
+        }
+      ]
+    },
+    {
+      "id": "6.offline",
+      "title": "NFR \u2014 offline-capable",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "deployment truth",
+        "evidence-only"
+      ],
+      "unknown": "No current no-hub cold run covers the complete local workflow, including restart and credential custody.",
+      "issues": [
+        1480,
+        1233
+      ],
+      "pull_requests": [],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/vault/storage.rs",
+          "text": "Local vault persistence is merged at the baseline."
+        },
+        {
+          "rung": "merged",
+          "path": "core/tests/persistence.rs",
+          "text": "Local persistence has regression evidence, but durable-verifier and restart-lifetime issues remain open."
+        }
+      ]
+    },
+    {
+      "id": "6.app-contract",
+      "title": "NFR \u2014 app is a first-class client with a pinned contract",
+      "rung": "live",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "deployment truth",
+        "evidence-only"
+      ],
+      "unknown": "The isolated CI contract does not demonstrate a public desktop/mobile release pair or a clean-device user run.",
+      "issues": [
+        1568
+      ],
+      "pull_requests": [
+        1567
+      ],
+      "evidence": [
+        {
+          "rung": "live",
+          "path": "app/src-tauri/tests/operator_live.rs",
+          "url": "https://github.com/dp-web4/hestia/actions/runs/44873991884/job/136754524354",
+          "text": "The baseline app-daemon contract job completed successfully against a running isolated daemon, including authentication, bad-key refusal, and handshake checks."
+        },
+        {
+          "rung": "merged",
+          "path": ".github/workflows/ci.yml",
+          "text": "The live contract is wired into CI rather than existing only as an ignored test; this supersedes the August snapshot's no-workflow statement."
+        }
+      ]
+    },
+    {
+      "id": "7.1",
+      "title": "Security law \u2014 issuance-bound release and presentation",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "evidence-only"
+      ],
+      "unknown": "Both axes, audience narrowing, single-use nullification, and legacy backfill are not demonstrated under transport-authenticated identities.",
+      "issues": [
+        356,
+        832,
+        824
+      ],
+      "pull_requests": [
+        1511
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/src/vault/rules.rs",
+          "text": "Release-rule mechanics are merged; the open projection issue prevents treating the abstraction as the complete normative rule."
+        },
+        {
+          "rung": "merged",
+          "path": "core/src/delegation.rs",
+          "text": "Delegation state exists at the baseline, not evidence of authenticated presentation or single-use enforcement."
+        }
+      ]
+    },
+    {
+      "id": "7.2",
+      "title": "Security law \u2014 custody is not release",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "security/governance correctness",
+        "evidence-only"
+      ],
+      "unknown": "No second-device co-signed custody transfer, concurrent offline presentation, and revocation observation satisfies the full requirement.",
+      "issues": [
+        1485,
+        832
+      ],
+      "pull_requests": [
+        1487
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/tests/router_forwarding_custody.rs",
+          "text": "Routing custody has a merged regression artifact."
+        },
+        {
+          "rung": "merged",
+          "path": "core/tests/fleet_receiver_custody.rs",
+          "text": "Receiver custody is covered in source tests; cross-device revocation and co-sign observation remain unmeasured."
+        }
+      ]
+    },
+    {
+      "id": "7.3",
+      "title": "Security law \u2014 attribution, composition, and audited surfaces",
+      "rung": "merged",
+      "coverage": "partial",
+      "gaps": [
+        "security/governance correctness",
+        "deployment truth",
+        "evidence-only"
+      ],
+      "unknown": "No exhaustive current cross-surface invariant run proves non-forgeable attribution and a passing audit for every consequential surface.",
+      "issues": [
+        824,
+        823,
+        1278
+      ],
+      "pull_requests": [
+        1589,
+        1614
+      ],
+      "evidence": [
+        {
+          "rung": "merged",
+          "path": "core/tests/gate_category_coverage.rs",
+          "text": "Consequential-category coverage has a merged mechanical artifact."
+        },
+        {
+          "rung": "merged",
+          "path": "plugins/_shared/registered_surface_test.py",
+          "text": "Registered surfaces have a common contract, while authenticated connect, factor atomicity, and fallback authority remain open."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1650",
+          "text": "Corroboration evidence is now written atomically (#1650, merged 2026-11-23); #823 stays open until the post-era factor backlog is reconciled."
+        }
+      ]
+    },
+    {
+      "id": "9.public-release",
+      "title": "Public-release evidence",
+      "rung": "public",
+      "coverage": "partial",
+      "gaps": [
+        "product functionality",
+        "deployment truth",
+        "UX",
+        "evidence-only"
+      ],
+      "unknown": "No current same-tag daemon + desktop/mobile bundle has a clean-machine, version-matched acceptance transcript across the target platforms.",
+      "issues": [
+        716,
+        494,
+        342,
+        1568
+      ],
+      "pull_requests": [
+        1508,
+        1567
+      ],
+      "evidence": [
+        {
+          "rung": "public",
+          "url": "https://github.com/dp-web4/hestia/releases/tag/v0.3.0",
+          "text": "The v0.3.0 daemon was publicly released on 2026-11-02; public availability is not conflated with full PRD readiness."
+        },
+        {
+          "rung": "public",
+          "url": "https://github.com/dp-web4/hestia/releases/tag/app-v0.1.2",
+          "text": "The latest listed app release remains app-v0.1.2 from 2026-06-13, so a same-tag current app/daemon pair is not evidenced."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1629",
+          "text": "The ratify CLI that release discipline (#716) depends on is merged; no release has been cut with it, so it does not raise this row."
+        }
+      ]
+    }
+  ],
+  "remote_verified_at": "2026-11-24T00:51:41Z",
+  "remote_draft_pull_requests": [
+    1487,
+    1506,
+    1508,
+    1511,
+    1533,
+    1567,
+    1587,
+    1589,
+    1614,
+    1630,
+    1631,
+    1632
+  ]
+}
