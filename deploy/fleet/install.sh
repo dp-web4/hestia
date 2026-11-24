@@ -219,7 +219,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat ${HESTIA_HOME}/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
+ExecStart=%h/.local/bin/hestia serve --bind ${HESTIA_BIND}
 Environment=HESTIA_HOME=${HESTIA_HOME}
 Environment=RUST_LOG=warn
 # THE GAUGE'S ONLY INPUT. \`deployment_health\` reads this env var and has NO fallback:
@@ -532,9 +532,10 @@ step_service_macos() {
   <key>Label</key><string>${label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>HESTIA_PASSPHRASE="\$(cat ${HESTIA_HOME}/.passphrase)" exec \$HOME/.local/bin/hestia serve --bind ${HESTIA_BIND}</string>
+    <string>\$HOME/.local/bin/hestia</string>
+    <string>serve</string>
+    <string>--bind</string>
+    <string>${HESTIA_BIND}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

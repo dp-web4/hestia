@@ -82,16 +82,16 @@ fi
 if [ -f "$PP" ] && [ "$(stat -f %Lp "$PP")" != 600 ]; then plan "chmod 600 $PP"; [ $APPLY = 1 ] && chmod 600 "$PP"; fi
 
 # ---- 3-5. the agent -----------------------------------------------------------------------
-# The daemon's ARGV IS PRESERVED EXACTLY and every word is shell-quoted (GPT, review of #1154: the
-# first cut rebuilt it as `serve --bind <default>` -- dropping a seat's own bind or options -- and
-# interpolated paths unquoted into shell source, so a space broke it). Two shapes are understood:
+# The daemon's ARGV IS PRESERVED EXACTLY as a direct array (GPT, review of #1154: the first cut
+# rebuilt it as `serve --bind <default>` -- dropping a seat's own bind or options). The daemon
+# reads the passphrase itself, so no shell wrapper or environment export is recreated. Two shapes are understood:
 #   [<bin>, serve, <opts…>]                                   a direct exec (McNugget's)
 #   [/bin/sh, -c, 'HESTIA_PASSPHRASE="$(cat …)" exec <bin> <opts…>']   the installer's form
 # Anything else is REFUSED rather than guessed at.
 argv_json=$(plutil -extract ProgramArguments json -o - "$PLIST" 2>/dev/null) || die "no ProgramArguments in $PLIST"
-parsed=$(python3 - "$argv_json" "$PP" <<'PY'
+parsed=$(python3 - "$argv_json" <<'PY'
 import json, shlex, sys
-argv, pp = json.loads(sys.argv[1]), sys.argv[2]
+argv = json.loads(sys.argv[1])
 if argv[:2] == ["/bin/sh", "-c"] and len(argv) == 3:
     toks = shlex.split(argv[2])
     if len(toks) < 3 or not toks[0].startswith("HESTIA_PASSPHRASE=$(cat ") or toks[1] != "exec":
@@ -109,20 +109,19 @@ for i, w in enumerate(words):
         bind = words[i + 1]
     elif w.startswith("--bind="):
         bind = w.split("=", 1)[1]
-line = f'HESTIA_PASSPHRASE="$(cat {shlex.quote(pp)})" exec ' + " ".join(shlex.quote(w) for w in words)
-print(words[0]); print(bind); print(line)
+print(words[0]); print(bind); print(json.dumps(words))
 PY
 ) || die "cannot represent this agent's command line exactly; migrate it by hand"
 bin=$(printf '%s\n' "$parsed" | sed -n 1p)
 BIND=$(printf '%s\n' "$parsed" | sed -n 2p)
 want_args=$(printf '%s\n' "$parsed" | sed -n 3p)
 [ -x "$bin" ] || die "the agent's binary '$bin' is not executable"
-cur_args=$(plutil -extract ProgramArguments.2 raw "$PLIST" 2>/dev/null || true)
+cur_args=$(plutil -extract ProgramArguments json -o - "$PLIST" 2>/dev/null | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))' || true)
 ka_type=$(plutil -type KeepAlive "$PLIST" 2>/dev/null || echo absent)
 ka_ok=0; [ "$ka_type" = dictionary ] && [ "$(plutil -extract KeepAlive.SuccessfulExit raw "$PLIST" 2>/dev/null)" = false ] && ka_ok=1
 
 changes=0
-[ "$cur_args" = "$want_args" ] || { plan "ProgramArguments -> /bin/sh -c '$want_args'"; changes=1; }
+[ "$cur_args" = "$want_args" ] || { plan "ProgramArguments -> direct argv $want_args"; changes=1; }
 [ $inline = 1 ] && { plan "remove EnvironmentVariables.HESTIA_PASSPHRASE"; changes=1; }
 [ $ka_ok = 1 ] || { plan "KeepAlive ($ka_type) -> {SuccessfulExit: false}"; changes=1; }
 [ "$bin" = "$HOME/.local/bin/hestia" ] || say "  note  binary stays at $bin (canonical is ~/.local/bin/hestia; hestia-deploy's HESTIA_BIN governs where it installs)"
@@ -135,7 +134,7 @@ backup="$HESTIA_HOME/launchd-before-canonical-$(date +%Y%m%d-%H%M%S).plist"
 ( umask 077; cp "$PLIST" "$backup" )
 new="$HESTIA_HOME/.canonical-$$.plist"
 ( umask 077; cp "$PLIST" "$new" )
-plutil -replace ProgramArguments -json "$(python3 -c 'import json,sys;print(json.dumps(["/bin/sh","-c",sys.argv[1]]))' "$want_args")" "$new"
+plutil -replace ProgramArguments -json "$want_args" "$new"
 plutil -remove EnvironmentVariables.HESTIA_PASSPHRASE "$new" 2>/dev/null || true
 plutil -replace KeepAlive -json '{"SuccessfulExit":false}' "$new"
 plutil -lint "$new" >/dev/null || { rm -f "$new"; die "the rewritten agent does not lint; nothing installed"; }
