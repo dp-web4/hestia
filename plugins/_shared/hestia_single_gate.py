@@ -1136,10 +1136,21 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         pass
     esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); re-issue the "
            f"write afterwards to claim the approval." if esc_id else "")
-    v = core._deny("gate.self_access",
-                   f"'{ev.tool}' would WRITE the governance surface: {cv.resource or marker} "
-                   f"(matched marker {marker!r}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
-                   innate=True)
+    if cv.rule == closure.RULE_OPAQUE_WRITER:
+        v = core.Verdict(
+            "deny",
+            "gate.self_access",
+            f"'{ev.tool}' writes a patch the gate cannot read yet: {cv.resource or 'stdin'}. {detail}.{esc}",
+            "Create or expose the patch in its own call first, then run the write separately "
+            "so its targets can be reviewed.",
+            True,
+            cv.resource or marker,
+        )
+    else:
+        v = core._deny("gate.self_access",
+                       f"'{ev.tool}' would WRITE the governance surface: {cv.resource or marker} "
+                       f"(matched marker {marker!r}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
+                       innate=True)
     return _verdict_deny(v, escalation_id=esc_id)
 
 
