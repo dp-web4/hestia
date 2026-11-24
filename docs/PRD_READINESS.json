@@ -2,10 +2,9 @@
   "schema_version": 1,
   "baseline": {
     "ref": "origin/main",
-    "commit": "93b8dd458789ec0839dea1bc700ddb3cd1656744",
-    "measured_at": "2026-11-23T08:41:52Z"
+    "commit": "185dc82fbc37c6e4d6916f44b12cda3fa8b59e59",
+    "measured_at": "2026-11-24T00:51:24Z"
   },
-  "remote_verified_at": "2026-11-23T08:45:31Z",
   "rows": [
     {
       "id": "5.1",
@@ -24,8 +23,7 @@
         716
       ],
       "pull_requests": [
-        1567,
-        1629
+        1567
       ],
       "evidence": [
         {
@@ -57,9 +55,7 @@
         1269,
         1210
       ],
-      "pull_requests": [
-        1613
-      ],
+      "pull_requests": [],
       "evidence": [
         {
           "rung": "merged",
@@ -70,6 +66,11 @@
           "rung": "merged",
           "path": "plugins/member-mesh/hestia-mesh.py",
           "text": "Member messaging and its regression suite are merged, while routing and receiving follow-ups remain open."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1613",
+          "text": "Hub CLI and router REST endpoints are confined (#351), merged 2026-11-23; this hardens the hub surface and does not establish the guided join."
         }
       ]
     },
@@ -190,7 +191,6 @@
       ],
       "pull_requests": [
         1628,
-        1629,
         1614
       ],
       "evidence": [
@@ -204,6 +204,11 @@
           "rung": "merged",
           "path": "plugins/_shared/seat_gate_boundary_test.py",
           "text": "The thin-shim/common-authority boundary has a merged contract, while deployment and witness gaps remain explicit blockers."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1629",
+          "text": "The operator-signed ratify CLI (#1378) merged 2026-11-23; #716's installed-authority ratification and #940/#956's floor and TTL defects remain open."
         }
       ]
     },
@@ -602,6 +607,11 @@
           "rung": "merged",
           "path": "plugins/_shared/registered_surface_test.py",
           "text": "Registered surfaces have a common contract, while authenticated connect, factor atomicity, and fallback authority remain open."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1650",
+          "text": "Corroboration evidence is now written atomically (#1650, merged 2026-11-23); #823 stays open until the post-era factor backlog is reconciled."
         }
       ]
     },
@@ -624,7 +634,6 @@
         1568
       ],
       "pull_requests": [
-        1629,
         1508,
         1567
       ],
@@ -638,8 +647,28 @@
           "rung": "public",
           "url": "https://github.com/dp-web4/hestia/releases/tag/app-v0.1.2",
           "text": "The latest listed app release remains app-v0.1.2 from 2026-06-13, so a same-tag current app/daemon pair is not evidenced."
+        },
+        {
+          "rung": "merged",
+          "url": "https://github.com/dp-web4/hestia/pull/1629",
+          "text": "The ratify CLI that release discipline (#716) depends on is merged; no release has been cut with it, so it does not raise this row."
         }
       ]
     }
+  ],
+  "remote_verified_at": "2026-11-24T00:51:41Z",
+  "remote_draft_pull_requests": [
+    1487,
+    1506,
+    1508,
+    1511,
+    1533,
+    1567,
+    1587,
+    1589,
+    1614,
+    1630,
+    1631,
+    1632
   ]
 }
