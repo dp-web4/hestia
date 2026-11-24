@@ -373,6 +373,9 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     real_root = "path:" + os.path.realpath(ws)
     check("exact_root_deny_names_the_exact_grant_and_the_recursive_spelling",
           real_root + " is EXACT" in v.reason and real_root + "/**" in v.reason, v.reason)
+    check("exact_root_deny_names_the_members_recursive_request",
+          f"hestia_request_scope(path={os.path.realpath(ws)}, recursive=true, reason=...)" in v.reason
+          and "operator or delegate" in v.reason and "only an operator" not in v.reason, v.reason)
     v = G.evaluate(G.NormalizedEvent(tool="Bash", command=f"cat {deep}/note.md", cwd=ws),
                    root_exact, ws)
     check("exact_root_shell_deny_names_the_exact_grant",
