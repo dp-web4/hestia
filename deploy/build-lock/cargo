@@ -19,7 +19,9 @@
 #      concurrent cold builds — `nice` alone protects the daemon's share of a saturated CPU, which
 #      is not enough when N builds saturate all of it). FAIL-OPEN on a stuck lock: if the lock is
 #      held past the wait budget (a hung build), run un-serialized rather than block the fleet's
-#      builds forever — an un-serialized build beats no build.
+#      builds forever — an un-serialized build beats no build. The lock is ONE file for all targets
+#      on purpose (#828): independent graphs wait on each other, and that throughput cost is the
+#      CPU cap #387 measured as necessary — keying it per target would restore N cold builds.
 # Every other cargo invocation passes straight through, untouched.
 #
 # INSTALL: place this as `cargo` in a PATH directory that PRECEDES the real cargo (e.g.
@@ -50,28 +52,109 @@ done < <(type -ap cargo 2>/dev/null || true)
 
 case "${1:-}" in
   build|b|test|t|check|c|clippy|bench|doc|d|install)
-    # Shared WARM target on ext4 (#387; kimi's IO channel). The dominant cost of a PR sweep is a
-    # COLD build reading thousands of source files off the /mnt/c 9p mount, saturating the drvfs
-    # read queue that every gate call also traverses — which is why timeouts appear at low CPU%.
-    # A target shared across a repo's worktrees makes each build INCREMENTAL (seconds, not a cold
-    # 8 minutes → far fewer source reads) and puts the target IO on ext4. Keyed on the git
-    # COMMON dir so all worktrees of ONE repo share a target while OTHER projects are untouched;
-    # skipped outside a git tree; a caller's own CARGO_TARGET_DIR always wins. flock (below)
+    # Shared WARM target on ext4 (#387; kimi's IO channel). The manifest, not the caller's
+    # cwd, selects it (#828). Cargo metadata names the actual path dependencies; canonicalizing
+    # those manifest paths collapses a worktree symlink to the same identity while keeping a
+    # genuinely different dependency population in a different target. Inside a git tree,
+    # metadata failure is loud: silently falling back to a local target would hide the split.
+    # A caller's explicit CARGO_TARGET_DIR always wins and skips discovery. flock (below)
     # serializes, so the shared target is never written by two builds at once.
     if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-      _gcd="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-      if [ -n "$_gcd" ]; then
-        _gcd="$(cd "$_gcd" 2>/dev/null && pwd || echo "$_gcd")"
-        _key="$(printf '%s' "$_gcd" | cksum | cut -d' ' -f1)"
-        export CARGO_TARGET_DIR="${HESTIA_BUILD_TARGET:-$HOME/.cache/hestia-cargo-target}/$_key"
+      _manifest_args=()
+      _manifest_dir=.
+      _expect_manifest=0
+      _expect_path=0
+      # `install` builds from the registry unless --path names a local crate; only that local
+      # crate has a manifest (and a shared target) to identify, so forward --path as its manifest.
+      _discover=1
+      [ "$1" = install ] && _discover=0
+      for _arg in "$@"; do
+        if [ "$_expect_manifest" = 1 ]; then
+          _manifest_args+=("$_arg")
+          _manifest_dir="$(dirname "$_arg")"
+          _expect_manifest=0
+          continue
+        fi
+        if [ "$_expect_path" = 1 ]; then
+          _manifest_args+=(--manifest-path "$_arg/Cargo.toml")
+          _manifest_dir="$_arg"
+          _discover=1
+          _expect_path=0
+          continue
+        fi
+        case "$1:$_arg" in
+          install:--path)
+            _expect_path=1 ;;
+          install:--path=*)
+            _manifest_args+=(--manifest-path "${_arg#--path=}/Cargo.toml")
+            _manifest_dir="${_arg#--path=}"
+            _discover=1 ;;
+          *:--manifest-path)
+            _manifest_args+=("$_arg")
+            _expect_manifest=1 ;;
+          *:--manifest-path=*)
+            _manifest_args+=("$_arg")
+            _manifest_dir="$(dirname "${_arg#--manifest-path=}")" ;;
+        esac
+      done
+      if [ "$_expect_manifest" = 1 ] || [ "$_expect_path" = 1 ]; then
+        echo "cargo build-lock: --manifest-path/--path needs a value" >&2
+        exit 2
       fi
+      # Outside a git tree there is no repo-wide shared target to split, so the shim leaves the
+      # build alone exactly as before #828; only a failure INSIDE a git tree is refused below.
+      if [ "$_discover" = 1 ] && ! git -C "$_manifest_dir" rev-parse --git-common-dir >/dev/null 2>&1; then
+        echo "cargo build-lock: $_manifest_dir is not in a git worktree; no shared target" >&2
+        _discover=0
+      fi
+    fi
+    if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "$_discover" = 1 ]; then
+      # Resolve the graph for the HOST platform only: unfiltered `--offline` metadata wants every
+      # platform's deps (e.g. android_system_properties) cached and refuses a fully-cached host build.
+      _filter=()
+      _host="$("${RUSTC:-rustc}" -vV 2>/dev/null | sed -n 's/^host: //p')"
+      [ -n "$_host" ] && _filter=(--filter-platform "$_host")
+      if ! _identity="$("$real" metadata --format-version 1 --offline "${_filter[@]}" "${_manifest_args[@]}" | python3 -c '
+import hashlib, json, os, sys
+m = json.load(sys.stdin)
+paths = sorted(os.path.realpath(p["manifest_path"]) for p in m["packages"]
+               if p.get("source") is None)
+identity = hashlib.sha256(chr(10).join(paths).encode()).hexdigest()[:16]
+print(os.path.realpath(m["workspace_root"]) + chr(9) + identity)
+')"; then
+        echo "cargo build-lock: cargo metadata failed; refusing to guess the dependency/target identity" >&2
+        echo "cargo build-lock: prime the graph with \`cargo fetch\`, or set CARGO_TARGET_DIR to choose a target yourself" >&2
+        exit 2
+      fi
+      IFS=$'\t' read -r _root _dep_id <<< "$_identity"
+      if [ -z "$_root" ] || [ -z "$_dep_id" ]; then
+        echo "cargo build-lock: metadata returned no usable dependency identity" >&2
+        exit 2
+      fi
+      if ! _gcd="$(git -C "$_root" rev-parse --git-common-dir 2>/dev/null)"; then
+        echo "cargo build-lock: $_root is not in a git worktree; refusing a local-target fallback" >&2
+        exit 2
+      fi
+      case "$_gcd" in
+        /*) ;;
+        *) _gcd="$_root/$_gcd" ;;
+      esac
+      if ! _gcd="$(cd "$_gcd" 2>/dev/null && pwd -P)"; then
+        echo "cargo build-lock: cannot resolve the git common directory" >&2
+        exit 2
+      fi
+      _key="$(printf '%s\n' "$_gcd" "$_dep_id" | cksum | cut -d' ' -f1)"
+      export CARGO_TARGET_DIR="${HESTIA_BUILD_TARGET:-$HOME/.cache/hestia-cargo-target}/$_key"
+      echo "cargo build-lock: manifest_root=$_root dependency_identity=$_dep_id target_dir=$CARGO_TARGET_DIR" >&2
     fi
     wait="${HESTIA_BUILD_LOCK_WAIT:-900}"
     if [ "$wait" = "0" ] || ! command -v flock >/dev/null 2>&1; then
       # Serialization disabled, or flock unavailable: fall back to nice-only (increment 1).
+      echo "cargo build-lock: lock=disabled" >&2
       exec nice -n 15 "$real" "$@"
     fi
     lock="${HESTIA_BUILD_LOCK:-${TMPDIR:-/tmp}/hestia-cargo-build.lock}"
+    echo "cargo build-lock: lock=$lock" >&2
     # Hold the lock via a dedicated FD, NOT `flock -E N cmd`. The -E form returns N when it cannot
     # acquire AND propagates the child's exit — so a legitimate `cargo` exit N (e.g. 99) reads as a
     # lock timeout and the build re-runs unsynchronized (GPT #392 review). With `flock -w <fd>`, the

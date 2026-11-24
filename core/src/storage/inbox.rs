@@ -364,6 +364,13 @@ impl SqliteInboxStore {
             // under the contract the act was made under, and so a binding that changes while
             // the row waits is detected rather than silently applied.
             ("transport_stamp", "TEXT"),
+            ("claimed_by_session", "TEXT"),
+            ("claim_expires_at", "TEXT"),
+            // Terminal scope/escalation dispositions mark transient asks as moot (#1354).
+            // The ruling hash in the reason binds this projection to its durable evidence;
+            // both fields survive request-map eviction, escalation reaping, and restart.
+            ("mooted_at", "TEXT"),
+            ("moot_reason", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -463,6 +470,12 @@ impl SqliteInboxStore {
     /// durable — the caller warns and lets the cursor projector retry; it never
     /// reports the failure as a ruling failure, because the ruling succeeded.
     ///
+    /// For scope/escalation pointers the same transaction also marks matching local
+    /// `review_request` rows moot (#1354), preserving the ruling hash as evidence. Late matching
+    /// asks inherit the earliest stored disposition when `enqueue_member_on` inserts them, so
+    /// post-ruling follow-ups keep that evidence after the live target is reaped. Other pointer
+    /// kinds and durable replies are not transient target asks and are untouched.
+    ///
     /// No cap eviction here, on purpose: `enqueue_member`'s cap makes room by
     /// DELETING the recipient's oldest undrained notice, and for a disposition
     /// that would drop "your petition was ruled" to admit "your petition was
@@ -479,7 +492,7 @@ impl SqliteInboxStore {
     ) -> Result<Option<u64>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let conn = self.write_conn()?;
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         // Same retention discipline as every other writer on this plane.
         conn.execute(
@@ -495,7 +508,8 @@ impl SqliteInboxStore {
             params![cutoff],
         )
         .context("pruning expired member notices")?;
-        conn.execute(
+        let tx = conn.transaction().context("starting terminal-disposition projection")?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO member_notices
                  (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash,
                   queued_at, disposition_key)
@@ -509,8 +523,26 @@ impl SqliteInboxStore {
                 now.to_rfc3339(),
             ],
         )
-        .context("ensuring disposition obligation")?;
-        Ok((conn.changes() > 0).then(|| conn.last_insert_rowid() as u64))
+        .context("ensuring disposition obligation")? > 0;
+        let inserted_id = tx.last_insert_rowid() as u64;
+        let target = pointer_uri.split('#').next().unwrap_or(pointer_uri);
+        if target.starts_with("hestia://scope/") || target.starts_with("hestia://escalation/") {
+            // The disposition row and this projection of its mootness commit together. Match
+            // the complete id segment, never a string prefix; durable replies and forwarded
+            // rows are deliberately untouched. A projection retry preserves first evidence.
+            tx.execute(
+                "UPDATE member_notices
+                    SET mooted_at = ?2, moot_reason = ?3
+                  WHERE dest_peer IS NULL AND mooted_at IS NULL
+                    AND (pointer_uri = ?1 OR substr(pointer_uri, 1, length(?1) + 1) = ?1 || '#')
+                    AND (kind = 'review_request'
+                         OR substr(kind, 1, length('review_request') + 1) = 'review_request.')",
+                params![target, now.to_rfc3339(), format!("terminal ruling {ruling_hash}")],
+            )
+            .context("marking transient asks moot at their terminal ruling")?;
+        }
+        tx.commit().context("committing terminal-disposition projection")?;
+        Ok(inserted.then_some(inserted_id))
     }
 
     /// The recipient-liveness record (Kimi ↔ CBP, 2026-07-25).
@@ -1357,11 +1389,31 @@ impl SqliteInboxStore {
             .context("recording member queue eviction")?;
             }
         }
+        let moot_target = pointer_uri
+            .filter(|_| kind.split('.').next() == Some("review_request"))
+            .map(|p| p.split('#').next().unwrap_or(p))
+            .filter(|p| p.starts_with("hestia://scope/") || p.starts_with("hestia://escalation/"));
+        // A post-ruling corroboration ask still has review value, but it is not
+        // responsiveness debt. Inherit the earliest terminal disposition in the same INSERT
+        // so live-map reaping cannot make the late row owed again. The dummy input row keeps
+        // ordinary inserts working when no disposition matches.
         conn.execute(
             "INSERT INTO member_notices
                  (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
-                  in_reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  in_reply_to, mooted_at, moot_reason)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                    CASE WHEN d.chain_hash IS NULL THEN NULL ELSE ?9 END,
+                    'terminal ruling ' || d.chain_hash
+               FROM (SELECT 1) AS insert_once
+               LEFT JOIN member_notices AS d ON d.id = (
+                   SELECT d2.id FROM member_notices AS d2
+                    WHERE ?10 IS NOT NULL
+                      AND d2.disposition_key IS NOT NULL
+                      AND d2.dest_peer IS NULL
+                      AND (d2.pointer_uri = ?10
+                           OR substr(d2.pointer_uri, 1, length(?10) + 1) = ?10 || '#')
+                    ORDER BY d2.id ASC LIMIT 1
+               )",
             params![
                 to_plugin,
                 from_plugin,
@@ -1371,6 +1423,8 @@ impl SqliteInboxStore {
                 chain_hash,
                 now.to_rfc3339(),
                 in_reply_to.map(|v| v as i64),
+                now.to_rfc3339(),
+                moot_target,
             ],
         )
         .context("enqueuing member notice")?;
@@ -1424,6 +1478,199 @@ impl SqliteInboxStore {
         })
     }
 
+    /// Claim one queued notice for a proven daemon session. Only the recipient may claim it;
+    /// a different session's unexpired lease is a conflict, not an overwrite. The lease coordinates
+    /// consumption; it does not authenticate the member beyond the existing session resolution.
+    pub fn claim_member_notice(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        session: Uuid,
+        lease_secs: i64,
+    ) -> Result<MemberNoticeClaimOutcome> {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(lease_secs);
+        let session = session.to_string();
+        let mut conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member notice claim")?;
+        let prior = tx
+            .query_row(
+                "SELECT drained_at, claimed_by_session, claim_expires_at
+                 FROM member_notices
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL",
+                params![id as i64, to_plugin],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("reading member notice claim")?;
+        let outcome = match prior {
+            None => MemberNoticeClaimOutcome::NotFound,
+            Some((Some(_), _, _)) => MemberNoticeClaimOutcome::AlreadyDrained,
+            Some((_, claimed_by, raw_expiry)) => {
+                let prior_expiry = raw_expiry
+                    .as_deref()
+                    .map(DateTime::parse_from_rfc3339)
+                    .transpose()
+                    .context("parsing member notice claim expiry")?
+                    .map(|t| t.with_timezone(&Utc));
+                let other_live_claim = claimed_by.as_deref().is_some_and(|owner| {
+                    owner != session && prior_expiry.map_or(true, |expiry| expiry > now)
+                });
+                if other_live_claim {
+                    MemberNoticeClaimOutcome::Conflict {
+                        claimed_by_session: claimed_by.expect("checked above"),
+                        claim_expires_at: prior_expiry,
+                    }
+                } else {
+                    let renewed = claimed_by.as_deref() == Some(session.as_str())
+                        && prior_expiry.is_some_and(|expiry| expiry > now);
+                    let superseded_expired_claim = claimed_by
+                        .as_deref()
+                        .is_some_and(|owner| owner != session && !other_live_claim);
+                    tx.execute(
+                        "UPDATE member_notices
+                         SET claimed_by_session = ?2, claim_expires_at = ?3
+                         WHERE id = ?1 AND to_plugin = ?4 AND drained_at IS NULL
+                           AND dest_peer IS NULL",
+                        params![id as i64, session, expires_at.to_rfc3339(), to_plugin],
+                    )
+                    .context("claiming member notice")?;
+                    MemberNoticeClaimOutcome::Claimed {
+                        claim_expires_at: expires_at,
+                        renewed,
+                        superseded_expired_claim,
+                    }
+                }
+            }
+        };
+        tx.commit().context("committing member notice claim")?;
+        Ok(outcome)
+    }
+
+    /// Release the caller's own claim. Releasing an unclaimed row is an idempotent no-op;
+    /// another session's claim, even an expired one, must be reclaimed rather than released.
+    pub fn release_member_notice(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        session: Uuid,
+    ) -> Result<MemberNoticeClaimOutcome> {
+        let session = session.to_string();
+        let mut conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member notice release")?;
+        let prior = tx
+            .query_row(
+                "SELECT drained_at, claimed_by_session, claim_expires_at
+                 FROM member_notices
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL",
+                params![id as i64, to_plugin],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("reading member notice claim")?;
+        let outcome = match prior {
+            None => MemberNoticeClaimOutcome::NotFound,
+            Some((Some(_), _, _)) => MemberNoticeClaimOutcome::AlreadyDrained,
+            Some((_, claimed_by, raw_expiry)) => {
+                let claim_expires_at = raw_expiry
+                    .as_deref()
+                    .map(DateTime::parse_from_rfc3339)
+                    .transpose()
+                    .context("parsing member notice claim expiry")?
+                    .map(|t| t.with_timezone(&Utc));
+                match claimed_by {
+                    Some(owner) if owner != session => MemberNoticeClaimOutcome::Conflict {
+                        claimed_by_session: owner,
+                        claim_expires_at,
+                    },
+                    Some(_) => {
+                        tx.execute(
+                            "UPDATE member_notices
+                             SET claimed_by_session = NULL, claim_expires_at = NULL
+                             WHERE id = ?1 AND to_plugin = ?2 AND claimed_by_session = ?3
+                               AND drained_at IS NULL AND dest_peer IS NULL",
+                            params![id as i64, to_plugin, session],
+                        )
+                        .context("releasing member notice claim")?;
+                        MemberNoticeClaimOutcome::Released { was_claimed: true }
+                    }
+                    None => MemberNoticeClaimOutcome::Released { was_claimed: false },
+                }
+            }
+        };
+        tx.commit().context("committing member notice release")?;
+        Ok(outcome)
+    }
+
+    /// The exact lease columns of one undrained local notice, as stored (raw strings, so a
+    /// restore writes back byte-identical values). `None` when the row is absent, drained,
+    /// forwarded, or not addressed to `to_plugin`. The handler reads this BEFORE a claim,
+    /// renewal, takeover or release so that a failed witness append can undo the change
+    /// (NOVA re-review of #1513: an unwitnessed lease change must not stay effective).
+    pub fn member_notice_lease(&self, id: u64, to_plugin: &str) -> Result<Option<MemberNoticeLease>> {
+        let conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        conn.query_row(
+            "SELECT claimed_by_session, claim_expires_at FROM member_notices
+             WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL AND drained_at IS NULL",
+            params![id as i64, to_plugin],
+            |row| {
+                Ok(MemberNoticeLease {
+                    claimed_by_session: row.get(0)?,
+                    claim_expires_at: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .context("reading member notice lease")
+    }
+
+    /// Compare-and-swap a lease back to `prior`, but only while the row still holds exactly
+    /// `written` (the change being undone) and is undrained. Returns whether the row was
+    /// restored; `false` means something else changed it meanwhile and the caller must
+    /// report the lease state as uncertain rather than claim a rollback it did not make.
+    pub fn restore_member_notice_lease(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        written: &MemberNoticeLease,
+        prior: &MemberNoticeLease,
+    ) -> Result<bool> {
+        let conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let changed = conn
+            .execute(
+                "UPDATE member_notices
+                 SET claimed_by_session = ?3, claim_expires_at = ?4
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL AND drained_at IS NULL
+                   AND claimed_by_session IS ?5 AND claim_expires_at IS ?6",
+                params![
+                    id as i64,
+                    to_plugin,
+                    prior.claimed_by_session,
+                    prior.claim_expires_at,
+                    written.claimed_by_session,
+                    written.claim_expires_at,
+                ],
+            )
+            .context("restoring member notice lease")?;
+        Ok(changed == 1)
+    }
+
     /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
     /// recipient-scoped (a member can never drain another member's mail).
     /// Same at-least-once failure bias as the hub-notice drain.
@@ -1438,9 +1685,32 @@ impl SqliteInboxStore {
     /// liveness evidence lives. This is a semantic change to what an empty
     /// drain *means*, wearing a recording change's clothes; the return value
     /// and consume-once behaviour are untouched.
+    ///
+    /// This compatibility entry point deliberately ignores claims; the production
+    /// tool uses the session-aware arm ([`Self::drain_member_for_session`]).
     pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
+        self.drain_member_inner(to_plugin, None)
+    }
+
+    /// Drain only notices this session may consume. A live claim by another session excludes
+    /// the row from BOTH the SELECT and the delivery mark; it is not drained-then-filtered.
+    pub fn drain_member_for_session(
+        &self,
+        to_plugin: &str,
+        session: Uuid,
+    ) -> Result<Vec<MemberNotice>> {
+        self.drain_member_inner(to_plugin, Some(session))
+    }
+
+    fn drain_member_inner(
+        &self,
+        to_plugin: &str,
+        session: Option<Uuid>,
+    ) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let session = session.map(|id| id.to_string()).unwrap_or_default();
         let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member drain")?;
@@ -1457,11 +1727,14 @@ impl SqliteInboxStore {
                        -- hollow if the delivery window still hid the row. They are
                        -- served until delivered, however old.
                        AND (queued_at >= ?2 OR kind = 'disposition')
+                       AND (?3 = '' OR claimed_by_session IS NULL
+                           OR claimed_by_session = ?3
+                           OR (claim_expires_at IS NOT NULL AND claim_expires_at <= ?4))
                      ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
             let rows = stmt
-                .query_map(params![to_plugin, cutoff], |row| {
+                .query_map(params![to_plugin, cutoff, session, now_rfc3339], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -1509,11 +1782,14 @@ impl SqliteInboxStore {
         // "already handed to the fleet mesh", so the mark did not merely mislabel the
         // rows, it cancelled the forwards: accepted, witnessed, enqueued, never sent,
         // never reported, success code — the black hole this branch was built to close,
-        // reconstituted one plane up.
+        // reconstituted one plane up. The claim predicate below must stay identical to
+        // the SELECT's: a live claim by another session is neither returned nor marked.
         tx.execute(
             "UPDATE member_notices SET drained_at = ?2
-             WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
-            params![to_plugin, now.to_rfc3339()],
+             WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL
+               AND (?3 = '' OR claimed_by_session IS NULL OR claimed_by_session = ?3
+                   OR (claim_expires_at IS NOT NULL AND claim_expires_at <= ?4))",
+            params![to_plugin, now_rfc3339, session, now_rfc3339],
         )
         .context("marking drained member notices")?;
         // The heartbeat: recorded whether or not the drain returned anything,
@@ -1673,7 +1949,7 @@ impl SqliteInboxStore {
             .join(" OR ");
         let sql = format!(
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at,
-                    in_reply_to
+                    in_reply_to, mooted_at, moot_reason
              FROM member_notices n
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
                AND n.dest_peer IS NULL
@@ -1710,12 +1986,14 @@ impl SqliteInboxStore {
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at, re) =
-                row?;
+            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at, re,
+                 mooted_at, moot_reason) = row?;
             out.push(UnansweredNotice {
                 id: id as u64,
                 in_reply_to: re.map(|r| r as u64),
@@ -1734,6 +2012,15 @@ impl SqliteInboxStore {
                     ),
                     None => None,
                 },
+                mooted_at: match mooted_at {
+                    Some(d) => Some(
+                        DateTime::parse_from_rfc3339(&d)
+                            .context("parsing unanswered mooted_at")?
+                            .with_timezone(&Utc),
+                    ),
+                    None => None,
+                },
+                moot_reason,
             });
         }
         Ok(out)
@@ -1941,6 +2228,35 @@ impl SqliteInboxStore {
     }
 }
 
+pub const MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS: i64 = 15 * 60;
+pub const MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS: i64 = 30;
+pub const MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS: i64 = 60 * 60;
+
+/// The raw lease columns of one notice (`claimed_by_session`, `claim_expires_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberNoticeLease {
+    pub claimed_by_session: Option<String>,
+    pub claim_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberNoticeClaimOutcome {
+    Claimed {
+        claim_expires_at: DateTime<Utc>,
+        renewed: bool,
+        superseded_expired_claim: bool,
+    },
+    Released {
+        was_claimed: bool,
+    },
+    Conflict {
+        claimed_by_session: String,
+        claim_expires_at: Option<DateTime<Utc>>,
+    },
+    NotFound,
+    AlreadyDrained,
+}
+
 /// One member→member notice (the local-mesh wake signal).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemberNotice {
@@ -2015,6 +2331,12 @@ pub struct UnansweredNotice {
     /// forces the reader to group by a proxy. Whether a debt is a duplicate is a
     /// question about bindings, and the reader could not see them.
     pub in_reply_to: Option<u64>,
+    /// Present only when a terminal scope/escalation disposition marked this transient ask.
+    /// Live read-time derivation leaves both fields null; the handler requires both before
+    /// treating the mark as durable evidence.
+    pub mooted_at: Option<DateTime<Utc>>,
+    /// The terminal ruling hash whose disposition produced `mooted_at`.
+    pub moot_reason: Option<String>,
 }
 
 /// One notice awaiting hand-off to the fleet mesh (r6-routing branch 2).
@@ -3470,6 +3792,307 @@ mod tests {
         assert!(store.drain_member("kimi-code").unwrap().is_empty());
     }
 
+    #[test]
+    fn member_notice_claims_conflict_renew_release_and_protect_bystander_drains() {
+        let (_tmp, store) = fresh();
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/x.md#thread=t"),
+                "hash-claim",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+
+        let first = store
+            .claim_member_notice(id, "kimi-code", owner, 60)
+            .unwrap();
+        let first_expiry = match first {
+            MemberNoticeClaimOutcome::Claimed {
+                claim_expires_at,
+                renewed,
+                superseded_expired_claim,
+            } => {
+                assert!(!renewed);
+                assert!(!superseded_expired_claim);
+                claim_expires_at
+            }
+            other => panic!("first claim failed: {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", bystander, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+
+        match store
+            .claim_member_notice(id, "kimi-code", owner, 120)
+            .unwrap()
+        {
+            MemberNoticeClaimOutcome::Claimed {
+                claim_expires_at,
+                renewed,
+                ..
+            } => {
+                assert!(renewed);
+                assert!(claim_expires_at > first_expiry);
+            }
+            other => panic!("owner renewal failed: {other:?}"),
+        }
+
+        assert!(store
+            .drain_member_for_session("kimi-code", bystander)
+            .unwrap()
+            .is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "a skipped row was not observed");
+        assert_eq!(claimed_by, Some(owner.to_string()));
+
+        assert!(matches!(
+            store
+                .release_member_notice(id, "kimi-code", bystander)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+        assert_eq!(
+            store
+                .release_member_notice(id, "kimi-code", owner)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Released { was_claimed: true }
+        );
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", bystander, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Claimed { .. }
+        ));
+        assert_eq!(
+            store
+                .drain_member_for_session("kimi-code", bystander)
+                .unwrap()
+                .len(),
+            1,
+            "the claim owner can drain its own notice"
+        );
+    }
+
+    #[test]
+    fn an_expired_member_notice_claim_can_be_reclaimed() {
+        let (_tmp, store) = fresh();
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/x.md#thread=t"),
+                "hash-expiry",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", owner, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Claimed { .. }
+        ));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), id as i64],
+            )
+            .unwrap();
+
+        match store
+            .claim_member_notice(id, "kimi-code", successor, 60)
+            .unwrap()
+        {
+            MemberNoticeClaimOutcome::Claimed {
+                renewed,
+                superseded_expired_claim,
+                ..
+            } => {
+                assert!(!renewed);
+                assert!(superseded_expired_claim);
+            }
+            other => panic!("expired claim was not reclaimable: {other:?}"),
+        }
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", owner, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn concurrent_claim_drain_and_expiry_reclaim_have_one_winner_and_one_drain() {
+        let (_tmp, store) = fresh();
+        let store = std::sync::Arc::new(store);
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/race.md#thread=t"),
+                "hash-race",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for session in [owner, bystander] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (session, store.claim_member_notice(id, "kimi-code", session, 60))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. }))
+        }).count();
+        let conflicts = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. }))
+        }).count();
+        assert_eq!((claimed, conflicts), (1, 1), "one live claim, one conflict: {outcomes:?}");
+        let winner = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. })).then_some(*session)
+        }).unwrap();
+        let loser = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. })).then_some(*session)
+        }).unwrap();
+        assert!(store.drain_member_for_session("kimi-code", loser).unwrap().is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "the losing session did not mark a live claim drained");
+        assert_eq!(claimed_by, Some(winner.to_string()));
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), id as i64],
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for session in [owner, bystander] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (session, store.claim_member_notice(id, "kimi-code", session, 60))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. }))
+        }).count();
+        let conflicts = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. }))
+        }).count();
+        assert_eq!((claimed, conflicts), (1, 1), "expiry permits one successor, not two: {outcomes:?}");
+        let winner = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. })).then_some(*session)
+        }).unwrap();
+        let loser = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. })).then_some(*session)
+        }).unwrap();
+        assert_eq!(store.drain_member_for_session("kimi-code", winner).unwrap().len(), 1);
+        assert!(store.drain_member_for_session("kimi-code", loser).unwrap().is_empty());
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", loser, 60).unwrap(),
+            MemberNoticeClaimOutcome::AlreadyDrained
+        ));
+    }
+
+    #[test]
+    fn a_live_claim_survives_restart_and_prelease_drain_contract_is_explicit() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("inbox.db");
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let id = {
+            let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+            let id = store
+                .enqueue_member(
+                    "kimi-code",
+                    "claude-code",
+                    "role:constellation:interactive-dev",
+                    "review_request",
+                    Some("forum/restart.md#thread=t"),
+                    "hash-restart",
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                store.claim_member_notice(id, "kimi-code", owner, 60),
+                Ok(MemberNoticeClaimOutcome::Claimed { .. })
+            ));
+            id
+        };
+
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        assert!(store.drain_member_for_session("kimi-code", bystander).unwrap().is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "restart did not leak a bystander drain");
+        assert_eq!(claimed_by, Some(owner.to_string()));
+
+        // Pre-lease store callers retain the old drain behavior deliberately. Production uses
+        // drain_member_for_session; a lease coordinates work, never strengthens member identity.
+        assert_eq!(store.drain_member("kimi-code").unwrap().len(), 1);
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", owner, 60),
+            Ok(MemberNoticeClaimOutcome::AlreadyDrained)
+        ));
+    }
+
     /// The queue cap must not be a cross-member denial channel: a sender
     /// flooding member A's queue must not evict member B's mail, from a third
     /// party, that B has never read. This is the falsifier for
@@ -3851,6 +4474,89 @@ mod tests {
         assert!(store.inbox_touch("codex-cli").unwrap().is_none());
     }
 
+    #[test]
+    fn terminal_disposition_durably_moots_only_matching_transient_asks() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("inbox.db");
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        for (i, (kind, pointer)) in [
+            ("review_request", "hestia://escalation/a#corroborate-or-dissent"),
+            ("review_request.pr", "hestia://escalation/a#corroborate-or-dissent"),
+            ("reply", "hestia://escalation/a#corroborate-or-dissent;still-content"),
+            ("review_request", "hestia://escalation/ab#corroborate-or-dissent"),
+            ("review_request", "hestia://appeal/a#peer-decide"),
+            ("review_request", "pr/1354"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                                kind, Some(pointer), &format!("ask-{i}"), None)
+                .unwrap();
+        }
+        store
+            .ensure_member_disposition("claude-code", "disposition",
+                                       "hestia://escalation/a#decided", "ruling-a")
+            .unwrap();
+        store
+            .ensure_member_disposition("claude-code", "disposition",
+                                       "hestia://appeal/a#ruled", "appeal-ruling")
+            .unwrap();
+        for (kind, chain_hash) in [("review_request.pr", "ask-late"), ("reply", "reply-late")] {
+            store
+                .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                                kind,
+                                Some("hestia://escalation/a#corroborate-or-dissent;late-follow-up"),
+                                chain_hash, None)
+                .unwrap();
+        }
+
+        let evidence = |store: &SqliteInboxStore| {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT pointer_uri, mooted_at, moot_reason FROM member_notices
+                          WHERE from_plugin = 'claude-code' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let rows = evidence(&store);
+        for row in &rows[..2] {
+            assert!(row.1.is_some(), "transient ask needs durable moot evidence: {rows:?}");
+            assert!(row.2.as_deref().unwrap_or_default().contains("ruling-a"), "{rows:?}");
+        }
+        assert_eq!((rows[2].1.as_deref(), rows[2].2.as_deref()), (None, None),
+                   "a durable reply never moots: {rows:?}");
+        assert_eq!((rows[3].1.as_deref(), rows[3].2.as_deref()), (None, None),
+                   "the id is a complete path segment, never a string prefix: {rows:?}");
+        for row in &rows[4..6] {
+            assert_eq!((row.1.as_deref(), row.2.as_deref()), (None, None),
+                       "appeals and durable pointers are not transient target asks: {rows:?}");
+        }
+        assert!(rows[6].1.is_some(),
+                "an ask enqueued after the ruling inherits its durable evidence: {rows:?}");
+        assert!(rows[6].2.as_deref().unwrap_or_default().contains("ruling-a"), "{rows:?}");
+        assert_eq!((rows[7].1.as_deref(), rows[7].2.as_deref()), (None, None),
+                   "a late durable reply is still content, not a transient ask: {rows:?}");
+        let first_stamp = rows[0].1.clone();
+        drop(store);
+
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        assert_eq!(evidence(&store)[0].1, first_stamp, "the mark must survive reopen");
+        store
+            .ensure_member_disposition("claude-code", "disposition",
+                                       "hestia://escalation/a#decided", "ruling-a-later")
+            .unwrap();
+        assert_eq!(evidence(&store)[0].1, first_stamp,
+                   "projection retries must not rewrite the first terminal evidence");
+    }
+
     /// A pre-id-binding inbox.db must upgrade in place, not fail to open.
     #[test]
     fn member_schema_migrates_from_the_pre_binding_shape() {
@@ -3879,6 +4585,10 @@ mod tests {
         let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
         // The legacy row is pending (drained_at NULL) and queryable under the new columns.
         assert_eq!(store.member_pending("kimi-code").unwrap(), 1);
+        let unanswered = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
+        assert_eq!(unanswered.len(), 1);
+        assert!(unanswered[0].mooted_at.is_none());
+        assert!(unanswered[0].moot_reason.is_none());
         let drained = store.drain_member("kimi-code").unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].in_reply_to, None);
