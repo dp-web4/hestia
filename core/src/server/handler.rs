@@ -124,6 +124,7 @@ impl ServerHandler for HestiaServer {
             "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_cross_chain_checkpoint" => tool_cross_chain_checkpoint(&self.state, &args).await,
+            "hestia_gate_evaluate" => tool_gate_evaluate(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
@@ -710,6 +711,23 @@ fn hestia_tools() -> Vec<Tool> {
                     "observed_at": {"type": "string", "format": "date-time", "description": "Optional RFC3339 observation time; defaults to the daemon's current time."},
                     "session_id": {"type": "string", "description": "Your own live session id from hestia_connect."},
                     "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_gate_evaluate",
+            "Side-effect-free SOCIETY-LAW evaluation for a trusted local client. Resolves the member from your live session, evaluates tool_name plus optional target/command against the SAME publication and law fold as hestia_query_policy, and returns an AuthZEN-shaped subject/action/resource, a fail-closed boolean decision plus a separate society_law_allows result, verdict, rule, reason and law generation. The decision is positive only when every required stage and input has been evaluated; unevaluable or partial probes are not authorization. It never begins an action, appends a witness, charges trust, consumes rate-limit capacity, opens a scope request or escalation, or grants permission. Local MRH/scope, governance closure and egress are explicitly NOT evaluated here; use the gate's dry run for those stages. Session identity is claimed, not authenticated (#824/#954)",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tool_name"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "tool_name": {"type": "string", "minLength": 1},
+                    "target": {"type": "string", "description": "Optional path or resource. Bash/Shell prefers command when both are present."},
+                    "command": {"type": "string", "description": "Optional complete Bash/Shell command; never executed"},
+                    "session_id": {"type": "string", "description": "Your live session id from hestia_connect"},
+                    "sessionId": {"type": "string", "description": "Alternate spelling; snake_case wins"}
                 }
             }),
         ),
@@ -1805,6 +1823,95 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
                  change the law; a rephrase that reaches the same resource is scored as a \
                  recast, BELOW plain compliance. Your appeal is routed to an arbiter that \
                  is structurally not you and not the gate that denied you.",
+    }))
+}
+
+async fn tool_gate_evaluate(state: &SharedState, args: &Value) -> ToolResult {
+    let mut unknown: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|obj| obj.keys())
+        .map(String::as_str)
+        .filter(|key| !["tool_name", "target", "command", "session_id", "sessionId"].contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Ok(hestia_error_envelope(
+            "hestia.gate_evaluate_unknown_arg",
+            "unknown argument(s) refused rather than silently discarded",
+            Some(json!({"unknownKeys": unknown})),
+        ));
+    }
+    let tool_name = require_string(args, "tool_name")?;
+    if tool_name.trim().is_empty() {
+        return Err(anyhow::anyhow!("tool_name must not be empty"));
+    }
+    let published = state.published();
+    let Some(who) = published.resolve(optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.gate_evaluate_unattributed",
+            "a side-effect-free evaluation requires your own live session_id from hestia_connect; \
+             the member is resolved from that session, never from a caller-supplied plugin_id",
+            None,
+        ));
+    };
+    let command = optional_string(args, "command");
+    let target_arg = optional_string(args, "target");
+    let shell = matches!(tool_name.as_str(), "Bash" | "Shell");
+    let target = if shell { command.as_deref().or(target_arg.as_deref()) } else { target_arg.as_deref() };
+    let unevaluable = shell && target.is_none();
+    let pa = crate::policy::PolicyAction {
+        tool_name: &tool_name,
+        category: crate::policy::classify(&tool_name),
+        target,
+        full_command: command.as_deref(),
+    };
+    let evaluation = published.evaluate_read_only(&who.plugin_id, &who.role_lct, &pa);
+    let law_generation = published.policy_generation();
+    let policy_version = published.version;
+    let not_evaluated = ["local_mrh_scope", "governance_closure", "egress"];
+    let complete = not_evaluated.is_empty() && !unevaluable;
+    let society_law_allows = !unevaluable
+        && !(evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced);
+    let decision = complete && society_law_allows;
+    let resource = if shell && command.is_some() {
+        json!({"type": "command", "id": command})
+    } else {
+        json!({"type": "path", "id": target_arg})
+    };
+    Ok(json!({
+        "subject": {"type": "member", "id": who.plugin_id},
+        "action": {"name": tool_name, "properties": {"command": command}},
+        "resource": resource.clone(),
+        "decision": decision,
+        "society_law_allows": society_law_allows,
+        "context": {
+            "verdict": evaluation.decision.as_str(),
+            "rule": evaluation.rule_id,
+            "rule_name": evaluation.rule_name,
+            "reason": evaluation.reason,
+            "enforced": evaluation.enforced,
+            "stage": "society_law",
+            "not_evaluated": not_evaluated,
+            "complete": complete,
+            "evaluated": !unevaluable,
+            "unevaluable": unevaluable,
+            "inert_content_skipped": evaluation.inert_content_skipped,
+            "rate_limit": "observed_only",
+            "side_effects": {
+                "action_started": false, "chain_appended": false, "trust_charged": false,
+                "rate_limit_consumed": false, "scope_request_opened": false,
+                "escalation_opened": false,
+            },
+            "assurance": "trusted local client; session identity is claimed, not authenticated (#824/#954)",
+        },
+        "r6": {
+            "rules": {"rule_id": evaluation.rule_id, "law_generation": law_generation},
+            "resource": resource,
+            "reference": [],
+        },
+        "policyVersion": policy_version,
+        "permits": false,
     }))
 }
 
@@ -31089,6 +31196,120 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod gate_evaluate_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState) -> String {
+        tool_connect(state, &json!({"plugin_id": "codex", "host_agent": "test"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn society_deny_matches_live_and_has_no_decision_side_effects() {
+        let (_dir, state) = test_state().await;
+        let session = connect(&state).await;
+        let command = "rm -rf /home/user/data";
+        let expected = {
+            let published = state.published();
+            let who = published.resolve(Some(&session)).unwrap();
+            published.evaluate(&who.plugin_id, &who.role_lct, &crate::policy::PolicyAction {
+                tool_name: "Bash", category: "command", target: Some(command), full_command: Some(command),
+            })
+        };
+        assert_eq!(expected.decision, crate::policy::PolicyDecision::Deny);
+        let before = {
+            let s = state.lock().await;
+            (s.chain_store.len().unwrap(), s.actions.len(), s.scope_requests.len(),
+             s.gate_escalations.len(), format!("{:?}", s.scope_tally), s.trust_count(), s.trust("codex").action_count,
+             s.trust("codex").success_count, s.trust("codex").witness_count)
+        };
+        for _ in 0..2 {
+            let out = tool_gate_evaluate(&state, &json!({
+                "tool_name": "Bash", "command": command, "session_id": session,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(out["decision"], false, "{out}");
+            assert_eq!(out["society_law_allows"], false, "{out}");
+            assert_eq!(out["context"]["complete"], false, "{out}");
+            assert_eq!(out["context"]["verdict"], expected.decision.as_str(), "{out}");
+            assert_eq!(out["context"]["rule"], json!(expected.rule_id), "{out}");
+            assert_eq!(out["subject"]["id"], "codex", "{out}");
+            assert_eq!(out["context"]["stage"], "society_law", "{out}");
+            assert_eq!(out["context"]["not_evaluated"], json!(["local_mrh_scope", "governance_closure", "egress"]));
+            assert!(out["context"]["side_effects"].as_object().unwrap().values().all(|v| *v == false));
+            assert_eq!(out["permits"], false, "{out}");
+            assert!(out["r6"]["rules"]["law_generation"].as_str().unwrap().starts_with("policy:sha256:"));
+        }
+        let after = {
+            let s = state.lock().await;
+            (s.chain_store.len().unwrap(), s.actions.len(), s.scope_requests.len(),
+             s.gate_escalations.len(), format!("{:?}", s.scope_tally), s.trust_count(), s.trust("codex").action_count,
+             s.trust("codex").success_count, s.trust("codex").witness_count)
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn bad_inputs_and_local_scope_are_named_without_opening_anything() {
+        let (_dir, state) = test_state().await;
+        let session = connect(&state).await;
+        let before = state.lock().await.chain_store.len().unwrap();
+        let unattributed = tool_gate_evaluate(&state, &json!({"tool_name": "Read", "target": "/x"}))
+            .await
+            .unwrap();
+        assert_eq!(unattributed["_hestia_error"]["code"], "hestia.gate_evaluate_unattributed");
+        let unknown = tool_gate_evaluate(&state, &json!({
+            "tool_name": "Read", "target": "/x", "session_id": session, "plugin_id": "someone-else",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.gate_evaluate_unknown_arg");
+        assert_eq!(unknown["_hestia_error"]["data"]["unknownKeys"], json!(["plugin_id"]));
+        let unevaluable = tool_gate_evaluate(&state, &json!({"tool_name": "Bash", "session_id": session}))
+            .await
+            .unwrap();
+        assert_eq!(unevaluable["context"]["unevaluable"], true, "{unevaluable}");
+        assert_eq!(unevaluable["context"]["evaluated"], false, "{unevaluable}");
+        assert_eq!(unevaluable["context"]["complete"], false, "{unevaluable}");
+        assert_eq!(unevaluable["decision"], false, "{unevaluable}");
+        assert_eq!(unevaluable["society_law_allows"], false, "{unevaluable}");
+        assert_eq!(unevaluable["permits"], false, "{unevaluable}");
+        let outside = tool_gate_evaluate(&state, &json!({
+            "tool_name": "Read", "target": "/outside", "session_id": session,
+        }))
+        .await
+        .unwrap();
+        assert!(outside["context"]["not_evaluated"].as_array().unwrap().contains(&json!("local_mrh_scope")));
+        assert_eq!(outside["context"]["complete"], false, "{outside}");
+        assert_eq!(outside["society_law_allows"], true, "{outside}");
+        assert_eq!(outside["decision"], false, "{outside}");
+        assert_eq!(outside["permits"], false);
+        {
+            let s = state.lock().await;
+            assert!(matches!(space_of(&s, "codex", "/outside"), SpaceAnswer::Outside));
+        }
+        let s = state.lock().await;
+        assert_eq!(s.chain_store.len().unwrap(), before);
+        assert!(s.actions.is_empty() && s.scope_requests.is_empty() && s.gate_escalations.is_empty());
+        assert!(s.scope_tally.is_empty());
     }
 }
 
