@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: ea692c372bb73bfb0c6873930adeb6fb55b75060446534445c378cafe13c6c77  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -1356,6 +1356,37 @@ def _scope_parts(scopes, workspace: str) -> tuple:
     return tuple(repos), tuple(roots)
 
 
+def _lexical_grant_contains(path: str, scopes, workspace: str) -> bool:
+    """Whether a grant contains ``path`` WITHOUT resolving the candidate (#1116).
+
+    Resolving an ungranted candidate would turn denial text into a readlink oracle for
+    `/proc/<pid>/cwd`, `/proc/<pid>/exe`, and dangling links. Only an already-granted
+    lexical path may carry the richer resolved-target explanation.
+    """
+    candidate = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
+    wsn = os.path.normpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    if candidate == wsn or candidate.startswith(wsn + "/"):
+        segment = candidate[len(wsn):].lstrip("/").split("/", 1)[0]
+        if segment in scopes:
+            return True
+    for scope in scopes:
+        if not isinstance(scope, str) or not scope.startswith("path:") \
+                or scope.startswith("path:" + UNPRICEABLE_PREFIX):
+            continue
+        raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
+        recursive = raw.endswith(RECURSIVE_SUFFIX)
+        if recursive:
+            raw = raw[:-len(RECURSIVE_SUFFIX)]
+        if not raw:
+            continue
+        if not raw.startswith("/"):
+            raw = os.path.join(wsn, raw)
+        root = os.path.normpath(raw).replace("\\", "/").rstrip("/")
+        if candidate == root or (recursive and candidate.startswith(root + "/")):
+            return True
+    return False
+
+
 def _within_path_grant(path: str, scopes, workspace: str) -> bool:
     """Whether ``path`` is a granted root, or descends from a root granted RECURSIVELY.
 
@@ -1416,8 +1447,8 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
 
     Returns "" when no exact root contains the path (nothing to explain — the path is
     simply outside every grant), else one sentence naming the deepest such root and the
-    spelling that would reach. Naming the operator's act is deliberate: the member cannot
-    widen its own grant, and should not go looking for a way to."""
+    spelling that would reach. Naming the member's request verb is deliberate: the member
+    cannot widen its own grant, but it can ask an operator or delegate to decide that reach."""
     cand = os.path.realpath(os.path.normpath(path)).replace("\\", "/").rstrip("/")
     exact_roots = sorted((root for root, recursive in _scope_roots_with_reach(scopes, workspace)
                           if not recursive and cand.startswith(root + "/")), key=len, reverse=True)
@@ -1426,7 +1457,8 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
     root = exact_roots[0]
     return (f"; note: your grant path:{root} is EXACT — it reaches that path itself and nothing "
             f"beneath it. A recursive grant (path:{root}{RECURSIVE_SUFFIX}) would reach this; "
-            f"only an operator can make it so")
+            f"ask for it with hestia_request_scope(path={root}, recursive=true, reason=...) "
+            f"for an operator or delegate to decide")
 
 
 def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
@@ -1594,11 +1626,15 @@ def resolve_agent_policy(profile: HarnessProfile,
 # Declared RED in the Sprint F notes; this bridge dies the day the certified snapshot
 # carries an explicit launch-cwd grant.
 def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
-    """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
-    launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
-    task-specific launch dir is reachable for that session without widening the standing
-    grant. This is the precedent `hestia_request_scope` generalises."""
+    """An interactive seat's launch repo is in scope (dp 2026-07-21: 'whatever cwd we launch
+    it in') — a per-launch dynamic grant on top of the static allowlist, so a task-specific
+    launch dir is reachable without widening the standing grant. A member named by the
+    `<machine>-being` convention gets no implicit grant from its process cwd (#1098): its
+    service WorkingDirectory is not launch evidence. Only an explicitly set launch_cwd_env
+    declares that dir for a being; interactive seats keep the original cwd fallback."""
     env = os.environ.get(profile.launch_cwd_env) if profile.launch_cwd_env else None
+    if not env and profile.member_id.endswith("-being"):
+        return []
     cwd = (env or os.getcwd()).replace("\\", "/")
     if workspace in cwd:
         rest = cwd.split(workspace, 1)[1].lstrip("/")
@@ -3980,9 +4016,22 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                     target=norm,
                 )
             mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
+            resolution = ""
+            lexical_scopes = (list(scopes) + list(read_scopes)
+                              + [entry for entry, _modes in mode_scopes])
+            if _lexical_grant_contains(norm, lexical_scopes, ws):
+                try:
+                    first_hop = os.readlink(norm)
+                except (OSError, ValueError):
+                    pass
+                else:
+                    resolution = f"it resolves through a symlink to '{_elide(first_hop)}'; "
             # A narrowed grant that REACHES the path is a grant: the refusal must not open by
             # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
-            where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
+            # Name only the hop the member could readlink itself; realpath would cross
+            # ungranted hops and disclose their targets (#1116).
+            where = (resolution + "a grant reaches it, but not in the mode this act needs" if mode_hint
+                     else resolution + "the link target is outside your granted scope" if resolution
                      else f"'{seg}' is not granted" if seg else "it is outside the workspace")
             hint = _exact_grant_hint(absolute, scopes, ws) + mode_hint
             lead = "beyond your grant's modes" if mode_hint else "outside your granted scope"
