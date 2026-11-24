@@ -43,7 +43,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +        resolved = os.path.normpath(spelling).replace("\\", "/")
 +        if resolved != ws and not resolved.startswith(ws + "/"):
 +            continue
-+        if patterns and _only_pattern_text(resolved, patterns, judged_words):
++        if patterns and _only_pattern_text(spelling, patterns, judged_words):
 +            continue
 +        # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
 +        hidden = _symlink_target_forbidden(resolved, egress)
@@ -86,7 +86,7 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
  import json
  import os
  import re
-@@ -289,6 +290,82 @@
+@@ -289,6 +290,89 @@
          json.dump({"mrh": mrh, "role": "role:constellation:member"}, fh)
      return G.HarnessProfile(member_id="test-member", identity_path=p,
                              home_markers=("~/.test-member",))
@@ -156,6 +156,13 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
 +    ok, offending = G.command_in_scope(f"cat {sibling}/README.md", ["granted"], ws, ws)
 +    check("workspace-prefix-sibling-is-not-inside", not ok and offending, (ok, offending))
 +    for label, command in (
++            ("dot-segment", f"cat {ws}/ungranted/./README.md"),
++            ("dotdot-segment", f"cat {ws}/ungranted/sub/../README.md"),
++            ("pattern-is-data-file-is-reach",
++             f"grep -e {ws}/ungranted/README.md {ws}/ungranted/./README.md")):
++        ok, offending = G.command_in_scope(command, ["granted"], ws, ws)
++        check(f"normalized-absolute-pass-denies-{label}", not ok and offending, (ok, offending))
++    for label, command in (
 +            ("sed-write", f"sed 'w {ws}/ungranted/README.md' {ws}/granted/README.md"),
 +            ("pythonpath-import", f"PYTHONPATH={ws}/ungranted python3 -c 'import mod'"),
 +            ("data-operand", f"echo {ws}/ungranted/README.md")):
@@ -169,7 +176,7 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
 
 
  def test_path_and_command_scope():
-@@ -1311,6 +1388,8 @@
+@@ -1311,6 +1395,8 @@
      "test_egress_offers_no_door",
      "test_scope_remedy_distinguishes_itself_from_appeal",
      "test_path_and_command_scope",
@@ -178,7 +185,7 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
      "test_path_grant_reaches_a_sibling_of_the_repos",
      "test_path_grants_keep_their_type_and_match_resolved_boundaries",
      "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
-@@ -1390,6 +1469,8 @@
+@@ -1390,6 +1476,8 @@
      test_egress_offers_no_door()
      test_scope_remedy_distinguishes_itself_from_appeal()
      test_path_and_command_scope()
@@ -268,7 +275,7 @@ diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate
 @@ -1,5 +1,5 @@
  #!/usr/bin/env python3
 -# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
-+# hestia-gt-sha256: 1dd26e74ff2e3c280aa2cac000d967f51057acb50146f7582dded4b08628496b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03  (published ground truth; manifest: hooks-gt)
  """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
  dp, 2026-08-02:
@@ -314,7 +321,7 @@ diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate
 +        resolved = os.path.normpath(spelling).replace("\\", "/")
 +        if resolved != ws and not resolved.startswith(ws + "/"):
 +            continue
-+        if patterns and _only_pattern_text(resolved, patterns, judged_words):
++        if patterns and _only_pattern_text(spelling, patterns, judged_words):
 +            continue
 +        # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
 +        hidden = _symlink_target_forbidden(resolved, egress)
@@ -376,7 +383,7 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
      {
        "path": "hestia_gate_core.py",
 -      "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc",
-+      "sha256": "1dd26e74ff2e3c280aa2cac000d967f51057acb50146f7582dded4b08628496b",
++      "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03",
        "source": "plugins/_shared/hestia_gate_core.py"
      },
      {
@@ -391,7 +398,7 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
    "engine": null,
    "requires": [],
 -  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
-+  "gt_version": "c9ea3cb89d89f59d90622c1a0ed036feed8f3db8002fc53e90b5526d270af039"
++  "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f"
  }
 diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
 --- a/hooks-gt/claude-code/manifest.json
@@ -401,12 +408,12 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "c9ea3cb89d89f59d90622c1a0ed036feed8f3db8002fc53e90b5526d270af039",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
      "files": [
        {
          "path": "hestia_gate_core.py",
 -        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
-+        "sha256": "1dd26e74ff2e3c280aa2cac000d967f51057acb50146f7582dded4b08628496b"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
        },
        {
          "path": "hestia_gate_mechanism.py",
@@ -420,7 +427,7 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
      }
    ],
 -  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
-+  "gt_version": "8a5745f10deec11046f66521ed2fc316006c48b7b16d1638cb357ba7845e7f13"
++  "gt_version": "55b869727686fae82518ad5da6304ff0ff70d2b3bf0a7fbf6a96d0fa93b8e3e5"
  }
 diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
 --- a/hooks-gt/codex/manifest.json
@@ -430,12 +437,12 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "c9ea3cb89d89f59d90622c1a0ed036feed8f3db8002fc53e90b5526d270af039",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
      "files": [
        {
          "path": "hestia_gate_core.py",
 -        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
-+        "sha256": "1dd26e74ff2e3c280aa2cac000d967f51057acb50146f7582dded4b08628496b"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
        },
        {
          "path": "hestia_gate_mechanism.py",
@@ -449,7 +456,7 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
      }
    ],
 -  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
-+  "gt_version": "2985e4c63fd10dd53e2f458bce540f6379360c2c5318b002e2a16b9bedfb154d"
++  "gt_version": "86a814ebe688baff335be638147ea416c6faecc8e74858fab52b6ddb723f7d3a"
  }
 diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
 --- a/hooks-gt/gemini/manifest.json
@@ -459,12 +466,12 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "c9ea3cb89d89f59d90622c1a0ed036feed8f3db8002fc53e90b5526d270af039",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
      "files": [
        {
          "path": "hestia_gate_core.py",
 -        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
-+        "sha256": "1dd26e74ff2e3c280aa2cac000d967f51057acb50146f7582dded4b08628496b"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
        },
        {
          "path": "hestia_gate_mechanism.py",
@@ -478,7 +485,7 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    },
    "requires": [],
 -  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
-+  "gt_version": "1cc949c348806bfa3d43dfa010b90d254161aaeb9655aa42232ed38f6a635895"
++  "gt_version": "ef73e08789e5ff6839ea14e2ca0bd4c1bfb2aa742aa22c73263d2b9fdf467ead"
  }
 diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
 --- a/hooks-gt/kimi/manifest.json
@@ -488,12 +495,12 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "c9ea3cb89d89f59d90622c1a0ed036feed8f3db8002fc53e90b5526d270af039",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
      "files": [
        {
          "path": "hestia_gate_core.py",
 -        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
-+        "sha256": "1dd26e74ff2e3c280aa2cac000d967f51057acb50146f7582dded4b08628496b"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
        },
        {
          "path": "hestia_gate_mechanism.py",
@@ -507,5 +514,5 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
      }
    ],
 -  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
-+  "gt_version": "d1b56d64f89e4349bb3b92746943b88a6ee306fbe6713e1655b4a1368e226f6e"
++  "gt_version": "426e21137ee2c2cf2f9d67cfa8db864d7077baae72fb17e79d10ffaa786fdd38"
  }

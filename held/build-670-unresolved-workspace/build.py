@@ -151,7 +151,7 @@ def detect_workspace""")
         resolved = os.path.normpath(spelling).replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
             continue
-        if patterns and _only_pattern_text(resolved, patterns, judged_words):
+        if patterns and _only_pattern_text(spelling, patterns, judged_words):
             continue
         # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
         hidden = _symlink_target_forbidden(resolved, egress)
@@ -298,6 +298,13 @@ def test_absolute_scope_paths_do_not_depend_on_process_cwd():
         fh.write("x\n")
     ok, offending = G.command_in_scope(f"cat {sibling}/README.md", ["granted"], ws, ws)
     check("workspace-prefix-sibling-is-not-inside", not ok and offending, (ok, offending))
+    for label, command in (
+            ("dot-segment", f"cat {ws}/ungranted/./README.md"),
+            ("dotdot-segment", f"cat {ws}/ungranted/sub/../README.md"),
+            ("pattern-is-data-file-is-reach",
+             f"grep -e {ws}/ungranted/README.md {ws}/ungranted/./README.md")):
+        ok, offending = G.command_in_scope(command, ["granted"], ws, ws)
+        check(f"normalized-absolute-pass-denies-{label}", not ok and offending, (ok, offending))
     for label, command in (
             ("sed-write", f"sed 'w {ws}/ungranted/README.md' {ws}/granted/README.md"),
             ("pythonpath-import", f"PYTHONPATH={ws}/ungranted python3 -c 'import mod'"),

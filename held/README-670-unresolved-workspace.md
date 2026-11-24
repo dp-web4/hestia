@@ -2,7 +2,7 @@
 
 | file | sha256 |
 |---|---|
-| `57df05dc2f78ba0777cd1e48841be04fa99c5c3b4e8e68c1c59f7faa85a35586.patch` | `57df05dc2f78ba0777cd1e48841be04fa99c5c3b4e8e68c1c59f7faa85a35586` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `2c08e37ff4bec2734274d8332267e4d2383fa8639f2344397915b4a29f7d2f12.patch` | `2c08e37ff4bec2734274d8332267e4d2383fa8639f2344397915b4a29f7d2f12` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -22,10 +22,11 @@ subdirectory or make it disappear.
   separator. The rewrite only adds coverage; it cannot remove a prior refusal or let an unenumerated one-time
   approval widen to literal ungranted repositories.
 
-**Behavior change:** a bounded session with no valid workspace configuration now denies **every tool call**, including
-no-path tools, instead of evaluating against whatever directory the hook happened to inherit. That is the intended
-fail-closed posture, not an assertion that existing configured sessions must change. Deployment requires a pre-flight
-of hook environments and markers so configured sessions do not stop unexpectedly.
+**Behavior change:** once the common gate evaluates a bounded session with no valid workspace configuration, it denies
+**every bounded tool call**, including no-path tools, instead of evaluating against whatever directory the hook happened
+to inherit. The daemon-unreachable degraded read-only path is unchanged. That is the intended fail-closed posture, not
+an assertion that existing configured sessions must change. Deployment requires a pre-flight of hook environments and
+markers so configured sessions do not stop unexpectedly.
 
 ## Verification
 
