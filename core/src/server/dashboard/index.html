@@ -6573,6 +6573,33 @@
              The grant was recorded and no seat may ever read it. This is what a typo looks
              like; it is only correct if you are granting ahead of a first connect.
              <em>Nothing is enforced differently until a member by that exact id connects.</em>`;
+        const grantTerms = t => {
+          const reach = t.recursive ? 'recursive' : 'exact';
+          const until = t.expires_at ? `expires ${new Date(t.expires_at * 1000).toISOString().slice(0, 16)}Z` : 'until revoked';
+          return `modes ${t.modes || '?'}, ${reach}, ${until}`;
+        };
+        if (out.replaced_existing) {
+          // WHAT was replaced (NOVA, #1638): the same path with other terms is a replacement,
+          // never an overlap, so the old row's terms are shown, and a lapsed one is named as such.
+          const was = out.replaced_terms
+            ? ` (was ${grantTerms(out.replaced_terms)}${out.replaced_terms.live === false ? ', already lapsed' : ''})`
+            : '';
+          ok.innerHTML = `<strong>Replaced the existing grant on this member and path${escapeHtml(was)}.</strong> `
+            + ok.innerHTML;
+        }
+        const coverageOverlaps = Array.isArray(out.coverage_overlaps) ? out.coverage_overlaps : [];
+        if (coverageOverlaps.length) {
+          // PATH containment only (NOVA, #1638): the server compares paths, not modes, reach or
+          // expiry, so the label says "path" and the existing grant's own terms are shown beside it.
+          const described = coverageOverlaps.slice(0, 3).map(o =>
+            `${o.relation === 'existing_path_covers_new' ? 'existing path covers new' : 'new path covers existing'}: `
+              + `${o.path} (${grantTerms(o)})`);
+          const remainder = coverageOverlaps.length > 3 ? ` (+${coverageOverlaps.length - 3} more)` : '';
+          ok.innerHTML += `<br><strong>Path overlap:</strong> ${escapeHtml(described.join('; ') + remainder)}.
+            Existing rows are retained; a path overlap does not make either grant redundant —
+            modes, exact/recursive reach, and expiry can differ intentionally. Paths are compared
+            as written (normalised; symlinks are not resolved).`;
+        }
         ok.hidden = false;
         path.value = ''; reason.value = '';
         sync();
