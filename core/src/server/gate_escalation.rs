@@ -848,6 +848,14 @@ pub struct Factor {
     /// never something that could have informed the decision. Older factors default false.
     #[serde(default)]
     pub post_claim: bool,
+    /// True when a ruling already existed at acceptance. This distinguishes retrospective
+    /// review from decision-relevant evidence; `post_claim` separately means the permit
+    /// was already spent. Historical factors default false rather than being reclassified.
+    /// So `false` on a REPLAYED legacy factor (written before this field existed) means
+    /// "not recorded", NOT "came before the ruling": it does not prove pre-ruling provenance,
+    /// and no reader may infer from it that the factor informed the decision.
+    #[serde(default)]
+    pub post_decision: bool,
 }
 
 /// Where an invoked factor came from. `by` on the `Factor` names the filler's durable
@@ -3719,6 +3727,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             argument: None,
             invocation: None,
             post_claim: false,
+            post_decision: false,
             at: now,
         });
         Ok(esc.clone())
@@ -3737,6 +3746,13 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         self.by_id.insert(prior.id.clone(), prior);
     }
 
+    /// Restore the exact pre-corroboration row when the factor's witness append fails.
+    /// The caller holds the state lock across mutation, append, and rollback, so no reader
+    /// or decider can observe the unwitnessed factor in between.
+    pub fn undo_corroborate(&mut self, prior: Escalation) {
+        self.by_id.insert(prior.id.clone(), prior);
+    }
+
     /// Add a peer's evidence to an escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean
@@ -3751,8 +3767,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
     /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
     /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
-    /// A factor created after `consumed_at` is explicitly `post_claim`, so preserved late
-    /// commentary cannot be misread as evidence that informed the already-spent ruling.
+    /// A factor created after the ruling is explicitly `post_decision`; one created after
+    /// `consumed_at` is also `post_claim`. Retrospective review and spent-permit commentary
+    /// therefore remain distinct from evidence that informed the original decision.
     ///
     /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
     /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
@@ -3844,6 +3861,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 .filter(|a| !a.is_empty()),
             invocation: None,
             post_claim: esc.consumed_at.is_some(),
+            post_decision: esc.decided_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -3908,6 +3926,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 prompt_digest: invocation.prompt_digest.trim().to_string(),
             }),
             post_claim: false,
+            post_decision: esc.decided_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -4643,6 +4662,62 @@ mod tests {
         assert!(!esc.is_claimable(T0 + 60));
         assert_eq!(esc.peer_participation().invoked, 1);
         assert_eq!(esc.peer_participation().concurred, 0);
+    }
+
+    /// NOVA 11-22: an old `gate_escalation_corroborated` event, written before
+    /// `post_decision` existed, replays as `false` even when its own `at` is AFTER the
+    /// ruling. That is "not recorded", not "pre-ruling" (see the field's doc). A current
+    /// event that carries the key is believed.
+    #[test]
+    fn replay_of_a_legacy_corroboration_without_post_decision_loads_false_not_reclassified() {
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "old1", "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit",
+                "marker": "law_inject.py", "opened_at": T0, "expires_at": T0 + 3600,
+            }),
+        );
+        let decided = chain_entry(
+            "gate_escalation_decided",
+            serde_json::json!({
+                "escalation_id": "old1", "status": "denied", "decided_by": "operator",
+                "decided_via": "operator_session",
+                "factors_present": [{"channel": "operator_session", "by": "operator",
+                                     "role": null, "independence": null, "at": T0 + 10}],
+            }),
+        );
+        let factors = |with_key: bool| {
+            let mut late = serde_json::json!({
+                "channel": "peer_member", "by": "codex", "role": "role:constellation:member",
+                "independence": "cross_vendor", "at": T0 + 20, "dissent": true,
+                "argument": "after the fact", "post_claim": false,
+            });
+            if with_key {
+                late["post_decision"] = serde_json::json!(true);
+            }
+            serde_json::json!([
+                {"channel": "operator_session", "by": "operator", "role": null,
+                 "independence": null, "at": T0 + 10},
+                late,
+            ])
+        };
+        let corroborated = |with_key: bool| chain_entry(
+            "gate_escalation_corroborated",
+            serde_json::json!({"escalation_id": "old1", "factors_present": factors(with_key)}),
+        );
+
+        let mut legacy = EscalationStore::default();
+        legacy.rehydrate(&[opened.clone(), decided.clone(), corroborated(false)], T0 + 60);
+        let row = legacy.get("old1").expect("restored");
+        assert_eq!(row.factors.len(), 2, "the legacy factor must still load, not be dropped");
+        assert!(row.factors[1].at > row.decided_at.unwrap(), "fixture: the factor is late");
+        assert!(!row.factors[1].post_decision, "missing history is not reclassified on replay");
+        assert!(row.factors[1].dissent, "the rest of the legacy factor survives");
+
+        let mut current = EscalationStore::default();
+        current.rehydrate(&[opened, decided, corroborated(true)], T0 + 60);
+        assert!(current.get("old1").unwrap().factors[1].post_decision, "a recorded key is believed");
     }
 
     /// #128, the restore half. A `gate_escalation_opened` entry written before `asker_basis`
@@ -7038,6 +7113,101 @@ mod bar_factor_tests {
         assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
         assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
+    }
+
+    #[test]
+    fn post_decision_review_is_typed_separately_from_post_claim_commentary() {
+        let (mut s, id) = open_with("law_inject.py");
+        let pending = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                    false, Some("before the ruling"), T0 + 1).unwrap();
+        assert!(!pending.factors[0].post_decision);
+        assert!(!pending.factors[0].post_claim);
+
+        let decided = s.decide(&id, true, "dp", "role:constellation:sovereign",
+                               Channel::OperatorSession, None, Some("reviewed"), T0 + 2).unwrap();
+        assert!(!decided.factors[0].post_decision, "the pending factor keeps its temporal meaning");
+        assert!(!decided.factors[1].post_decision, "the decider's own factor is not retrospective");
+
+        let reviewed = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                     true, Some("retrospective disagreement"), T0 + 3).unwrap();
+        let review = reviewed.factors.last().unwrap();
+        assert!(review.post_decision);
+        assert!(!review.post_claim, "decided need not mean spent");
+
+        let invoked = s.attach_invoked(
+            &id,
+            "lct:web4:filler:ollama-qwen3",
+            "role:constellation:classifier",
+            crate::arbiter::Independence::CrossVendor,
+            false,
+            Some("retrospective classification"),
+            invocation(),
+            T0 + 4,
+        ).unwrap();
+        let classification = invoked.factors.last().unwrap();
+        assert!(classification.post_decision);
+        assert!(!classification.post_claim);
+
+        s.claim("claude-code", "law_inject.py", Some("Edit -> act"), T0 + 5)
+            .expect("the approved act is spent before the final comment");
+        let commented = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                      false, Some("after the spend"), T0 + 6).unwrap();
+        let comment = commented.factors.last().unwrap();
+        assert!(comment.post_decision);
+        assert!(comment.post_claim);
+
+        let mut legacy = serde_json::to_value(comment).unwrap();
+        legacy.as_object_mut().unwrap().remove("post_decision");
+        let historical: Factor = serde_json::from_value(legacy).unwrap();
+        assert!(!historical.post_decision, "missing history is not reclassified");
+        assert!(historical.post_claim, "the independent older field is preserved");
+    }
+
+    /// NOVA 11-22: the same-second ruling boundary. `post_decision` is keyed on whether the
+    /// ruling EXISTED when the factor was accepted, not on comparing seconds, so a factor
+    /// filed in the ruling's own second reads by order: before the ruling false, after true.
+    #[test]
+    fn a_factor_in_the_same_second_as_the_ruling_is_labelled_by_order_not_by_clock() {
+        let (mut s, id) = open_with("law_inject.py");
+        let ruling_second = T0 + 2;
+        s.corroborate(&id, "codex", "role:constellation:member", None,
+                      false, Some("just before"), ruling_second).unwrap();
+        s.decide(&id, true, "dp", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("ok"), ruling_second).unwrap();
+        let after = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                  true, Some("just after"), ruling_second).unwrap();
+        assert_eq!(after.decided_at, Some(ruling_second));
+        assert!(!after.factors[0].post_decision, "filed before the ruling, same second");
+        assert!(after.factors[2].post_decision, "filed after the ruling, same second");
+        assert!(!after.factors[2].post_claim);
+    }
+
+    /// NOVA 11-22: a late `attach_invoked` on a DENIED row (operator deny, and a
+    /// self-withdrawal, which is a deny via `SelfWithdrawn`) lands, is typed
+    /// `post_decision`, is not `post_claim` (nothing was spent), and moves nothing.
+    #[test]
+    fn a_late_invoked_factor_on_a_denied_or_withdrawn_row_is_post_decision_and_inert() {
+        for via in [Channel::OperatorSession, Channel::SelfWithdrawn] {
+            let (mut s, id) = open_with("law_inject.py");
+            s.decide(&id, false, "claude-code", "role:constellation:member",
+                     via, None, Some("no"), T0 + 2).unwrap();
+            let late = s.attach_invoked(
+                &id,
+                "lct:web4:filler:ollama-qwen3",
+                "role:constellation:classifier",
+                crate::arbiter::Independence::CrossVendor,
+                false,
+                Some("late classification"),
+                invocation(),
+                T0 + 3,
+            ).unwrap_or_else(|e| panic!("{via:?}: a denied row takes late evidence: {e:?}"));
+            let f = late.factors.last().unwrap();
+            assert_eq!(f.channel, Channel::Invoked);
+            assert!(f.post_decision, "{via:?}: late invoked factor not typed post_decision");
+            assert!(!f.post_claim, "{via:?}: a denied row was never spent");
+            assert_eq!(late.stored_status(), Status::Denied, "{via:?}: the ruling is untouched");
+            assert!(!late.is_claimable(T0 + 3), "{via:?}: nothing became claimable");
+        }
     }
 
     #[test]
