@@ -65,6 +65,12 @@ check("an old unit warns and names the manifest", "HESTIA_CURRENT_BUILD_FILE=" i
 check("the warning names the unit", "hestia.service does not export" in OLD, True)
 check("the exact path stays quiet", run(environment="HESTIA_CURRENT_BUILD_FILE=<HOME>/current-build.json"), "")
 check("a different manifest path warns", "HESTIA_CURRENT_BUILD_FILE=" in run(environment="HESTIA_CURRENT_BUILD_FILE=/elsewhere/current-build.json"), True)
+check("the exact path among other variables stays quiet",
+      run(environment="HESTIA_HOME=<HOME> HESTIA_CURRENT_BUILD_FILE=<HOME>/current-build.json PATH=/usr/bin"), "")
+check("the path under another variable name warns",
+      "HESTIA_CURRENT_BUILD_FILE=" in run(environment="OTHER_FILE=<HOME>/current-build.json"), True)
+check("a longer path that starts with the expected one warns",
+      "HESTIA_CURRENT_BUILD_FILE=" in run(environment="HESTIA_CURRENT_BUILD_FILE=<HOME>/current-build.json.bak"), True)
 check("no manifest means no authority warning", run(manifest=False), "")
 check("check mode does not warn", run(mode="--check"), "")
 check("non-Linux is not probed", run(os_name="Darwin"), "")

@@ -1062,8 +1062,10 @@ warn_current_build_env() {
   command -v systemctl >/dev/null 2>&1 || return 0
   local expected="$HESTIA_HOME/current-build.json" actual
   actual="$(systemctl --user show "$UNIT" -p Environment --value 2>/dev/null || true)"
-  case "$actual" in
-    *"$expected"*) ;;
+  # The whole `NAME=value` entry, bounded by spaces (systemctl prints the Environment as
+  # space-separated assignments): not the path inside another variable, not a longer path.
+  case " $actual " in
+    *" HESTIA_CURRENT_BUILD_FILE=$expected "*) ;;
     *) log "WARN deployment authority: $UNIT does not export HESTIA_CURRENT_BUILD_FILE=$expected; the dashboard will read deployment: unknown" ;;
   esac
 }
