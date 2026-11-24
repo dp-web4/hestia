@@ -3066,6 +3066,103 @@
     return !!pol && (pol.preset === 'permissive' || !pol.enforce);
   }
 
+  function escalationView(e, pendingIds) {
+    const evidence = e.bar
+      ? `bar ${e.bar}${e.bar_met === true ? ' met' : e.bar_met === false ? ' not met' : ''}`
+      : '';
+    const via = [e.decided_via, evidence].filter(Boolean).join(', ');
+    const suffix = via ? ` (${via})` : '';
+    const ruler = e.decided_by || 'unattributed';
+    let status = 'info';
+    let statusClass = 'info';
+    let disposition;
+    if (e.event_type === 'gate_escalation_decided' && e.decided_via === 'self_withdrawn') {
+      status = 'withdrawn';
+      disposition = `withdrawn by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_decided') {
+      // Both decide writers record the outcome as `status` ("approved" / "denied"); the
+      // ruling row has no `granted` key (that is the caller's reply, not the chain's).
+      status = e.status === 'approved' || e.status === 'denied' ? e.status : 'decided';
+      statusClass = e.status === 'approved' ? 'ok' : e.status === 'denied' ? 'deny' : 'info';
+      disposition = `${status} by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_withdrawn') {
+      status = 'withdrawn';
+      disposition = `withdrawn by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_expired') {
+      status = 'expired';
+      statusClass = 'warn';
+      // WHICH lapse (`record_newly_lapsed`): an approval whose claim window passed unspent is
+      // NOT "unruled" -- it was ruled and never used. A row with no `lapse_kind` (written
+      // before the field existed, or a writer that omits it) claims neither.
+      disposition = e.lapse_kind === 'approved_unclaimed' ? 'approved, expired unclaimed'
+        : e.lapse_kind === 'undecided' ? 'expired unruled'
+        : 'expired';
+    } else if (e.event_type === 'gate_escalation_claimed') {
+      status = 'claimed';
+      statusClass = 'ok';
+      disposition = 'claimed (ruling outside this window)';
+    } else if (pendingIds.has(e.escalation_id)) {
+      status = 'pending';
+      disposition = 'pending';
+    } else {
+      // NOT a disposition. The feed (`recent`) is a chain read the snapshot worker may
+      // reuse, while `pending_escalations` is read from the store at fold time, so an ask
+      // ruled or lapsed between the two shows here, as does one whose ruling fell outside
+      // this window. Say only what is known: it is not pending and its outcome is not in
+      // this feed. Never render it as denied or expired; the escalation pointer has the rest.
+      status = 'not pending';
+      disposition = 'not pending; outcome not in this feed';
+    }
+    return {
+      status,
+      statusClass,
+      detail: `${(e.escalation_id || '').slice(0, 8)}${e.marker ? ' ' + e.marker : ''} -> ${disposition}`,
+    };
+  }
+
+  // The snapshot's pending items name their escalation `id` (dashboard.rs), not `escalation_id`.
+  function livePendingIds(data) {
+    return new Set((data?.pending_escalations ?? []).map(e => e.id).filter(Boolean));
+  }
+
+  function projectEscalations(entries, pendingIds) {
+    const groups = new Map();
+    for (const e of entries) {
+      if (!e.event_type.startsWith('gate_escalation_') || !e.escalation_id) continue;
+      if (!groups.has(e.escalation_id)) groups.set(e.escalation_id, []);
+      groups.get(e.escalation_id).push(e);
+    }
+    const projections = new Map();
+    for (const [id, events] of groups) {
+      // NEWEST BY CHAIN POSITION, never first in array order: the feed arrives newest-first
+      // today, but nothing in this function may depend on that. Same precedence as the
+      // escalation pointer lookup in `handler.rs` (`newest(...)`): the newest settlement
+      // (decided / withdrawn / expired), else the newest claim (a spend, not a settlement),
+      // else the newest open. The chosen row's status AND chain hash are what the row shows.
+      const newest = kinds => events.reduce((best, e) =>
+        kinds.includes(e.event_type) && (!best || e.chain_position > best.chain_position) ? e : best,
+        null);
+      const opened = newest(['gate_escalation_opened']);
+      const representative =
+        newest(['gate_escalation_decided', 'gate_escalation_withdrawn', 'gate_escalation_expired']) ||
+        newest(['gate_escalation_claimed']) || opened ||
+        newest(events.map(e => e.event_type));
+      const source = {
+        ...representative,
+        marker: representative.marker || opened?.marker,
+        plugin_id: opened?.plugin_id || representative.plugin_id,
+      };
+      projections.set(id, {source, view: escalationView(source, pendingIds)});
+    }
+    return entries.flatMap(e => {
+      if (!e.escalation_id) return [e];
+      const projection = projections.get(e.escalation_id);
+      if (!projection) return [e];
+      if (projection.source.chain_position !== e.chain_position) return [];
+      return [{...projection.source, escalation_view: projection.view}];
+    });
+  }
+
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
@@ -3080,6 +3177,7 @@
         e.event_type === 'policy_decision' && e.decision === feedFilter
       );
     }
+    source = projectEscalations(source, livePendingIds(lastData));
     let filtered = selectedOrch
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
@@ -3207,8 +3305,15 @@
       let statusClass = 'info';
       let tool = '';
       let hover = null;   // hover text for the detail cell; null => fall back to `detail`
+      const escView = e.escalation_view;
+      const eventLabel = escView ? 'escalation' : e.event_type;
 
-      if (e.event_type === 'outcome') {
+      if (escView) {
+        detail = escView.detail;
+        status = escView.status;
+        statusClass = escView.statusClass;
+        hover = `${e.event_type}\n${detail}\n\nchain hash:\n${e.hash}`;
+      } else if (e.event_type === 'outcome') {
         tool = e.tool_name || '?';
         detail = e.target || '';
         if (e.success === true) { status = 'ok'; statusClass = 'ok'; }
@@ -3258,12 +3363,12 @@
         <div class="feed-row${isNew ? ' new' : ''}">
           <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${memberName(whoAgent)}</span>${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
-          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(e.event_type)}</span>
+          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(eventLabel)}</span>
           <span class="feed-detail" title="${escapeHtml(hover || detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
           </span>
           <span class="feed-status ${statusClass}">${status}</span>
-          <span class="feed-hash">${fmt.short(e.hash)}…</span>
+          <span class="feed-hash" title="${escapeHtml(e.hash)}">${fmt.short(e.hash)}…</span>
         </div>
       `;
     }).join('');

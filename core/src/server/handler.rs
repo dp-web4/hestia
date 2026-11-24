@@ -24158,6 +24158,126 @@ mod appeal_tests {
         );
     }
 
+    /// The dashboard escalation feed (#869) is tested in JS against
+    /// `tools/dashboard_escalation_feed_fixture.json`. That fixture is only worth what its
+    /// shapes are worth: the first version of the feed read a `granted` key no ruling row
+    /// has, and an `escalation_id` key no pending item has, and its hand-written fixtures
+    /// had both. This drives the REAL writers (open, peer approve, peer deny, self-withdraw,
+    /// one left pending), takes the snapshot `/api/dashboard` serves, and holds the
+    /// fixture to it: same rows, same keys, same dispositions. Regenerate with
+    /// `HESTIA_WRITE_FEED_FIXTURE=1` after a deliberate writer change.
+    #[tokio::test]
+    async fn the_dashboard_feed_fixture_matches_what_the_daemon_writes() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker = seat(&state, "claude-code").await;
+        let peer = seat(&state, "codex").await;
+        let open = |marker: &'static str| {
+            let state = state.clone();
+            async move {
+                let o = tool_gate_escalation_open(&state, &json!({
+                    "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": marker,
+                    "act": format!("policy_edit -> {marker}"),
+                    "reason": "the deny blocks a legitimate rule addition",
+                    "session_id": asker.to_string(),
+                })).await.unwrap();
+                o["escalation_id"].as_str().unwrap().to_string()
+            }
+        };
+        let rule = |id: String, approve: bool, sid: Uuid| {
+            let state = state.clone();
+            async move {
+                let r = tool_gate_arbitrate_escalation(&state, &json!({
+                    "escalation_id": id, "approve": approve, "session_id": sid.to_string(),
+                    "reason": "reviewed",
+                })).await.unwrap();
+                assert!(r.get("_hestia_error").is_none(), "{r}");
+            }
+        };
+        let approved = open("policy.json").await;
+        rule(approved.clone(), true, peer).await;
+        let denied = open("law.json").await;
+        rule(denied.clone(), false, peer).await;
+        let withdrawn = open("witness.py").await;
+        rule(withdrawn.clone(), false, asker).await;
+        let pending = open("pending.json").await;
+
+        let snap = serde_json::to_value(state.lock().await.dashboard_snapshot(200)).unwrap();
+        // Stable labels for the per-run ids, so the fixture is readable and diffable.
+        let ids = [
+            (&approved, "a0a0a0a0approved"),
+            (&denied, "d0d0d0d0denied00"),
+            (&withdrawn, "w0w0w0w0withdrwn"),
+            (&pending, "p0p0p0p0pending0"),
+        ];
+        let relabel = |v: &Value| -> Value {
+            let mut t = v.to_string();
+            for (real, label) in &ids {
+                t = t.replace(real.as_str(), label);
+            }
+            serde_json::from_str(&t).unwrap()
+        };
+        let mut recent: Vec<Value> = snap["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"].as_str().unwrap().starts_with("gate_escalation_"))
+            .map(|e| {
+                let mut e = relabel(e);
+                let pos = e["chain_position"].clone();
+                e["hash"] = json!(format!("hash-{pos}"));
+                e["prev_hash"] = json!("prev");
+                e["timestamp"] = json!("2026-11-23T00:00:00Z");
+                e
+            })
+            .collect();
+        recent.retain(|e| e.get("escalation_id").is_some());
+        let pending_items: Vec<Value> =
+            snap["pending_escalations"].as_array().unwrap().iter().map(relabel).collect();
+        let real = json!({"recent": recent, "pending_escalations": pending_items});
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tools/dashboard_escalation_feed_fixture.json");
+        if std::env::var_os("HESTIA_WRITE_FEED_FIXTURE").is_some() {
+            std::fs::write(&path, serde_json::to_string_pretty(&real).unwrap() + "\n").unwrap();
+        }
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let (want, got) = (fixture["recent"].as_array().unwrap(), real["recent"].as_array().unwrap());
+        assert_eq!(want.len(), got.len(), "fixture rows vs real rows: {got:#?}");
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!(keys(w), keys(g), "a feed row's keys drifted from the writer: {g:#}");
+            for k in ["event_type", "escalation_id", "plugin_id", "marker", "status",
+                      "decided_by", "decided_via", "bar", "bar_met"] {
+                assert_eq!(w.get(k), g.get(k), "{k} drifted from the writer: {g:#}");
+            }
+        }
+        // The two dispositions the feed must tell apart are on the ruling rows, as `status`.
+        let ruling = |id: &str| got.iter()
+            .find(|e| e["escalation_id"] == id && e["event_type"] == "gate_escalation_decided")
+            .unwrap_or_else(|| panic!("no ruling row for {id}: {got:#?}"));
+        assert_eq!(ruling("a0a0a0a0approved")["status"], "approved");
+        assert_eq!(ruling("d0d0d0d0denied00")["status"], "denied");
+        assert!(got.iter().all(|e| e.get("granted").is_none()), "no feed row carries `granted`");
+
+        let (want, got) = (
+            fixture["pending_escalations"].as_array().unwrap(),
+            real["pending_escalations"].as_array().unwrap(),
+        );
+        assert_eq!(want.len(), got.len(), "{got:#?}");
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!(keys(w), keys(g), "a pending item's keys drifted: {g:#}");
+            assert_eq!(w["id"], g["id"]);
+        }
+        assert_eq!(got[0]["id"], "p0p0p0p0pending0", "a pending item names its escalation `id`");
+    }
+
     /// Minting site C, the peer-ruling path (#459): a member ruling on an escalation
     /// tells the ASKER. Minted at the tool handler, the layer that holds
     /// `SharedState` — the store's `decide` has no inbox access.
