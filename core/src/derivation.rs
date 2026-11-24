@@ -698,14 +698,20 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             entry_str(deny, "target").unwrap_or(""),
         );
         let denied_cmd = entry_str(deny, "attempted").unwrap_or_default();
+        // `feedback.act` digests the WHOLE attempt, so truncation of the row's display text is
+        // harmless on that branch — but it digests the REDACTED attempt (`act_digest`: "never a
+        // proof"), so a redacted attempt on either side is no identity there either (NOVA's hold
+        // on 774053993).
+        let unredacted_act_text = |text: &str| {
+            !text.trim_end().is_empty() && !text.contains("[REDACTED —") && !text.contains("***")
+        };
         let complete_act_text = |text: &str| {
             let text = text.trim_end();
-            !text.is_empty()
+            unredacted_act_text(text)
                 && !text.contains('…')
                 && !text.ends_with("...")
-                && !text.contains("[REDACTED —")
-                && !text.contains("***")
         };
+        let denied_unredacted = unredacted_act_text(denied_cmd);
         let denied_complete = complete_act_text(denied_cmd);
         let shell_tool = deny_sig.1.eq_ignore_ascii_case("bash")
             || deny_sig.1.eq_ignore_ascii_case("shell");
@@ -720,7 +726,9 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
                     let attempted = entry_str(e, "attempted").unwrap_or_default();
                     let target = entry_str(e, "target").unwrap_or_default();
                     match (entry_feedback_act(deny), entry_feedback_act(e)) {
-                        (Some(a), Some(b)) => a == b,
+                        (Some(a), Some(b)) => {
+                            a == b && denied_unredacted && unredacted_act_text(attempted)
+                        }
                         _ => denied_complete
                             && complete_act_text(attempted)
                             && (attempted == denied_cmd
@@ -747,8 +755,11 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         // RECAST-AFTER-DENY — the gap kimi named, and the half that still selected for
         // the thing it was meant to discourage.
         //
-        // `retried` requires complete, unredacted `attempted` on both decisions and corroborates
-        // act identity by exact command, payload hash, or a non-shell resource-shaped target.
+        // `retried` requires unredacted `attempted` on both decisions. With `feedback.act` on
+        // both, equal whole-attempt digests are the identity (a long verbatim retry's display
+        // text is truncated, its digest is not); otherwise `attempted` must also be untruncated,
+        // and identity is corroborated by exact command, payload hash, or a non-shell
+        // resource-shaped target.
         // Shell targets are bounded commands, not resources; bounded/redacted identity is no
         // identity at all. A route-around produces a successful OUTCOME rather than a matching
         // POLICY_DECISION,
@@ -2370,5 +2381,31 @@ mod recast_tests {
         let d = derive("m", ROLE, &[denied, different]);
         assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
                 "different whole-act digests cannot establish a retry: {d:?}");
+    }
+
+    #[test]
+    fn retried_feedback_act_needs_unredacted_attempts() {
+        // `feedback.act` digests the redacted attempt, so two acts differing only in a masked
+        // value share it. A matching digest over redacted or empty text is no act identity.
+        let entry = |pos: u64, attempted: &str| {
+            let mut e = retry_policy(pos, attempted, "same-target", "");
+            e.event_data["feedback"] = json!({"act": "same-redacted-digest"});
+            e
+        };
+        let masked = "Bash: curl --token *** https://example.invalid";
+        let withheld = "Bash [REDACTED — names a credential-shaped token; 400 chars withheld]";
+        let long_masked = format!("curl --token *** {}…[truncated]", "x".repeat(400));
+        for (denied, retry) in [
+            (masked, masked),
+            (withheld, withheld),
+            (long_masked.as_str(), long_masked.as_str()),
+            (masked, "Bash: curl https://example.invalid"),
+            ("Bash: curl https://example.invalid", masked),
+            ("", ""),
+        ] {
+            let d = derive("m", ROLE, &[entry(1, denied), entry(2, retry)]);
+            assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                    "a matching digest over redacted attempts is not a retry ({denied:?} / {retry:?}): {d:?}");
+        }
     }
 }
