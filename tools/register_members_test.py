@@ -412,6 +412,47 @@ def test_json_member_merges_without_disturbing_other_keys():
         assert "ok    claude-code" in r2.stdout and json.loads(cfg.read_text()) == data
 
 
+def _claude_foreign_witness_config(tmp, owned=False):
+    commands = [{"type": "command", "command": "python3 /opt/foreign/witness.py", "timeout": 3}]
+    if owned:
+        commands.append({"type": "command",
+                         "command": f"python3 {tmp}/.claude/hooks/hestia/witness.py", "timeout": 3})
+    return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": commands}]}}
+
+
+def test_foreign_success_witness_leaves_failure_gap_visible():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".claude" / "settings.json"
+        cfg.parent.mkdir()
+        cfg.write_text(json.dumps(_claude_foreign_witness_config(tmp)))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "UNCOVERED claude-code: PostToolUseFailure/witness.py" in r.stdout, r.stdout
+        assert "PostToolUseFailure" not in json.loads(cfg.read_text())["hooks"]
+        r2 = _run(tmp, plugins, "--member", "claude-code")
+        assert "partial claude-code" in r2.stdout and "every templated hook is registered" not in r2.stdout
+
+
+def test_owned_and_foreign_success_witnesses_do_not_suppress_failure_registration():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".claude" / "settings.json"
+        cfg.parent.mkdir()
+        cfg.write_text(json.dumps(_claude_foreign_witness_config(tmp, owned=True)))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "UNCOVERED" not in r.stdout, r.stdout
+        assert "REGISTERED claude-code: PostToolUseFailure/witness.py" in r.stdout, r.stdout
+        data = json.loads(cfg.read_text())
+        assert any(h["command"].endswith("witness.py")
+                   for group in data["hooks"]["PostToolUseFailure"] for h in group["hooks"])
+
+
 def test_a_harness_not_on_this_host_is_not_minted():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -564,7 +605,8 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
         assert prompts == [reader, _mesh_cmd("claude-code", dest, "prompt-disposition-watch.sh")], prompts
         assert "@HESTIA" not in cfg.read_text()
         r2 = _run(tmp, plugins, "--member", "claude-code")
-        assert "ok    claude-code" in r2.stdout and json.loads(cfg.read_text()) == data
+        assert "UNCOVERED claude-code: PostToolUseFailure/witness.py" in r2.stdout, r2.stdout
+        assert "partial claude-code" in r2.stdout and json.loads(cfg.read_text()) == data
 
 
 def test_claude_code_template_on_an_empty_settings_registers_every_hook_once_installed():
@@ -2089,6 +2131,8 @@ TESTS = [
     test_kimi_flat_layout_registers_the_failure_witness_and_reconciles_owned_lines,
     test_ensure_adds_the_feature_flag_when_absent,
     test_json_member_merges_without_disturbing_other_keys,
+    test_foreign_success_witness_leaves_failure_gap_visible,
+    test_owned_and_foreign_success_witnesses_do_not_suppress_failure_registration,
     test_a_harness_not_on_this_host_is_not_minted,
     test_unrendered_placeholder_refuses,
     test_dry_run_writes_nothing,
