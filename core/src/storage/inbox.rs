@@ -364,6 +364,11 @@ impl SqliteInboxStore {
             // under the contract the act was made under, and so a binding that changes while
             // the row waits is detected rather than silently applied.
             ("transport_stamp", "TEXT"),
+            // Terminal scope/escalation dispositions mark transient asks as moot (#1354).
+            // The ruling hash in the reason binds this projection to its durable evidence;
+            // both fields survive request-map eviction, escalation reaping, and restart.
+            ("mooted_at", "TEXT"),
+            ("moot_reason", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -463,6 +468,12 @@ impl SqliteInboxStore {
     /// durable — the caller warns and lets the cursor projector retry; it never
     /// reports the failure as a ruling failure, because the ruling succeeded.
     ///
+    /// For scope/escalation pointers the same transaction also marks matching local
+    /// `review_request` rows moot (#1354), preserving the ruling hash as evidence. Late matching
+    /// asks inherit the earliest stored disposition when `enqueue_member_on` inserts them, so
+    /// post-ruling follow-ups keep that evidence after the live target is reaped. Other pointer
+    /// kinds and durable replies are not transient target asks and are untouched.
+    ///
     /// No cap eviction here, on purpose: `enqueue_member`'s cap makes room by
     /// DELETING the recipient's oldest undrained notice, and for a disposition
     /// that would drop "your petition was ruled" to admit "your petition was
@@ -479,7 +490,7 @@ impl SqliteInboxStore {
     ) -> Result<Option<u64>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let conn = self.write_conn()?;
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         // Same retention discipline as every other writer on this plane.
         conn.execute(
@@ -495,7 +506,8 @@ impl SqliteInboxStore {
             params![cutoff],
         )
         .context("pruning expired member notices")?;
-        conn.execute(
+        let tx = conn.transaction().context("starting terminal-disposition projection")?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO member_notices
                  (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash,
                   queued_at, disposition_key)
@@ -509,8 +521,26 @@ impl SqliteInboxStore {
                 now.to_rfc3339(),
             ],
         )
-        .context("ensuring disposition obligation")?;
-        Ok((conn.changes() > 0).then(|| conn.last_insert_rowid() as u64))
+        .context("ensuring disposition obligation")? > 0;
+        let inserted_id = tx.last_insert_rowid() as u64;
+        let target = pointer_uri.split('#').next().unwrap_or(pointer_uri);
+        if target.starts_with("hestia://scope/") || target.starts_with("hestia://escalation/") {
+            // The disposition row and this projection of its mootness commit together. Match
+            // the complete id segment, never a string prefix; durable replies and forwarded
+            // rows are deliberately untouched. A projection retry preserves first evidence.
+            tx.execute(
+                "UPDATE member_notices
+                    SET mooted_at = ?2, moot_reason = ?3
+                  WHERE dest_peer IS NULL AND mooted_at IS NULL
+                    AND (pointer_uri = ?1 OR substr(pointer_uri, 1, length(?1) + 1) = ?1 || '#')
+                    AND (kind = 'review_request'
+                         OR substr(kind, 1, length('review_request') + 1) = 'review_request.')",
+                params![target, now.to_rfc3339(), format!("terminal ruling {ruling_hash}")],
+            )
+            .context("marking transient asks moot at their terminal ruling")?;
+        }
+        tx.commit().context("committing terminal-disposition projection")?;
+        Ok(inserted.then_some(inserted_id))
     }
 
     /// The recipient-liveness record (Kimi ↔ CBP, 2026-07-25).
@@ -1357,11 +1387,31 @@ impl SqliteInboxStore {
             .context("recording member queue eviction")?;
             }
         }
+        let moot_target = pointer_uri
+            .filter(|_| kind.split('.').next() == Some("review_request"))
+            .map(|p| p.split('#').next().unwrap_or(p))
+            .filter(|p| p.starts_with("hestia://scope/") || p.starts_with("hestia://escalation/"));
+        // A post-ruling corroboration ask still has review value, but it is not
+        // responsiveness debt. Inherit the earliest terminal disposition in the same INSERT
+        // so live-map reaping cannot make the late row owed again. The dummy input row keeps
+        // ordinary inserts working when no disposition matches.
         conn.execute(
             "INSERT INTO member_notices
                  (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
-                  in_reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  in_reply_to, mooted_at, moot_reason)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                    CASE WHEN d.chain_hash IS NULL THEN NULL ELSE ?9 END,
+                    'terminal ruling ' || d.chain_hash
+               FROM (SELECT 1) AS insert_once
+               LEFT JOIN member_notices AS d ON d.id = (
+                   SELECT d2.id FROM member_notices AS d2
+                    WHERE ?10 IS NOT NULL
+                      AND d2.disposition_key IS NOT NULL
+                      AND d2.dest_peer IS NULL
+                      AND (d2.pointer_uri = ?10
+                           OR substr(d2.pointer_uri, 1, length(?10) + 1) = ?10 || '#')
+                    ORDER BY d2.id ASC LIMIT 1
+               )",
             params![
                 to_plugin,
                 from_plugin,
@@ -1371,6 +1421,8 @@ impl SqliteInboxStore {
                 chain_hash,
                 now.to_rfc3339(),
                 in_reply_to.map(|v| v as i64),
+                now.to_rfc3339(),
+                moot_target,
             ],
         )
         .context("enqueuing member notice")?;
@@ -1673,7 +1725,7 @@ impl SqliteInboxStore {
             .join(" OR ");
         let sql = format!(
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at,
-                    in_reply_to
+                    in_reply_to, mooted_at, moot_reason
              FROM member_notices n
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
                AND n.dest_peer IS NULL
@@ -1710,12 +1762,14 @@ impl SqliteInboxStore {
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at, re) =
-                row?;
+            let (id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at, re,
+                 mooted_at, moot_reason) = row?;
             out.push(UnansweredNotice {
                 id: id as u64,
                 in_reply_to: re.map(|r| r as u64),
@@ -1734,6 +1788,15 @@ impl SqliteInboxStore {
                     ),
                     None => None,
                 },
+                mooted_at: match mooted_at {
+                    Some(d) => Some(
+                        DateTime::parse_from_rfc3339(&d)
+                            .context("parsing unanswered mooted_at")?
+                            .with_timezone(&Utc),
+                    ),
+                    None => None,
+                },
+                moot_reason,
             });
         }
         Ok(out)
@@ -2015,6 +2078,12 @@ pub struct UnansweredNotice {
     /// forces the reader to group by a proxy. Whether a debt is a duplicate is a
     /// question about bindings, and the reader could not see them.
     pub in_reply_to: Option<u64>,
+    /// Present only when a terminal scope/escalation disposition marked this transient ask.
+    /// Live read-time derivation leaves both fields null; the handler requires both before
+    /// treating the mark as durable evidence.
+    pub mooted_at: Option<DateTime<Utc>>,
+    /// The terminal ruling hash whose disposition produced `mooted_at`.
+    pub moot_reason: Option<String>,
 }
 
 /// One notice awaiting hand-off to the fleet mesh (r6-routing branch 2).
@@ -3851,6 +3920,89 @@ mod tests {
         assert!(store.inbox_touch("codex-cli").unwrap().is_none());
     }
 
+    #[test]
+    fn terminal_disposition_durably_moots_only_matching_transient_asks() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("inbox.db");
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        for (i, (kind, pointer)) in [
+            ("review_request", "hestia://escalation/a#corroborate-or-dissent"),
+            ("review_request.pr", "hestia://escalation/a#corroborate-or-dissent"),
+            ("reply", "hestia://escalation/a#corroborate-or-dissent;still-content"),
+            ("review_request", "hestia://escalation/ab#corroborate-or-dissent"),
+            ("review_request", "hestia://appeal/a#peer-decide"),
+            ("review_request", "pr/1354"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                                kind, Some(pointer), &format!("ask-{i}"), None)
+                .unwrap();
+        }
+        store
+            .ensure_member_disposition("claude-code", "disposition",
+                                       "hestia://escalation/a#decided", "ruling-a")
+            .unwrap();
+        store
+            .ensure_member_disposition("claude-code", "disposition",
+                                       "hestia://appeal/a#ruled", "appeal-ruling")
+            .unwrap();
+        for (kind, chain_hash) in [("review_request.pr", "ask-late"), ("reply", "reply-late")] {
+            store
+                .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                                kind,
+                                Some("hestia://escalation/a#corroborate-or-dissent;late-follow-up"),
+                                chain_hash, None)
+                .unwrap();
+        }
+
+        let evidence = |store: &SqliteInboxStore| {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT pointer_uri, mooted_at, moot_reason FROM member_notices
+                          WHERE from_plugin = 'claude-code' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let rows = evidence(&store);
+        for row in &rows[..2] {
+            assert!(row.1.is_some(), "transient ask needs durable moot evidence: {rows:?}");
+            assert!(row.2.as_deref().unwrap_or_default().contains("ruling-a"), "{rows:?}");
+        }
+        assert_eq!((rows[2].1.as_deref(), rows[2].2.as_deref()), (None, None),
+                   "a durable reply never moots: {rows:?}");
+        assert_eq!((rows[3].1.as_deref(), rows[3].2.as_deref()), (None, None),
+                   "the id is a complete path segment, never a string prefix: {rows:?}");
+        for row in &rows[4..6] {
+            assert_eq!((row.1.as_deref(), row.2.as_deref()), (None, None),
+                       "appeals and durable pointers are not transient target asks: {rows:?}");
+        }
+        assert!(rows[6].1.is_some(),
+                "an ask enqueued after the ruling inherits its durable evidence: {rows:?}");
+        assert!(rows[6].2.as_deref().unwrap_or_default().contains("ruling-a"), "{rows:?}");
+        assert_eq!((rows[7].1.as_deref(), rows[7].2.as_deref()), (None, None),
+                   "a late durable reply is still content, not a transient ask: {rows:?}");
+        let first_stamp = rows[0].1.clone();
+        drop(store);
+
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        assert_eq!(evidence(&store)[0].1, first_stamp, "the mark must survive reopen");
+        store
+            .ensure_member_disposition("claude-code", "disposition",
+                                       "hestia://escalation/a#decided", "ruling-a-later")
+            .unwrap();
+        assert_eq!(evidence(&store)[0].1, first_stamp,
+                   "projection retries must not rewrite the first terminal evidence");
+    }
+
     /// A pre-id-binding inbox.db must upgrade in place, not fail to open.
     #[test]
     fn member_schema_migrates_from_the_pre_binding_shape() {
@@ -3879,6 +4031,10 @@ mod tests {
         let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
         // The legacy row is pending (drained_at NULL) and queryable under the new columns.
         assert_eq!(store.member_pending("kimi-code").unwrap(), 1);
+        let unanswered = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
+        assert_eq!(unanswered.len(), 1);
+        assert!(unanswered[0].mooted_at.is_none());
+        assert!(unanswered[0].moot_reason.is_none());
         let drained = store.drain_member("kimi-code").unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].in_reply_to, None);
