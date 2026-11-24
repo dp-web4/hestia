@@ -574,9 +574,15 @@ def send_operation_id_from_argv():
     return None
 
 
-def presented_ids(text):
-    """Exact invitation pointers rendered into one completed member wake, without duplicates."""
-    return list(dict.fromkeys(re.findall(r"hestia://escalation/([0-9a-f]{16})(?![0-9a-f])", text)))
+def presented_invitations(text):
+    """(escalation_id, notice_id) pairs rendered into one completed wake, first notice wins."""
+    invitations = {}
+    for line in text.splitlines():
+        notice = re.search(r"\bid=(\d+)\b", line)
+        pointer = re.search(r"hestia://escalation/([0-9a-f]{16})(?![0-9a-f])", line)
+        if notice and pointer:
+            invitations.setdefault(pointer.group(1), int(notice.group(1)))
+    return list(invitations.items())
 
 
 def main():
@@ -612,8 +618,8 @@ def main():
 
 
 def act(cmd):
-    invitation_ids = presented_ids(sys.stdin.read()) if cmd == "presented" else []
-    if cmd == "presented" and not invitation_ids:
+    invitations = presented_invitations(sys.stdin.read()) if cmd == "presented" else []
+    if cmd == "presented" and not invitations:
         print(json.dumps({"member": PLUGIN, "observations": []}, indent=1))
         return
     # The duplicate check runs BEFORE connect(), not inside the send branch below.
@@ -689,18 +695,21 @@ def act(cmd):
             args["older_than_secs"] = int(sys.argv[2])
         out = rpc(h, "hestia_member_unanswered", args)
     elif cmd == "presented":
-        observations = []
-        for escalation_id in invitation_ids:
+        observations, refusals = [], []
+        for escalation_id, notice_id in invitations:
             result = rpc(h, "hestia_gate_escalation_presented",
-                         {"session_id": s, "escalation_id": escalation_id})
+                         {"session_id": s, "escalation_id": escalation_id,
+                          "notice_id": notice_id})
             if failed(result):
-                if "not invited" in json.dumps(result):
+                if "not invited" in json.dumps(result) or "not pending" in json.dumps(result):
                     continue
-                out = dict(result, observations=observations)
-                break
+                refusals.append(result)
+                continue
             observations.append(result)
-        else:
-            out = {"member": PLUGIN, "observations": observations}
+        out = {"member": PLUGIN, "observations": observations}
+        if refusals:
+            out["errors"] = refusals
+            out["_hestia_error"] = refusals[0].get("_hestia_error", {})
     else:
         # already_sent() ran above, before connect(). session_id is added here and is
         # deliberately NOT part of resend_key(): a fresh session is not a new act.

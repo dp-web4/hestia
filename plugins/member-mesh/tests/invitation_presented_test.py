@@ -16,6 +16,7 @@ CLI = os.environ.get("HESTIA_MESH_CLI") or str(HERE.parent / "hestia-mesh.py")
 CALLS = []
 FAIL_ON = set()
 NOT_INVITED_ON = set()
+SETTLED_ON = set()
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -42,6 +43,9 @@ class Stub(BaseHTTPRequestHandler):
                 return self._sse(body["id"], {"_hestia_error": {
                     "code": "hestia.test.not_invited",
                     "message": f"{args['escalation_id']} was not invited to escalation; refusing an unbound observation"}})
+            if args["escalation_id"] in SETTLED_ON:
+                return self._sse(body["id"], {"_hestia_error": {
+                    "code": "hestia.test.settled", "message": "escalation is Approved, not pending"}})
             if args["escalation_id"] in FAIL_ON:
                 return self._sse(body["id"], {"_hestia_error": {
                     "code": "hestia.test.transport", "message": "transport failed"}})
@@ -89,6 +93,7 @@ class PresentedTest(unittest.TestCase):
         CALLS.clear()
         FAIL_ON.clear()
         NOT_INVITED_ON.clear()
+        SETTLED_ON.clear()
 
     def run_cli(self, text):
         env = dict(os.environ, HESTIA_ENDPOINT=self.endpoint,
@@ -111,6 +116,7 @@ class PresentedTest(unittest.TestCase):
         rc, out, err = self.run_cli(digest)
         self.assertEqual(rc, 0, err)
         self.assertEqual([call["escalation_id"] for call in CALLS], [a, b])
+        self.assertEqual([call["notice_id"] for call in CALLS], [1, 3])
         self.assertTrue(all(call["session_id"] == "s-1" for call in CALLS))
         payload = json.loads(out)
         self.assertEqual(payload["member"], "test-member")
@@ -127,22 +133,37 @@ class PresentedTest(unittest.TestCase):
         a = "0123456789abcdef"
         b = "fedcba9876543210"
         FAIL_ON.add(b)
+        c = "1111111111111111"
         rc, out, err = self.run_cli(
-            f"hestia://escalation/{a} hestia://escalation/{b}")
+            f"id=1 hestia://escalation/{a}\nid=2 hestia://escalation/{b}\nid=3 hestia://escalation/{c}")
         self.assertEqual(rc, 3, err)
         payload = json.loads(out)
-        self.assertEqual(len(payload["observations"]), 1)
+        self.assertEqual(len(payload["observations"]), 2)
         self.assertEqual(payload["observations"][0]["escalation_id"], a)
+        self.assertEqual(payload["observations"][1]["escalation_id"], c)
         self.assertIn("_hestia_error", payload)
-        self.assertEqual(len(CALLS), 2)
+        self.assertEqual(len(CALLS), 3)
 
     def test_not_invited_disposition_does_not_drop_later_invitations(self):
         own = "aaaaaaaaaaaaaaaa"
         invited = "bbbbbbbbbbbbbbbb"
         NOT_INVITED_ON.add(own)
-        rc, out, err = self.run_cli(f"hestia://escalation/{own}#decided hestia://escalation/{invited}#review")
+        rc, out, err = self.run_cli(
+            f"id=10 hestia://escalation/{own}#decided\nid=11 hestia://escalation/{invited}#review")
         self.assertEqual(rc, 0, err)
         self.assertEqual([call["escalation_id"] for call in CALLS], [own, invited])
+        payload = json.loads(out)
+        self.assertEqual([row["escalation_id"] for row in payload["observations"]], [invited])
+
+    def test_settled_disposition_does_not_drop_later_invitations(self):
+        own = "aaaaaaaaaaaaaaaa"
+        invited = "bbbbbbbbbbbbbbbb"
+        SETTLED_ON.add(own)
+        rc, out, err = self.run_cli(
+            f"id=10 hestia://escalation/{own}#decided\nid=11 hestia://escalation/{invited}#review")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([call["escalation_id"] for call in CALLS], [own, invited])
+        self.assertEqual([call["notice_id"] for call in CALLS], [10, 11])
         payload = json.loads(out)
         self.assertEqual([row["escalation_id"] for row in payload["observations"]], [invited])
 
@@ -194,6 +215,7 @@ class PresentedTest(unittest.TestCase):
                 self.assertEqual([call["escalation_id"] for call in calls],
                                  ["0123456789abcdef"], output)
                 self.assertTrue(all(call["session_id"] == "s-1" for call in calls), output)
+                self.assertTrue(all(call["notice_id"] == 1 for call in calls), output)
             CALLS.clear()
             with self.subTest(script=script, outcome="member failed"):
                 rc, output, calls = self.run_fire(script, executable, sender, member, 3)
