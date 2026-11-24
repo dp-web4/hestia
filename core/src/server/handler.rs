@@ -28623,7 +28623,10 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
             Some(e) => e.claim_note(now),
             None if history_lookup == "terminal" => "terminal record recovered from the witness \
                                                      chain; permits_write stays false because no \
-                                                     spend authority is restored",
+                                                     spend authority is restored. To act on it, \
+                                                     open a new escalation for the act and cite \
+                                                     this id: the recovered ruling is evidence \
+                                                     for the decider, not a claim",
             None if history_lookup == "opened" => "the recovered open record has no live ruling \
                                                    path: treated as expired and permits_write stays \
                                                    false",
