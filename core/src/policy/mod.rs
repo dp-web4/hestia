@@ -18,6 +18,7 @@
 pub mod engine;
 pub mod extract;
 mod law_gate;
+pub mod lawbook;
 pub mod matchers;
 pub mod preamble;
 pub mod presets;
