@@ -9348,47 +9348,51 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
-    // #1354: a transient ask dies with its target. A `review_request` row whose
-    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
-    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
-    // is read-time against the live request map — no sweep — so a request the map
-    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
-    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
-    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
-    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
-    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
-    // terminal transition) is #1354's named follow-up, not this slice.
+    // #1354: a transient ask dies with its terminal scope/escalation target. The
+    // disposition projection durably marks that evidence; a live terminal target is also
+    // recognized at read time, without a sweep or a mutation by this read-only tool. Once
+    // live evidence is gone (scope eviction, escalation reaping, restart), an unmarked row
+    // fails back to owed: unknown is NOT moot. Durable marks do not un-derive.
     //
     // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
-    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
-    // recipient is still owed — mooting it would silently erase debt. The match is
-    // by kind ROOT, because the send gate admits dotted specializations
-    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
-    // must agree here too.
+    // target. A durable `reply` carrying a terminal target is CONTENT the recipient is
+    // still owed — mooting it would silently erase debt. The match is by kind ROOT, because
+    // the send gate admits dotted specializations (review_request.pr) and the ledger's own
+    // kind matching is by prefix; the two must agree here too.
     //
     // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
     // the misroute is sender-actionable, mootness is not.
     let now = super::gate_escalation::now_secs();
-    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
-        if kind.split('.').next() != Some("review_request") {
+    let target_moot = |n: &crate::storage::inbox::UnansweredNotice| -> bool {
+        if n.kind.split('.').next() != Some("review_request") {
             return false;
         }
-        let Some(p) = pointer_uri.as_deref() else {
+        if n.mooted_at.is_some()
+            && n.moot_reason.as_deref().is_some_and(|r| !r.trim().is_empty())
+        {
+            return true;
+        }
+        let Some(p) = n.pointer_uri.as_deref() else {
             return false;
         };
-        let Some(rest) = p.strip_prefix("hestia://scope/") else {
-            return false;
-        };
-        let id = rest.split('#').next().unwrap_or(rest);
-        match s.scope_requests.get(id) {
-            Some(req) => {
+        if let Some(rest) = p.strip_prefix("hestia://scope/") {
+            let id = rest.split('#').next().unwrap_or(rest);
+            return s.scope_requests.get(id).is_some_and(|req| {
                 req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
-            }
-            None => false,
+            });
         }
+        if let Some(rest) = p.strip_prefix("hestia://escalation/") {
+            let id = rest.split('#').next().unwrap_or(rest);
+            // status_of deliberately maps an UNKNOWN id to Expired for gate denial. Mootness
+            // is evidence classification instead: only a record actually present can be terminal.
+            return s.gate_escalations.get(id).is_some_and(|esc| {
+                esc.status_at(now) != super::gate_escalation::Status::Pending
+            });
+        }
+        false
     };
     let (mine, mine_moot): (Vec<_>, Vec<_>) =
-        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
+        mine.into_iter().partition(|n| !target_moot(&n));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
@@ -9398,7 +9402,7 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
-            let moot = scope_moot(&n.kind, &n.pointer_uri);
+            let moot = target_moot(&n);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
@@ -9422,15 +9426,19 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe_moot": mine_moot,
         "owed_to_me_moot": theirs_moot,
         "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
-                       reply never moots) whose pointer names a scope request that is \
-                       TERMINAL (ruled, revoked, or past its window), derived at read \
-                       time against the live request map — no sweep (#1354). A request \
-                       the memory-only map no longer holds reads UNKNOWN, and unknown \
-                       stays owed: absence of evidence is not mootness. Eviction or \
-                       restart therefore reverts moot -> owed; that non-monotonicity is \
-                       intentional until durable mooted_at evidence lands (the #1354 \
-                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
-                       outranks mootness — the misroute is sender-actionable.",
+                       reply never moots) whose scope/escalation target is terminal. Moot means \
+                       no longer counted as responsiveness debt, not that late review is \
+                       worthless: a factor filed now is still recorded. A terminal disposition \
+                       durably marks mooted_at and moot_reason on rows already queued and on \
+                       late asks enqueued after the ruling; those marks survive map eviction, \
+                       escalation reaping, and restart. A still-live target can also be derived \
+                       at read time, with no sweep and no mutation by this read-only tool. An \
+                       undecided scope request whose window merely lapses has no disposition, \
+                       so its live-derived mootness returns to owed after map eviction or \
+                       restart; the same fail-back applies to every unmarked target. An absent \
+                       target is UNKNOWN, never terminal. In owed_to_me a misroute \
+                       (recipient_liveness unknown) outranks mootness — the misroute is \
+                       sender-actionable (#1354).",
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null means the drain mark is absent; a peek may still \
                   have seen it. A mark does not prove it was returned or read; \
@@ -9558,6 +9566,8 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(json!({ "total": 0, "secrets": [], "note": "no hub connection" }));
     };
 
+    let rest_endpoint = crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)?;
+
     // Member identity keypair — same load path as tool_inbox.
     let secret_hex = s
         .vault
@@ -9578,7 +9588,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     for p in &snapshot {
         // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
         let detail = match client
-            .get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id)
+            .get_pair(&rest_endpoint, conn.hub_lct_id, p.pair_id)
             .await
         {
             Ok(d) if d.is_active() => d,
@@ -9590,7 +9600,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         };
         let since = pairings.cursor(&p.pair_id);
         let msgs = match client
-            .get_pair_messages(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id, since)
+            .get_pair_messages(&rest_endpoint, conn.hub_lct_id, p.pair_id, since)
             .await
         {
             Ok(m) => m,
@@ -14103,9 +14113,9 @@ mod member_mesh_tests {
     /// post-restart every id is unknown, and unknown fails toward owed), a durable
     /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
     /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
-    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
-    /// request from the map moves the row BACK to owed (moot -> owed): read-time
-    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// dotted specialization of the ask kind moots exactly like its root. Without durable
+    /// evidence, evicting the request moves a live-derived row BACK to owed (moot -> owed).
+    /// Once the terminal disposition marks mooted_at/moot_reason, eviction cannot un-moot it.
     /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
     /// because the misroute is the sender-actionable signal. Binding to a mooted row
     /// still works: mootness reclassifies the debt, it does not close the row.
@@ -14243,12 +14253,10 @@ mod member_mesh_tests {
         assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
         assert_eq!(owed_moot.len(), 1, "{rows}");
 
-        // Eviction/restart regression (dp-web4 review of #1357): the request map is
-        // memory-only, so losing the request must move the row BACK to owed. Mootness
-        // is a read-time property of available evidence, not a row state — the
-        // non-monotonicity is intentional until durable `mooted_at` evidence lands
-        // (the #1354 follow-up), and this transition is the proof it fails toward
-        // visibility rather than silently staying moot.
+        // Eviction/restart regression (dp-web4 review of #1357): with no terminal
+        // disposition yet, mootness is only derived from the live request. Losing that
+        // evidence must move the row BACK to owed rather than silently staying moot.
+        // The next block proves the durable-mark arm does not revert.
         {
             let mut s = state.lock().await;
             s.scope_requests.remove("scope-moot-decided");
@@ -14278,6 +14286,49 @@ mod member_mesh_tests {
         assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
                 "nothing stays moot on absent evidence: {rows2}");
 
+        // The terminal disposition carries durable evidence. Once it has landed, eviction of
+        // the memory-only request cannot resurrect the transient ask as debt.
+        {
+            let s = state.lock().await;
+            ensure_disposition(&s, "cbp-being", "hestia://scope/scope-moot-decided",
+                               "scope-ruling-hash");
+        }
+        let late_scope_ptr =
+            "hestia://scope/scope-moot-decided#peer-decide;late-after-eviction";
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_scope_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let rows3 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let durable = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == "hestia://scope/scope-moot-decided#peer-decide")
+            .unwrap_or_else(|| panic!("durable scope mootness survives eviction: {rows3}"));
+        assert!(durable["mooted_at"].is_string(), "{rows3}");
+        assert!(durable["moot_reason"].as_str().unwrap_or_default().contains("scope-ruling-hash"),
+                "the evidence names the ruling that made it moot: {rows3}");
+        let late_scope = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_scope_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling scope ask inherits durable mootness: {rows3}")
+            });
+        assert!(late_scope["mooted_at"].is_string(), "{rows3}");
+        assert!(late_scope["moot_reason"].as_str().unwrap_or_default()
+                .contains("scope-ruling-hash"), "{rows3}");
+
         // Mootness reclassifies; it does not close. The ASKED member can still bind late.
         let late = tool_member_notify(
             &state,
@@ -14288,6 +14339,134 @@ mod member_mesh_tests {
         .await
         .unwrap();
         assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
+    }
+
+    #[tokio::test]
+    async fn unanswered_moots_terminal_escalations_without_treating_unknown_as_expired() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = now_secs();
+        let (decided, expired, pending) = {
+            let mut s = state.lock().await;
+            let decided = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now, 3600)
+                .unwrap()
+                .id;
+            s.gate_escalations
+                .decide(&decided, false, "claude-code", "role:constellation:member",
+                        Channel::SelfWithdrawn, None, Some("false positive"), now)
+                .unwrap();
+            let expired = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now - 10, 1)
+                .unwrap()
+                .id;
+            let pending = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now, 3600)
+                .unwrap()
+                .id;
+            (decided, expired, pending)
+        };
+        let decided_ptr = format!("hestia://escalation/{decided}#corroborate-or-dissent");
+        let expired_ptr = format!("hestia://escalation/{expired}#corroborate-or-dissent");
+        let pending_ptr = format!("hestia://escalation/{pending}#corroborate-or-dissent");
+        let unknown_ptr = "hestia://escalation/not-present#corroborate-or-dissent";
+        for (kind, pointer) in [
+            ("review_request", decided_ptr.as_str()),
+            ("review_request", expired_ptr.as_str()),
+            ("review_request.pr", expired_ptr.as_str()),
+            ("review_request", pending_ptr.as_str()),
+            ("review_request", unknown_ptr),
+            ("reply", decided_ptr.as_str()),
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": kind,
+                        "pointer_uri": pointer, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let pointers = |rows: &Value, key: &str| {
+            rows[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["pointer_uri"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for ptr in [&decided_ptr, &expired_ptr] {
+            assert!(pointers(&rows, "i_owe_moot").contains(ptr),
+                    "a live terminal escalation moots its transient ask: {rows}");
+        }
+        for ptr in [&pending_ptr, &unknown_ptr.to_string()] {
+            assert!(pointers(&rows, "i_owe").contains(ptr),
+                    "pending and UNKNOWN targets stay owed: {rows}");
+        }
+        assert!(rows["i_owe"].as_array().unwrap().iter().any(|r|
+                r["kind"] == "reply" && r["pointer_uri"] == decided_ptr),
+                "a durable reply remains content even when its target is terminal: {rows}");
+
+        {
+            let s = state.lock().await;
+            ensure_disposition(&s, "claude-code",
+                               &format!("hestia://escalation/{decided}#withdrawn"),
+                               "withdrawn-ruling-hash");
+        }
+        let late_ptr = format!("{decided_ptr};exact-reviewed-v2-late-follow-up");
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        {
+            let mut s = state.lock().await;
+            s.gate_escalations.reap(now + 7200, 0);
+        }
+        let after = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let durable = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == decided_ptr)
+            .unwrap_or_else(|| panic!("terminal evidence survives escalation eviction: {after}"));
+        assert!(durable["mooted_at"].is_string(), "{after}");
+        assert!(durable["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        let late = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling ask keeps durable mootness after reaping: {after}")
+            });
+        assert!(late["mooted_at"].is_string(), "{after}");
+        assert!(late["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        assert!(pointers(&after, "i_owe").contains(&expired_ptr),
+                "an unmarked expired row fails back to owed after its live evidence is gone: {after}");
+        assert!(!pointers(&after, "i_owe_moot").contains(&pending_ptr),
+                "a pending ask never becomes moot merely because its live row was reaped: {after}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
@@ -24874,6 +25053,75 @@ mod appeal_tests {
         );
     }
 
+    /// #823: a factor whose own evidence append fails must not remain visible to the
+    /// decider. The retry writes one attributable event, and replay reconstructs that
+    /// same factor without manufacturing events for historical snapshot-only factors.
+    #[tokio::test]
+    async fn an_unwitnessed_corroboration_leaves_no_decision_relevant_factor() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let args = json!({
+            "escalation_id": esc_id, "session_id": peer_sid.to_string(),
+            "stance": "dissent", "argument": "the proposed rule is broader than its evidence",
+        });
+
+        // Let factor validation and state mutation succeed while the witness write fails.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let failed = tool_gate_escalation_corroborate(&state, &args).await;
+        assert!(failed.is_err(), "an unwitnessed factor cannot report success: {failed:?}");
+        {
+            let s = state.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).expect("the prior escalation remains");
+            assert!(esc.factors.is_empty(), "the failed factor never became live: {esc:?}");
+            // NOVA (#1650): the bar this factor WOULD meet (asserted after the retry) is not
+            // met by the transient one — an evidence append failure has no approval effect.
+            assert!(!esc.bar_met(), "an unwitnessed factor does not meet the bar: {esc:?}");
+            assert!(s.chain_store.read_recent(500).unwrap().iter()
+                .all(|e| e.event_type != "gate_escalation_corroborated"),
+                "the failed append left no canonical factor event");
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let recorded = tool_gate_escalation_corroborate(&state, &args).await.unwrap();
+        assert!(recorded["witnessEntryHash"].is_string(), "the retry is durable: {recorded}");
+        assert_eq!(recorded["factors_present"].as_array().unwrap().len(), 1);
+        let s = state.lock().await;
+        assert!(s.gate_escalations.get(&esc_id).unwrap().bar_met(),
+                "the same factor, once witnessed, meets the bar the failed attempt did not");
+        let mut chain = s.chain_store.read_recent(500).unwrap();
+        chain.reverse();
+        let events: Vec<_> = chain.iter()
+            .filter(|e| e.event_type == "gate_escalation_corroborated")
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one canonical factor record");
+        assert_eq!(events[0].event_data["corroborated_by"], "codex");
+        assert_eq!(events[0].event_data["stance"], "dissent");
+        assert_eq!(events[0].event_data["argument"], "the proposed rule is broader than its evidence");
+
+        let mut replayed = crate::server::gate_escalation::EscalationStore::default();
+        replayed.rehydrate(&chain, crate::server::gate_escalation::now_secs());
+        let replayed_esc = replayed.get(&esc_id).expect("the committed factor replays");
+        assert_eq!(replayed_esc.factors.len(), 1);
+        assert_eq!(replayed_esc.factors[0].by, "codex");
+        assert!(replayed_esc.factors[0].dissent);
+        assert_eq!(replayed_esc.factors[0].argument.as_deref(),
+                   Some("the proposed rule is broader than its evidence"));
+        assert_eq!(serde_json::to_value(&replayed_esc.factors).unwrap(),
+                   recorded["factors_present"]);
+    }
+
     /// Revised #480 review, defect 2: WITNESS IS FINALITY. If the
     /// `gate_escalation_decided` append fails, the decision must not stand — the
     /// store is rolled back to Pending, nothing is claimable, and the caller gets
@@ -25235,6 +25483,34 @@ mod authority_attribution_tests {
             format!("{r}").contains("pair_inbox_unattributed"),
             "an unattributed paired-channel drain must be refused: {r}"
         );
+    }
+
+    #[tokio::test]
+    async fn pair_inbox_rejects_a_cross_origin_stored_endpoint_before_dialing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat_session(&state, "bystander-member").await;
+        {
+            let mut s = state.lock().await;
+            let mut store = crate::hub::HubStore::default();
+            store.connections.push(crate::hub::HubConnection {
+                id: Uuid::new_v4(),
+                url: "https://hub.example".into(),
+                hub_lct_id: Uuid::new_v4(),
+                our_lct_id: Uuid::new_v4(),
+                connected_at: Utc::now(),
+                last_seen: None,
+                api_version: "v1".into(),
+                rest_endpoint: "https://evil.example/v1".into(),
+                hubs_joined: vec![],
+                member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            });
+            store.save(&mut s.vault).unwrap();
+        }
+        let err = tool_pair_inbox(&state, &json!({"session_id": sid.to_string()}))
+            .await
+            .expect_err("a stored cross-origin endpoint must be refused before dialing");
+        assert!(err.to_string().contains("cross-origin discovery endpoint refused"), "{err}");
     }
 
     /// The fifth site, caught in review of this PR's own "zero call sites" claim:
@@ -30411,6 +30687,16 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "bar_met_if_decided_now": updated.bar_met(),
                 }),
             );
+            let witness_hash = match entry {
+                Ok(e) => e.hash,
+                Err(append_err) => {
+                    s.gate_escalations.undo_corroborate(esc);
+                    return Err(anyhow::anyhow!(
+                        "corroboration NOT recorded — its witness append failed ({append_err}); \
+                         the escalation is unchanged and no factor was added"
+                    ));
+                }
+            };
             Ok(json!({
                 "escalation_id": updated.id,
                 // `corroborated` keeps its original meaning — "your CONCURRENCE landed" —
@@ -30425,7 +30711,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "post_claim": updated.consumed_at.is_some(),
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
-                "witnessEntryHash": entry.ok().map(|e| e.hash),
+                "witnessEntryHash": witness_hash,
                 "note": if dissent {
                     "your dissent is ON THE RECORD as evidence for review — never a veto: \
                      the sovereign decision stands or lands regardless, with your argument \
@@ -31987,6 +32273,71 @@ mod disposition_durability_tests {
             notes[0].pointer_uri.as_deref(),
             Some("hestia://escalation/esc-fail1#decided")
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_moot_update_rolls_back_and_rebuilds_after_restart() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, ruling_hash, ruling_pos) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            assert_eq!(project_dispositions(&handles.0, &handles.1).unwrap().projected, 0);
+            s.inbox_store.enqueue_member(
+                "kimi-code", "claude-code", "role:constellation:interactive-dev",
+                "review_request", Some("hestia://escalation/esc-rollback#corroborate-or-dissent"),
+                "ask-rollback", None,
+            ).unwrap();
+            let e = s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": "esc-rollback", "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit", "status": "approved", "decided_by": "operator",
+                }),
+            ).unwrap();
+            (handles.0, handles.1, e.hash, e.chain_position)
+        };
+
+        let injected = raw_inbox_conn(&dir);
+        injected.execute_batch(
+            "CREATE TRIGGER fail_moot_update BEFORE UPDATE OF mooted_at, moot_reason ON member_notices
+             BEGIN SELECT RAISE(FAIL, 'injected moot update'); END;",
+        ).unwrap();
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                ensure_disposition(&s, "kimi-code", "hestia://escalation/esc-rollback#decided", &ruling_hash),
+                None,
+            );
+        }
+        assert_eq!(count_dispositions(&injected, false), 0, "the disposition insert rolled back");
+        let mooted_at: Option<String> = injected.query_row(
+            "SELECT mooted_at FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(mooted_at.is_none(), "the failed moot update rolled back too");
+        injected.execute_batch("DROP TRIGGER fail_moot_update").unwrap();
+        assert_eq!(inbox.projection_cursor("disposition").unwrap(), Some(ruling_pos));
+
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1);
+        assert_eq!(pass.advanced_to, ruling_pos + 1);
+        drop(injected);
+        drop(state);
+
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.inbox_store.clone())
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 0);
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(count_dispositions(&conn, false), 1);
+        let moot_reason: String = conn.query_row(
+            "SELECT moot_reason FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(moot_reason.contains(&ruling_hash), "the rebuilt moot evidence lost its ruling: {moot_reason}");
     }
 
     /// Reviewer test 2: a restart between the ruling and the projection — the
