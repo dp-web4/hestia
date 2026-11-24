@@ -412,12 +412,15 @@ def test_json_member_merges_without_disturbing_other_keys():
         assert "ok    claude-code" in r2.stdout and json.loads(cfg.read_text()) == data
 
 
-def _claude_foreign_witness_config(tmp, owned=False):
+def _claude_foreign_witness_config(tmp, owned=False, failure=False):
     commands = [{"type": "command", "command": "python3 /opt/foreign/witness.py", "timeout": 3}]
     if owned:
         commands.append({"type": "command",
                          "command": f"python3 {tmp}/.claude/hooks/hestia/witness.py", "timeout": 3})
-    return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": commands}]}}
+    hooks = {"PostToolUse": [{"matcher": "*", "hooks": commands}]}
+    if failure:
+        hooks["PostToolUseFailure"] = [{"matcher": "*", "hooks": commands}]
+    return {"hooks": hooks}
 
 
 def test_foreign_success_witness_leaves_failure_gap_visible():
@@ -451,6 +454,65 @@ def test_owned_and_foreign_success_witnesses_do_not_suppress_failure_registratio
         data = json.loads(cfg.read_text())
         assert any(h["command"].endswith("witness.py")
                    for group in data["hooks"]["PostToolUseFailure"] for h in group["hooks"])
+
+
+def test_daemon_shaped_outcome_witness_is_not_reported_uncovered():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".claude" / "settings.json"
+        cfg.parent.mkdir()
+        command = {"type": "command", "command": f"python3 {REPO}/plugins/claude-code/hooks/witness.py",
+                   "timeout": 3}
+        cfg.write_text(json.dumps({"hooks": {
+            "PostToolUse": [{"matcher": "*", "hooks": [command]}],
+            "PostToolUseFailure": [{"matcher": "*", "hooks": [command]}]}}))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "UNCOVERED" not in r.stdout, r.stdout
+        r2 = _run(tmp, plugins, "--member", "claude-code")
+        assert "partial claude-code" not in r2.stdout and "UNCOVERED" not in r2.stdout, r2.stdout
+        assert "ok    claude-code" in r2.stdout and "every templated hook is registered" in r2.stdout, r2.stdout
+
+
+def test_foreign_failure_witness_is_coverage_not_an_uncovered_seat():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".claude" / "settings.json"
+        cfg.parent.mkdir()
+        cfg.write_text(json.dumps(_claude_foreign_witness_config(tmp, failure=True)))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "UNCOVERED" not in r.stdout, r.stdout
+        r2 = _run(tmp, plugins, "--member", "claude-code")
+        assert "partial claude-code" not in r2.stdout and "UNCOVERED" not in r2.stdout, r2.stdout
+        assert "ok    claude-code" in r2.stdout and "every templated hook is registered" in r2.stdout, r2.stdout
+
+
+def test_codex_success_only_template_does_not_invent_a_failure_gap():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text("""[[hooks.PostToolUse]]
+matcher = \".*\"
+
+[[hooks.PostToolUse.hooks]]
+type = \"command\"
+command = \"python3 /opt/foreign/witness.py\"
+timeout = 10
+""")
+        _install(tmp, "codex", "pre_tool_use.py", "observe.sh", "witness.py", "hydrate.sh", *_MESH_FILES)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "UNCOVERED" not in r.stdout, r.stdout
+        r2 = _run(tmp, plugins, "--member", "codex")
+        assert "partial codex" not in r2.stdout and "UNCOVERED" not in r2.stdout, r2.stdout
+        assert "ok    codex" in r2.stdout and "every templated hook is registered" in r2.stdout, r2.stdout
 
 
 def test_a_harness_not_on_this_host_is_not_minted():
@@ -2133,6 +2195,9 @@ TESTS = [
     test_json_member_merges_without_disturbing_other_keys,
     test_foreign_success_witness_leaves_failure_gap_visible,
     test_owned_and_foreign_success_witnesses_do_not_suppress_failure_registration,
+    test_daemon_shaped_outcome_witness_is_not_reported_uncovered,
+    test_foreign_failure_witness_is_coverage_not_an_uncovered_seat,
+    test_codex_success_only_template_does_not_invent_a_failure_gap,
     test_a_harness_not_on_this_host_is_not_minted,
     test_unrendered_placeholder_refuses,
     test_dry_run_writes_nothing,

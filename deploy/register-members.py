@@ -1127,7 +1127,9 @@ def prepare_member(member: str, spec: dict, template: dict, home: str, *, dry: b
                        and os.path.normpath(r.target) not in post_targets for r in regs)
     owned_post = any(r.event == "PostToolUse" and r.base == "witness.py"
                      and os.path.normpath(r.target) in post_targets for r in regs)
-    uncovered_failure = foreign_post and not owned_post
+    wants_failure = any(d.event == "PostToolUseFailure" and d.base == "witness.py" for d in L.desired)
+    has_failure = any(r.event == "PostToolUseFailure" and r.base == "witness.py" for r in regs)
+    uncovered_failure = foreign_post and not owned_post and wants_failure and not has_failure
     if uncovered_failure:
         # A foreign witness owns the whole outcome lifecycle. Do not split success and failure
         # across two witnesses by installing Hestia only for failures, but name the uncovered seat.
