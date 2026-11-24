@@ -32,6 +32,15 @@ def function_source(name):
 
 check("the feed projects through the snapshot's live pending set",
       "projectEscalations(source, livePendingIds(lastData))" in ui)
+# Snapshot consistency (NOVA 11-22): the pending set the projection reads must come from the
+# SAME `/api/dashboard` response as the rows it projects. `renderFeed` reads pending from
+# `lastData`, so every caller must pass that snapshot's own `recent`, and `lastData` must be
+# assigned before the render that uses it.
+feed_calls = re.findall(r"renderFeed\(([^)]*)\);", ui)
+check("every renderFeed call passes the current snapshot's own recent rows",
+      feed_calls and all(a in ("data.recent", "lastData.recent") for a in feed_calls), feed_calls)
+check("lastData is the snapshot being rendered (assigned before rerender)",
+      re.search(r"lastData = data;\s*\n\s*rerender\(data\);", ui) is not None)
 check("the renderer consumes the escalation view", "if (escView)" in ui)
 check("the event label says escalation", "escView ? 'escalation' : e.event_type" in ui)
 check("the feed detail is rendered only through escapeHtml",
@@ -72,6 +81,53 @@ console.log(JSON.stringify({
      ...rows('a0a0a0a0approved')], none)),
   expired: view(projectEscalations([asType(approvedOpen, 'gate_escalation_expired', {chain_position: 99})], none)),
   hostileDetail: escapeHtml(hostileView.detail),
+  // NOVA 11-22: more than one eligible terminal event, in BOTH array orders. A later ruling
+  // (a re-decide after appeal, or a lapse recorded after a ruling) is the current status.
+  twoRulings: [false, true].map(rev => {
+    const later = {...only('a0a0a0a0approved', 'gate_escalation_decided')[0],
+      chain_position: 50, hash: 'later-ruling', status: 'denied', decided_by: 'dp',
+      decided_via: 'operator_session'};
+    const list = [later, ...rows('a0a0a0a0approved')];
+    return view(projectEscalations(rev ? list.reverse() : list, none));
+  }),
+  rulingThenExpiry: [false, true].map(rev => {
+    const list = [asType(approvedOpen, 'gate_escalation_expired', {chain_position: 51, hash: 'expiry'}),
+      ...rows('a0a0a0a0approved')];
+    return view(projectEscalations(rev ? list.reverse() : list, none));
+  }),
+  twoClaims: [false, true].map(rev => {
+    const list = [asType(approvedOpen, 'gate_escalation_claimed', {chain_position: 60, hash: 'claim-new'}),
+      asType(approvedOpen, 'gate_escalation_claimed', {chain_position: 55, hash: 'claim-old'})];
+    return view(projectEscalations(rev ? list.reverse() : list, none));
+  }),
+  // A feed crossing a page/window boundary: the newer page holds the ruling and a claim, the
+  // older page the open. Every way the pages can be joined must pick the same row.
+  acrossPages: (() => {
+    const claim = asType(approvedOpen, 'gate_escalation_claimed', {chain_position: 70, hash: 'claim'});
+    const newer = [claim, ...only('a0a0a0a0approved', 'gate_escalation_decided')];
+    const older = only('a0a0a0a0approved', 'gate_escalation_opened');
+    return [[...newer, ...older], [...older, ...newer], [...older, ...[...newer].reverse()],
+            newer].map(list => view(projectEscalations(list, none)));
+  })(),
+  // The pending set is read at fold time, the feed may be an earlier read: an id the pending
+  // set still names never overrides a settlement the feed already holds.
+  pendingButRuled: view(projectEscalations(rows('a0a0a0a0approved'), new Set(['a0a0a0a0approved']))),
+  // Every ruler/marker field the new display path interpolates, hostile at once.
+  hostileAll: (() => {
+    const ruling = {...only('a0a0a0a0approved', 'gate_escalation_decided')[0],
+      marker: '<script>alert(1)</script>', decided_by: '"><img src=x onerror=alert(2)>',
+      decided_via: "'><svg onload=alert(3)>", bar: '<b>bar</b>&'};
+    const v = projectEscalations([ruling], none)[0].escalation_view;
+    return {detail: escapeHtml(v.detail), hover: escapeHtml(`gate_escalation_decided\n${v.detail}`),
+            raw: v.detail};
+  })(),
+  // Per-being filter on a terminal-only slice: the row stays under the OPENING actor, not
+  // under the ruler, even when the ruler is a different member.
+  rulingOnlyByMember: (() => {
+    const slice = projectEscalations(only('a0a0a0a0approved', 'gate_escalation_decided'), none);
+    return {asker: slice.filter(e => e.plugin_id === 'claude-code').length,
+            ruler: slice.filter(e => e.plugin_id === 'codex').length};
+  })(),
   untouched: projectEscalations([{chain_position: 30, event_type: 'outcome', plugin_id: 'kimi-code', hash: 'o'}], none),
 }));
 """)
@@ -104,8 +160,38 @@ console.log(JSON.stringify({
               got["withdrawn"][0]["status"] == "withdrawn"
               and "withdrawn by claude-code" in got["withdrawn"][0]["detail"], got["withdrawn"])
         check("a live pending open renders pending", got["pending"][0]["status"] == "pending")
+        off = got["offRecord"][0]
         check("an open not in the pending set is not mislabeled pending",
-              got["offRecord"][0]["detail"].endswith("no longer on record"))
+              off["status"] != "pending" and off["detail"].endswith("not pending; outcome not in this feed"),
+              off)
+        check("not-pending is not rendered as denied or expired",
+              off["status"] not in ("denied", "expired") and off["statusClass"] == "info"
+              and "denied" not in off["detail"] and "expired" not in off["detail"], off)
+        check("the later of two rulings is the current status, in either array order",
+              all(len(v) == 1 and v[0]["hash"] == "later-ruling" and v[0]["status"] == "denied"
+                  and "-> denied by dp (operator_session" in v[0]["detail"] for v in got["twoRulings"]),
+              got["twoRulings"])
+        check("a lapse recorded after a ruling is the newest settlement, in either array order",
+              all(len(v) == 1 and v[0]["hash"] == "expiry" and v[0]["status"] == "expired"
+                  for v in got["rulingThenExpiry"]), got["rulingThenExpiry"])
+        check("of two claims the newer is the row, in either array order",
+              all(len(v) == 1 and v[0]["hash"] == "claim-new" for v in got["twoClaims"]), got["twoClaims"])
+        check("a feed crossing a page boundary picks the ruling however the pages are joined",
+              all(len(v) == 1 and v[0]["hash"] == "hash-2" and v[0]["status"] == "approved"
+                  and v[0]["plugin_id"] == "claude-code" for v in got["acrossPages"]), got["acrossPages"])
+        check("a pending id never overrides a settlement already in the feed",
+              got["pendingButRuled"][0]["status"] == "approved", got["pendingButRuled"])
+        hostile_all = got["hostileAll"]
+        check("hostile marker, ruler, channel and bar are all escaped on detail and hover",
+              all("<" not in hostile_all[k] and ">" not in hostile_all[k] and '"' not in hostile_all[k]
+                  and "'" not in hostile_all[k] for k in ("detail", "hover"))
+              and "&lt;script&gt;" in hostile_all["detail"] and "&lt;img" in hostile_all["detail"]
+              and "&lt;svg" in hostile_all["detail"], hostile_all)
+        check("the hostile values reached the display path unaltered before escaping",
+              "<script>alert(1)</script>" in hostile_all["raw"]
+              and '"><img src=x onerror=alert(2)>' in hostile_all["raw"], hostile_all["raw"])
+        check("a terminal-only slice stays under the opening actor, not the ruler",
+              got["rulingOnlyByMember"] == {"asker": 1, "ruler": 0}, got["rulingOnlyByMember"])
         check("a window that cut the open still shows the ruling and its asker",
               got["rulingOnly"][0]["status"] == "approved"
               and got["rulingOnly"][0]["plugin_id"] == "claude-code", got["rulingOnly"])

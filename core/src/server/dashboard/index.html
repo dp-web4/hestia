@@ -3100,8 +3100,13 @@
       status = 'pending';
       disposition = 'pending';
     } else {
-      status = 'off-record';
-      disposition = 'no longer on record';
+      // NOT a disposition. The feed (`recent`) is a chain read the snapshot worker may
+      // reuse, while `pending_escalations` is read from the store at fold time, so an ask
+      // ruled or lapsed between the two shows here, as does one whose ruling fell outside
+      // this window. Say only what is known: it is not pending and its outcome is not in
+      // this feed. Never render it as denied or expired; the escalation pointer has the rest.
+      status = 'not pending';
+      disposition = 'not pending; outcome not in this feed';
     }
     return {
       status,
@@ -3124,12 +3129,19 @@
     }
     const projections = new Map();
     for (const [id, events] of groups) {
-      const opened = events.find(e => e.event_type === 'gate_escalation_opened');
+      // NEWEST BY CHAIN POSITION, never first in array order: the feed arrives newest-first
+      // today, but nothing in this function may depend on that. Same precedence as the
+      // escalation pointer lookup in `handler.rs` (`newest(...)`): the newest settlement
+      // (decided / withdrawn / expired), else the newest claim (a spend, not a settlement),
+      // else the newest open. The chosen row's status AND chain hash are what the row shows.
+      const newest = kinds => events.reduce((best, e) =>
+        kinds.includes(e.event_type) && (!best || e.chain_position > best.chain_position) ? e : best,
+        null);
+      const opened = newest(['gate_escalation_opened']);
       const representative =
-        events.find(e => e.event_type === 'gate_escalation_decided') ||
-        events.find(e => e.event_type === 'gate_escalation_withdrawn') ||
-        events.find(e => e.event_type === 'gate_escalation_expired') ||
-        events.find(e => e.event_type === 'gate_escalation_claimed') || opened || events[0];
+        newest(['gate_escalation_decided', 'gate_escalation_withdrawn', 'gate_escalation_expired']) ||
+        newest(['gate_escalation_claimed']) || opened ||
+        newest(events.map(e => e.event_type));
       const source = {
         ...representative,
         marker: representative.marker || opened?.marker,
