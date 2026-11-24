@@ -44,8 +44,10 @@ The class that actually locks a seat out is **no verdict**: under `HESTIA_PRE_FA
 a gate that cannot reach its daemon — or cannot import the shared mechanism two levels up from
 itself, which is what a hot-swapped tree does to it — refuses *every* tool, including the remedy.
 And policy resolution reports an empty scope when nothing answers, so **both states print the
-identical `(granted: )` banner**. That is why the cheap observable cannot tell them apart: the
-emptiness pub saw was a symptom of the daemon failure, read at the wrong layer.
+identical `(granted: )` banner**. That is why the cheap observable cannot tell them apart. But
+pub's Aug 28 emptiness was not a daemon-failure symptom: the live snapshot preserved in #1097
+shows the daemon answering with `in_scope: []`. The envelope really was empty (#715). Check the
+verdict and daemon reachability instead of inferring either state from the empty banner.
 
 Measured — the arms this preflight distinguishes. The first three are one box, one gate, one
 event (CBP); the last two were added 2026-09-07 from Sprout and Legion, and they are the reason
@@ -54,7 +56,7 @@ the verdict column alone is not enough to act on:
 | seat state | `--preflight` | the probe's own message says |
 |---|---|---|
 | healthy, envelope empty or not | `ok`, exit 0 | — |
-| daemon unreachable (the pub signature) | `FAILED(gate refuses a benign read)`, exit 4 | connection refused / no endpoint |
+| daemon unreachable | `FAILED(gate refuses a benign read)`, exit 4 | connection refused / no endpoint |
 | gate registered in a worktree | `FAILED(rule-0: …)`, exit 4 | `rule-0: …` |
 | **seat config never rendered** (timer arm, `HESTIA_HOME` set) | `FAILED(gate refuses a benign read)`, exit 4 | `deny [config.unbacked] — no rendered projection for <seat> at ~/.hestia/seats/<seat>.env` |
 | **`HESTIA_HOME` not supplied** (fired-session arm) | `FAILED(gate refuses a benign read)`, exit 4 | `deny [config.unbacked] — HESTIA_HOME is not set; the launcher must supply the bootstrap locator` |
@@ -243,8 +245,10 @@ primitive that is not there must never be indistinguishable from a lock that is 
   installing, for a pre-flight before a hold. Any other argument is usage, exit 2,
   and does not take the lock — the default is refusal, not deployment.
 - A half deploy heals on the **next timer cycle**: a full cycle that finds the binary
-  `CURRENT` but `current-build.json` behind it (or absent) re-runs the members' install
-  from the same synced checkout and logs `CURRENT <v> manifest-repair hooks=ok`. Until
+  `CURRENT` but `current-build.json` behind it (or absent), or a registrar dry-run that reports
+  owned registration drift, re-runs the members' install from the same synced checkout and logs
+  `CURRENT <v> manifest-repair hooks=ok`. Build-id equality alone no longer hides a hook moved
+  out of its worktree (#1097A); foreign registration lines are never rewritten. Until
   2026-08-27 that cycle logged `CURRENT` and exited before the installer, so a half deploy
   stayed half until someone ran `--hooks-only` by hand — and mcnugget measured that the
   someone, when it is an agent session, cannot (below). The timer is the one caller that
@@ -272,8 +276,9 @@ primitive that is not there must never be indistinguishable from a lock that is 
   (`HALF-DEPLOYED` is the last line, and it names the repair for that value), the unit
   reads failed, and the next timer cycle repairs the manifest. The binary is not rolled
   back: a stale daemon would be a worse state than a stale manifest, and the manifest is
-  what the repair rewrites. `hooks=ok` is checked against the **file**, not the installer's
-  exit code: the installer exits 0 without writing anything when no member is registered on
+  what the repair rewrites. `hooks=ok` is checked against the **file** and a post-install
+  registration dry-run, not the installer's exit code: the installer exits 0 without writing
+  anything when no member is registered on
   the host (and under `DRY_RUN=1`), and mcnugget measured the repair path reading that as
   `manifest-repair hooks=ok`, rc=0, under a real launchd timer, twice, with no manifest on
   disk — green every 4h, forever, on exactly the headless profile being onboarded next. It
