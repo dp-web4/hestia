@@ -174,7 +174,10 @@ function ScopeRequestCard({
     durations.includes("session") ? "session" : (durations[0] ?? "once"),
   );
   const breadths = scopeBreadthOptions(req.path, !!req.subtree);
-  const [breadthIdx, setBreadthIdx] = useState(0);
+  const [breadthIdx, setBreadthIdx] = useState(() => {
+    const asked = breadths.findIndex((b) => b.grantPath === null && b.recursive === !!req.recursive);
+    return asked < 0 ? 0 : asked;
+  });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const fromGate = req.origin === "gate_deny";
@@ -219,7 +222,7 @@ function ScopeRequestCard({
           {req.role ? ` · ${req.role}` : ""}
         </dd>
         <dt>path</dt>
-        {/* Exactly one path. The asker cannot request recursion; only the ruler can grant it.
+        {/* One root path. The member may ask for its subtree; the ruler honors or narrows that.
             An act the gate could not enumerate names no path (dp, 2026-10-10). */}
         {!scopeEnumerable(req) ? (
           <dd data-scope-once-only>
@@ -269,6 +272,12 @@ function ScopeRequestCard({
             <dt>their reason</dt>
             {/* Whole: truncating the asker's words is how a request gets ruled on its summary. */}
             <dd className="pre">{req.reason || <span className="muted">— none given —</span>}</dd>
+            {req.recursive && (
+              <>
+                <dt>reach</dt>
+                <dd>member asks for this path and below</dd>
+              </>
+            )}
           </>
         )}
       </dl>

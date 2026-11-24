@@ -1415,8 +1415,8 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
 
     Returns "" when no exact root contains the path (nothing to explain — the path is
     simply outside every grant), else one sentence naming the deepest such root and the
-    spelling that would reach. Naming the operator's act is deliberate: the member cannot
-    widen its own grant, and should not go looking for a way to."""
+    spelling that would reach. Naming the member's request verb is deliberate: the member
+    cannot widen its own grant, but it can ask an operator or delegate to decide that reach."""
     cand = os.path.realpath(os.path.normpath(path)).replace("\\", "/").rstrip("/")
     exact_roots = sorted((root for root, recursive in _scope_roots_with_reach(scopes, workspace)
                           if not recursive and cand.startswith(root + "/")), key=len, reverse=True)
@@ -1425,7 +1425,8 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
     root = exact_roots[0]
     return (f"; note: your grant path:{root} is EXACT — it reaches that path itself and nothing "
             f"beneath it. A recursive grant (path:{root}{RECURSIVE_SUFFIX}) would reach this; "
-            f"only an operator can make it so")
+            f"ask for it with hestia_request_scope(path={root}, recursive=true, reason=...) "
+            f"for an operator or delegate to decide")
 
 
 def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
