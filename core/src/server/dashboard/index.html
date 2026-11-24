@@ -1186,6 +1186,15 @@
       <span id="remedy-banner-text">…</span>
     </div>
 
+    <!-- GATE INTEGRITY overview banner (#1378). Modified, unratified, missing, unregistered,
+         deploy-different bytes and UNKNOWN stay above the views; only a verified set without
+         differing deployed bytes is silent. -->
+    <div class="esc-banner" id="gate-integrity-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="gate-integrity-banner-text">…</span>
+      <button class="esc-banner-btn" id="gate-integrity-banner-btn">Gates</button>
+    </div>
+
     <!-- TWO TOP-LEVEL VIEWS (dp, 2026-08-11). Everything from here to the end of .live-grid
          is the AGENTS view — local orchestrators + trust/histogram/witness-chain, i.e.
          governance of the agents on this box. The HUBS view (the outward community surface)
@@ -5292,7 +5301,19 @@
             reason: reason.trim(),
           });
         } else {
-          polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+          const current = lastData?.policy || {};
+          const strictness = { 'permissive': 0, 'audit-only': 1, 'safety': 2, 'strict': 3 };
+          const currentRank = strictness[current.preset];
+          const targetRank = strictness[t.dataset.preset];
+          if (typeof currentRank !== 'number' || targetRank < currentRank) {
+            const from = `${current.preset || 'unknown'}${current.enforce ? '' : ' (audit)'}`;
+            if (!confirm(`Change SOCIETY policy from ${from} to ${t.dataset.preset}. This loosens every member. Continue?`)) return;
+            const reason = prompt('Reason (required — this loosening is recorded in the witness chain):');
+            if (!reason || !reason.trim()) return;
+            polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset, reason: reason.trim() });
+          } else {
+            polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+          }
         }
       }
       else if (t.dataset.revert) polSend('DELETE', `/api/policy/override/${encodeURIComponent(t.dataset.revert)}`);
@@ -5899,6 +5920,76 @@
     });
   })();
 
+  // ---- GATE INTEGRITY overview banner (#1378) ------------------------------------------------
+  // A read that never answers (a hung daemon, a sign-in left pending) must not keep the last
+  // state: the read is bounded, and once the last answer is older than two polls the banner says
+  // the set is unverified and since when, instead of staying silent on an old VERIFIED (#1575).
+  const GATE_INTEGRITY_POLL_MS = 30000, GATE_INTEGRITY_TIMEOUT_MS = 15000;
+  let gateIntegrityBusy = false, gateIntegrityVerifiedAt = 0;
+  function gateIntegrityHealthy(r) {
+    return r.status === 'VERIFIED'
+      && !(r.gates || []).some(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
+  }
+  function gateIntegrityStale(text, banner, why) {
+    const since = gateIntegrityVerifiedAt ? new Date(gateIntegrityVerifiedAt).toLocaleTimeString() : 'this page opened';
+    text.textContent = `Gate integrity unverified — stale since ${since}${why ? ` (${why})` : ''}`;
+    banner.hidden = false;
+  }
+  async function gateIntegrityLoad() {
+    const banner = $('gate-integrity-banner'), text = $('gate-integrity-banner-text');
+    if (gateIntegrityBusy) {
+      if (Date.now() - gateIntegrityVerifiedAt > 2 * GATE_INTEGRITY_POLL_MS) gateIntegrityStale(text, banner, 'the last read has not answered');
+      return;
+    }
+    gateIntegrityBusy = true;
+    const ctl = new AbortController();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => { ctl.abort(); reject(new Error(`no answer after ${GATE_INTEGRITY_TIMEOUT_MS / 1000}s`)); },
+        GATE_INTEGRITY_TIMEOUT_MS);
+    });
+    try {
+      const r = await Promise.race([timeout, (async () => {
+        const res = await apiFetch('/api/gates/verify', { cache: 'no-store', signal: ctl.signal });
+        if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+        return res.json();
+      })()]);
+      gateIntegrityVerifiedAt = Date.now();
+      if (gateIntegrityHealthy(r)) { banner.hidden = true; return; }
+      if (r.status === 'UNKNOWN') {
+        text.textContent = `Gate integrity UNKNOWN — ${r.reason || 'the gate set could not be established'}`;
+        banner.hidden = false;
+        return;
+      }
+      const rows = (r.gates || []).filter(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
+      const count = pick => rows.filter(pick).length;
+      const parts = [];
+      const notRegistered = count(g => g.not_registered === true);
+      const modified = count(g => g.status === 'modified');
+      const missing = count(g => g.status === 'missing' || g.status === 'unreadable');
+      const differs = count(g => g.deployment === 'differs');
+      const pending = count(g => g.status === 'unratified' && g.deployment === 'match');
+      const unratified = count(g => g.status === 'unratified' && g.deployment !== 'match');
+      if (notRegistered) parts.push(`${notRegistered} not registered — possible bypass`);
+      if (modified) parts.push(`${modified} modified since ratification`);
+      if (missing) parts.push(`${missing} missing or unreadable`);
+      if (differs) parts.push(`${differs} differs from the deploy`);
+      if (pending) parts.push(`${pending} deployed, not yet ratified`);
+      if (unratified) parts.push(`${unratified} unratified`);
+      if (!parts.length) parts.push(r.status);
+      const members = [...new Set(rows.map(g => g.plugin_id || g.path.split('/').filter(Boolean).pop() || g.path))];
+      const shown = members.slice(0, 3).join(', ') + (members.length > 3 ? ` +${members.length - 3} more` : '');
+      text.textContent = `Gate integrity: ${rows.length} gate${rows.length === 1 ? '' : 's'}: ${parts.join(' · ')}${shown ? ` — ${shown}` : ''}`;
+      banner.hidden = false;
+    } catch (e) {
+      if (gateIntegrityVerifiedAt) gateIntegrityStale(text, banner, e.message);
+      else { text.textContent = `Gate integrity could not be read — ${e.message}`; banner.hidden = false; }
+    } finally {
+      clearTimeout(timer);
+      gateIntegrityBusy = false;
+    }
+  }
+
   // ---- GATES pane ----------------------------------------------------------------------------
   // GET /api/gates/verify and POST /api/gates/ratify, as the desktop app's Gates screen uses them.
   // The ratify carries `expected` = the evidence.current THIS pane rendered: the daemon recomputes
@@ -6056,6 +6147,7 @@
   let cfgSelected = null;       // member currently open in the editor
   let cfgShared = { configured: false, keys: [] };   // the shared set, from the last list
   let cfgRows = [];             // [{key, value}] the editor holds (a draft, not the vault)
+  let cfgStored = { role: '', note: '' };   // the vault's document as opened (cfgRows is the draft)
   let cfgSeats = [];            // last list
 
   function cfgVerdictHtml(v) {
@@ -6172,6 +6264,7 @@
     $('cfg-err').hidden = true; $('cfg-saved').hidden = true;
     $('cfg-editor-verdict').innerHTML = ''; $('cfg-editor-digest').textContent = '';
     document.querySelectorAll('#cfg-seat-list .cfg-seat').forEach(el => el.classList.toggle('selected', el.dataset.member === member));
+    cfgStored = { role: '', note: '' };
     if (!configured) { cfgRows = []; $('cfg-note').value = ''; $('cfg-inherited').hidden = true; cfgRenderRows(); return; }
     try {
       const res = await apiFetch('/api/config/seat/' + encodeURIComponent(member));
@@ -6180,6 +6273,7 @@
       const env = (data.config && data.config.env) || {};
       cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k] }));
       $('cfg-note').value = (data.config && data.config.note) || '';
+      cfgStored = { role: env.HESTIA_ROLE || '', note: $('cfg-note').value };
       // INHERITED, READ-ONLY. The lines this seat gets from the shared set, with their values,
       // shown above its own rows so the whole projection is visible while only the seat's own
       // lines are editable here. Editing a shared value means opening the shared set.
@@ -6223,6 +6317,19 @@
       if (!k) continue;
       if (k in env) { err.textContent = 'duplicate key ' + k; err.hidden = false; return; }
       env[k] = r.value;
+    }
+    // Against the STORED role (cfgReadRows just replaced cfgRows with the draft), and a reason
+    // that is new: the note field opens holding the last change's reason.
+    const previousRole = cfgStored.role;
+    const nextRole = env.HESTIA_ROLE || '';
+    if (previousRole !== nextRole) {
+      if (!confirm(`Change capacity role for ${cfgSelected} from ${previousRole || 'member'} to ${nextRole || 'member'}?`)) return;
+      const note = $('cfg-note').value.trim();
+      if (!note || note === cfgStored.note.trim()) {
+        err.textContent = 'a new reason (note) is required to change a capacity role';
+        err.hidden = false;
+        return;
+      }
     }
     const btn = $('cfg-save'); btn.disabled = true;
     try {
@@ -6970,7 +7077,11 @@
   // CPU (measured 2026-09-17). Coming back to the tab refreshes at once, so nothing is stale
   // when it is actually read.
   setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { tick(); gateIntegrityLoad(); } });
+
+  $('gate-integrity-banner-btn').addEventListener('click', () => { setView('govern', true); governShow('gates'); });
+  gateIntegrityLoad();
+  setInterval(() => { if (!document.hidden) gateIntegrityLoad(); }, GATE_INTEGRITY_POLL_MS);
 
   // Display alias editor (#998). Set and clear are operator acts on the console's own
   // presentation store; neither is witnessed, by ruling. The picker's value is the id.
