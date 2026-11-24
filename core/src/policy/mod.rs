@@ -17,6 +17,7 @@
 
 pub mod engine;
 pub mod extract;
+pub mod governance_twin;
 mod law_gate;
 pub mod lawbook;
 pub mod matchers;
