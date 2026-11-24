@@ -158,9 +158,14 @@ authority reference and evidence.
   never a partial commit.
 
 The daemon (`hestia serve`, and only `serve`) reads `$HESTIA_HOME/.passphrase` **in
-process**, and the shipped launchers no longer export it through a shell. Every other CLI
-command still needs `HESTIA_PASSPHRASE` or a TTY: it never reads the file. This keeps the passphrase out of `/proc/<pid>/environ` in the
-normal deployment, but does not make it inaccessible to a same-UID process: the file itself
+process** when `HESTIA_PASSPHRASE` is not set. Every other CLI
+command still needs `HESTIA_PASSPHRASE` or a TTY: it never reads the file. **The shipped
+launchers have not switched yet**: the systemd unit, the launchd plist and the macOS
+canonicalizer still export the passphrase through a shell wrapper, so in the normal
+deployment it is still visible in `/proc/<pid>/environ`. They switch to direct exec only
+after a published release contains this reader, because the installers run the newest
+published binary and an older one cannot start without the wrapper. Once they switch, the
+passphrase stays out of the daemon's environment, but that does not make it inaccessible to a same-UID process: the file itself
 remains mode `0600`, and any process at that UID can read it. The credential rule is therefore
 an A1 cooperation boundary, not secret containment. If an operator explicitly supplies
 `HESTIA_PASSPHRASE` for automation, the value is also visible in that process's environment

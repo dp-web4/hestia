@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""#581: the daemon and shipped launchers read the passphrase in-process."""
+"""#581: the daemon reads the passphrase in-process; the launchers switch in a follow-up."""
 from pathlib import Path
 import sys
 
@@ -20,30 +20,19 @@ def main():
           "if let Some(pp) = read_passphrase_file(home)?" in cli
           and "rpassword::prompt_password(prompt)" in cli)
 
+    # The launchers keep main's shell wrapper until a published release contains the reader
+    # (the installers run the newest PUBLISHED binary). Pin that here, so the switch to direct
+    # exec is a deliberate change made with its own checks, not a drive-by.
     unit = (ROOT / "deploy/templates/hestia.service").read_text()
-    check("systemd starts the daemon directly",
-          "ExecStart=%h/.local/bin/hestia serve --bind 127.0.0.1:7711" in unit)
-    check("systemd does not export the passphrase",
-          "HESTIA_PASSPHRASE=" not in unit)
-
     install = (ROOT / "deploy/fleet/install.sh").read_text()
-    check("the installer starts systemd directly",
-          "ExecStart=%h/.local/bin/hestia serve --bind ${HESTIA_BIND}" in install)
-    check("launchd arguments are a direct array",
-          "<string>\\$HOME/.local/bin/hestia</string>" in install
-          and "<string>/bin/sh</string>" not in install)
-
-    canon = (ROOT / "deploy/fleet/canonicalize-macos-seat.sh").read_text()
-    check("canonicalization compares the full argv array",
-          "plutil -extract ProgramArguments json -o -" in canon)
-    check("canonicalization writes direct argv, not a shell wrapper",
-          "plutil -replace ProgramArguments -json \"$want_args\"" in canon
-          and "line = f'HESTIA_PASSPHRASE" not in canon)
+    check("the launchers still use the wrapper an older published binary needs",
+          "HESTIA_PASSPHRASE=" in unit and "HESTIA_PASSPHRASE=" in install)
 
     assurance = (ROOT / "docs/PRD_ASSURANCE.md").read_text()
     check("A1 same-UID file access is disclosed, not overclaimed",
           "any process at that UID can read it" in assurance
-          and "/proc/<pid>/environ" in assurance)
+          and "/proc/<pid>/environ" in assurance
+          and "have not switched yet" in assurance)
 
     if FAILS:
         print(f"{len(FAILS)} FAILURE(S): {FAILS}")
