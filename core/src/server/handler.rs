@@ -133,6 +133,7 @@ impl ServerHandler for HestiaServer {
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
+            "hestia_member_claim" => tool_member_claim(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
             "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
@@ -856,7 +857,23 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_member_inbox",
-            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
+            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity). A consuming drain skips another session's unexpired claims and never marks those rows drained; peek:true remains non-consuming",
+        ),
+        t_args(
+            "hestia_member_claim",
+            "Claim one of YOUR queued notices before acting on it. The default action=claim takes a 15-minute lease; renew uses the same transition and reports renewed:false if it took an available claim rather than extending your live one; release returns your claim to the queue. A different session's unexpired claim is a conflict, never an overwrite. Expired claims may be reclaimed. Requires your own live session_id; only notices addressed to your member can be claimed. Claims and releases are witnessed; a bystander's consuming hestia_member_inbox neither returns nor marks a live-claimed notice",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["notice_id"],
+                "properties": {
+                    "notice_id": {"type": "integer", "minimum": 0},
+                    "action": {"type": "string", "enum": ["claim", "renew", "release"], "default": "claim"},
+                    "lease_secs": {"type": "integer", "minimum": 30, "maximum": 3600, "default": 900},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id."}
+                }
+            }),
         ),
         t(
             "hestia_egress_pending",
@@ -9129,7 +9146,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("peeking member inbox: {e}"))?
     } else {
         s.inbox_store
-            .drain_member(&who.plugin_id)
+            .drain_member_for_session(
+                &who.plugin_id,
+                who.session_uuid.expect("attributed callers have a session"),
+            )
             .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
     };
     // Silently-dropped mail, reported to the only party who can tell what is
@@ -9151,6 +9171,220 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
     Ok(out)
+}
+
+/// Witness is finality for a lease change (NOVA re-review of #1513, mirroring #1650's
+/// corroboration undo): when the `member_notice_claimed` / `member_notice_released` append
+/// fails, put the lease back to its exact prior owner/expiry while the state lock is still
+/// held, and say so. The restore is compare-and-swap against what this act wrote; if it does
+/// not apply (or `prior` is unknown) the answer is explicitly `lease_state: "uncertain"`.
+fn undo_unwitnessed_member_claim(
+    store: &crate::storage::SqliteInboxStore,
+    notice_id: u64,
+    to_plugin: &str,
+    action: &str,
+    written: &crate::storage::inbox::MemberNoticeLease,
+    prior: Option<&crate::storage::inbox::MemberNoticeLease>,
+    append_err: &anyhow::Error,
+) -> Value {
+    let restore = match prior {
+        Some(prior) => store
+            .restore_member_notice_lease(notice_id, to_plugin, written, prior)
+            .map_err(|e| e.to_string()),
+        None => Err("the prior lease was not readable before the change".to_string()),
+    };
+    let (lease_state, restore_error) = match &restore {
+        Ok(true) => ("restored_to_prior", None),
+        Ok(false) => ("uncertain", Some("the row changed after this act; nothing was restored".to_string())),
+        Err(e) => ("uncertain", Some(e.clone())),
+    };
+    hestia_error_envelope(
+        "hestia.member_claim_unwitnessed",
+        if lease_state == "restored_to_prior" {
+            "the lease change was NOT recorded — its witness append failed; the lease is back to its exact prior owner and expiry"
+        } else {
+            "the lease change was NOT recorded — its witness append failed, and the rollback could not be confirmed; treat the lease state as uncertain"
+        },
+        Some(json!({
+            "notice_id": notice_id,
+            "action": action,
+            "lease_state": lease_state,
+            "restore_error": restore_error,
+            "append_error": append_err.to_string(),
+        })),
+    )
+}
+
+async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::storage::inbox::MemberNoticeClaimOutcome;
+
+    let Some(notice_id) = args.get("notice_id").and_then(Value::as_u64) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "member_claim requires a nonnegative integer notice_id",
+            None,
+        ));
+    };
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("claim");
+    if !matches!(action, "claim" | "renew" | "release") {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "action must be claim, renew, or release",
+            None,
+        ));
+    }
+    let lease_secs = args
+        .get("lease_secs")
+        .and_then(Value::as_i64)
+        .unwrap_or(crate::storage::inbox::MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS);
+    if !(crate::storage::inbox::MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS
+        ..=crate::storage::inbox::MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS)
+        .contains(&lease_secs)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid_lease",
+            "lease_secs must be between 30 and 3600",
+            Some(json!({"lease_secs": lease_secs})),
+        ));
+    }
+
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_unattributed",
+            "member_claim requires the caller's own live session_id (from hestia_connect)",
+            None,
+        ));
+    };
+    let target = format!("notice:{notice_id}");
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_member_claim",
+        "member_notify",
+        &target,
+    ) {
+        return Ok(denied);
+    }
+    let session = who.session_uuid.expect("attributed callers have a session");
+    // The exact lease before this act, read under the same state lock as the change, so a
+    // failed witness append can put it back (fresh claim, renewal, expired takeover, release).
+    let prior_lease = s
+        .inbox_store
+        .member_notice_lease(notice_id, &who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("reading member notice lease: {e}"))?;
+    let outcome = if action == "release" {
+        s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
+    } else {
+        s.inbox_store.claim_member_notice(
+            notice_id,
+            &who.plugin_id,
+            session,
+            lease_secs,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("changing member notice claim: {e}"))?;
+
+    match outcome {
+        MemberNoticeClaimOutcome::Claimed {
+            claim_expires_at,
+            renewed,
+            superseded_expired_claim,
+        } => {
+            let entry = match s.append_chain(
+                "member_notice_claimed",
+                json!({
+                    "notice_id": notice_id,
+                    "plugin_id": who.plugin_id,
+                    "role_lct": who.role_lct,
+                    "session_id": session,
+                    "claim_expires_at": claim_expires_at,
+                    "lease_secs": lease_secs,
+                    "renewed": renewed,
+                    "superseded_expired_claim": superseded_expired_claim,
+                }),
+            ) {
+                Ok(entry) => entry,
+                Err(append_err) => {
+                    let written = crate::storage::inbox::MemberNoticeLease {
+                        claimed_by_session: Some(session.to_string()),
+                        claim_expires_at: Some(claim_expires_at.to_rfc3339()),
+                    };
+                    return Ok(undo_unwitnessed_member_claim(
+                        &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                        prior_lease.as_ref(), &append_err,
+                    ));
+                }
+            };
+            Ok(json!({
+                "notice_id": notice_id,
+                "claimed": true,
+                "renewed": renewed,
+                "superseded_expired_claim": superseded_expired_claim,
+                "claim_expires_at": claim_expires_at,
+                "witnessEntryHash": entry.hash,
+            }))
+        }
+        MemberNoticeClaimOutcome::Released { was_claimed } => {
+            let witness = if was_claimed {
+                match s.append_chain(
+                    "member_notice_released",
+                    json!({
+                        "notice_id": notice_id,
+                        "plugin_id": who.plugin_id,
+                        "role_lct": who.role_lct,
+                        "session_id": session,
+                    }),
+                ) {
+                    Ok(entry) => Some(entry),
+                    Err(append_err) => {
+                        // An unwitnessed release must not free the notice for a sibling drain.
+                        let written = crate::storage::inbox::MemberNoticeLease {
+                            claimed_by_session: None,
+                            claim_expires_at: None,
+                        };
+                        return Ok(undo_unwitnessed_member_claim(
+                            &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                            prior_lease.as_ref(), &append_err,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(json!({
+                "notice_id": notice_id,
+                "released": was_claimed,
+                "witnessEntryHash": witness.map(|entry| entry.hash),
+            }))
+        }
+        MemberNoticeClaimOutcome::Conflict {
+            claimed_by_session,
+            claim_expires_at,
+        } => {
+            let owner_prefix: String = claimed_by_session.chars().take(8).collect();
+            Ok(hestia_error_envelope(
+                "hestia.member_claim_conflict",
+                "this notice is claimed by another session; wait for its lease to expire or coordinate with that session",
+                Some(json!({
+                    "notice_id": notice_id,
+                    "claimed_by_session_prefix": owner_prefix,
+                    "claim_expires_at": claim_expires_at,
+                })),
+            ))
+        }
+        MemberNoticeClaimOutcome::NotFound => Ok(hestia_error_envelope(
+            "hestia.member_claim_not_found",
+            "no queued notice with that id is addressed to your member on this machine",
+            Some(json!({"notice_id": notice_id})),
+        )),
+        MemberNoticeClaimOutcome::AlreadyDrained => Ok(hestia_error_envelope(
+            "hestia.member_claim_already_drained",
+            "this notice has already been drained and cannot be claimed",
+            Some(json!({"notice_id": notice_id})),
+        )),
+    }
 }
 
 /// "Which notices were queued and never answered?" — the query the mesh could
@@ -13356,6 +13590,177 @@ mod member_mesh_tests {
             .unwrap();
         assert_eq!(kimi_mail["total"], json!(1));
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
+    }
+
+    #[tokio::test]
+    async fn a_claim_routes_one_notice_to_its_owner_without_blocking_other_mail() {
+        let (_dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let bystander = connect(&state, "kimi-code").await;
+
+        let mut queued = Vec::new();
+        for pointer in ["shared-context/forum/claimed.md", "shared-context/forum/other.md"] {
+            let sent = tool_member_notify(
+                &state,
+                &json!({
+                    "to_plugin_id": "kimi-code",
+                    "kind": "review_request",
+                    "pointer_uri": pointer,
+                    "session_id": sender,
+                }),
+            )
+            .await
+            .unwrap();
+            queued.push(sent["queued_id"].as_u64().expect("notice queued"));
+        }
+
+        let claimed = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": owner}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], json!(true), "claim failed: {claimed}");
+        assert!(claimed["witnessEntryHash"].is_string());
+
+        let conflict = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict["_hestia_error"]["code"], json!("hestia.member_claim_conflict"));
+        assert!(conflict["_hestia_error"]["data"]["claim_expires_at"].is_string());
+
+        let bystander_mail = tool_member_inbox(
+            &state,
+            &json!({"session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bystander_mail["total"], json!(1));
+        assert_eq!(bystander_mail["notices"][0]["id"], json!(queued[1]));
+
+        let owner_mail = tool_member_inbox(&state, &json!({"session_id": owner}))
+            .await
+            .unwrap();
+        assert_eq!(owner_mail["total"], json!(1), "the bystander consumed the claim: {owner_mail}");
+        assert_eq!(owner_mail["notices"][0]["id"], json!(queued[0]));
+
+        let s = state.lock().await;
+        let event = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|entry| entry.event_type == "member_notice_claimed")
+            .expect("claim was not witnessed");
+        assert_eq!(event.event_data["notice_id"], json!(queued[0]));
+        assert_eq!(event.event_data["plugin_id"], json!("kimi-code"));
+    }
+
+    /// NOVA re-review of #1513: a lease change whose witness append fails must not stay
+    /// effective. For each of fresh claim, renewal, expired takeover and release, inject a
+    /// failure on exactly that act's chain event, and require (a) an explicit unwitnessed
+    /// error with `lease_state: restored_to_prior`, (b) the row's owner/expiry byte-identical
+    /// to before, and (c) for release, that a sibling session still cannot drain the notice.
+    async fn unwitnessed_lease_change_rolls_back(arm: &str) {
+        let (dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let sibling = connect(&state, "kimi-code").await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let witness = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        witness.pragma_update(None, "key", hex::encode(key)).unwrap();
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "shared-context/forum/lease.md", "session_id": sender}),
+        )
+        .await
+        .unwrap();
+        let id = sent["queued_id"].as_u64().expect("notice queued");
+        let lease = || {
+            let state = state.clone();
+            async move {
+                state.lock().await.inbox_store.member_notice_lease(id, "kimi-code").unwrap()
+                    .expect("notice still undrained")
+            }
+        };
+        let claim = |session: &str, extra: Value| {
+            let state = state.clone();
+            let mut args = json!({"notice_id": id, "session_id": session});
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            async move { tool_member_claim(&state, &args).await.unwrap() }
+        };
+
+        // Arrange the lease the failing act starts from.
+        let (actor, extra, event) = match arm {
+            "fresh" => (&owner, json!({}), "member_notice_claimed"),
+            "renew" => {
+                let ok = claim(&owner, json!({"lease_secs": 120})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"lease_secs": 3600}), "member_notice_claimed")
+            }
+            "takeover" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                let inbox = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+                inbox.pragma_update(None, "key", hex::encode(key)).unwrap();
+                inbox.execute("UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                              rusqlite::params!["2000-01-01T00:00:00+00:00", id as i64]).unwrap();
+                (&sibling, json!({}), "member_notice_claimed")
+            }
+            "release" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"action": "release"}), "member_notice_released")
+            }
+            other => panic!("unknown arm {other}"),
+        };
+        let prior = lease().await;
+        assert_eq!(prior.claimed_by_session.is_some(), arm != "fresh", "{arm}: setup {prior:?}");
+
+        witness.execute_batch(&format!(
+            "CREATE TRIGGER fail_lease BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = '{event}'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;")).unwrap();
+        let r = claim(actor, extra).await;
+        witness.execute_batch("DROP TRIGGER fail_lease").unwrap();
+
+        assert_eq!(r["_hestia_error"]["code"], json!("hestia.member_claim_unwitnessed"),
+                   "{arm}: {r}");
+        assert_eq!(r["_hestia_error"]["data"]["lease_state"], json!("restored_to_prior"),
+                   "{arm}: {r}");
+        assert_eq!(lease().await, prior, "{arm}: the lease change stayed effective unwitnessed");
+        if arm == "release" {
+            let sibling_mail = tool_member_inbox(&state, &json!({"session_id": sibling}))
+                .await
+                .unwrap();
+            assert_eq!(sibling_mail["total"], json!(0),
+                       "an unwitnessed release let a sibling consume the notice: {sibling_mail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_fresh_claim_is_rolled_back() {
+        unwitnessed_lease_change_rolls_back("fresh").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_renewal_is_rolled_back_to_the_prior_expiry() {
+        unwitnessed_lease_change_rolls_back("renew").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_expired_takeover_is_rolled_back_to_the_prior_owner() {
+        unwitnessed_lease_change_rolls_back("takeover").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_release_is_rolled_back_and_blocks_sibling_drain() {
+        unwitnessed_lease_change_rolls_back("release").await;
     }
 
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
