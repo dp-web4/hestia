@@ -208,6 +208,12 @@ class Remedy:
 
 REMEDIES: dict[str, Remedy] = {
     # ── scope ────────────────────────────────────────────────────────────────────────────
+    "runtime.python_ambient_import": Remedy(
+        "For ad-hoc Python outside a declared trusted package root, prefer `python3 -I` so the "
+        "script directory, user site-packages, and PYTHON* environment cannot change what gets "
+        "imported. If local sibling imports are intentional, run from the declared package root "
+        "instead; -I is hygiene, not a sandbox.",
+    ),
     "mrh.path": Remedy(
         "Adjust to work within scope. If the path is genuinely needed: when this refusal names "
         "a scope request id, the gate already opened it for you — a NOT-SAME peer decides it "
@@ -4092,6 +4098,258 @@ def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
     return tuple(out)
 
 
+def _shell_without_comments(text: str) -> str:
+    out = []
+    quote = None
+    escaped = False
+    comment = False
+    word_start = True
+    for char in text:
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+                out.append(char)
+            else:
+                out.append(" ")
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            word_start = False
+            continue
+        if quote is not None:
+            out.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            word_start = False
+            continue
+        if char in ("'", '"'):
+            quote = char
+            out.append(char)
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            comment = True
+            out.append(" ")
+            continue
+        out.append(char)
+        word_start = char.isspace() or char in ";|&()"
+    return "".join(out)
+
+
+def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
+    """Parse direct interpreter command positions as `(isolated, script_dir, cwd, PYTHONPATH)`."""
+    if not command:
+        return []
+    try:
+        command = _shell_without_comments(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\n")
+        lexer.whitespace = " \t\r\f\v"
+        lexer.commenters = ""
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return []
+    segments = [[]]
+    separators = []
+    for word in words:
+        if re.fullmatch(r"(?:[&|;]|\n)+", word):
+            separators.append(word)
+            segments.append([])
+        else:
+            segments[-1].append(word)
+
+    invocations = []
+    current_cwd = os.path.realpath(cwd)
+    alternate_cwds = []
+    current_pythonpath = None
+    skip_next = False
+    for segment_index, segment in enumerate(segments):
+        if skip_next:
+            if not segment:
+                continue
+            skip_next = False
+            continue
+        if not segment:
+            continue
+        previous_separator = separators[segment_index - 1] if segment_index else None
+        i = 0
+        pythonpath = current_pythonpath
+        while i < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[i]):
+            name, value = segment[i].split("=", 1)
+            if name == "PYTHONPATH":
+                pythonpath = value
+            i += 1
+        if i < len(segment) and segment[i] == "env":
+            i += 1
+            while i < len(segment):
+                arg = segment[i]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", arg):
+                    name, value = arg.split("=", 1)
+                    if name == "PYTHONPATH":
+                        pythonpath = value
+                    i += 1
+                elif arg in ("-u", "--unset") and i + 1 < len(segment):
+                    if segment[i + 1] == "PYTHONPATH":
+                        pythonpath = None
+                    i += 2
+                elif arg == "--":
+                    i += 1
+                    break
+                elif arg.startswith("-"):
+                    i += 1
+                else:
+                    break
+        if i >= len(segment):
+            if segment[0] != "env":
+                current_pythonpath = pythonpath
+            continue
+        if segment[i] in ("export", "local", "declare", "typeset", "readonly"):
+            for arg in segment[i + 1:]:
+                name, eq, value = arg.partition("=")
+                if eq and name == "PYTHONPATH":
+                    current_pythonpath = value
+            continue
+        if segment[i] == "unset":
+            if any(arg == "PYTHONPATH" for arg in segment[i + 1:]):
+                current_pythonpath = None
+            continue
+        if segment[i] == "cd":
+            next_separator = (separators[segment_index]
+                              if segment_index < len(separators) else None)
+            if len(segment) == i + 2 and next_separator in ("&&", "||", ";", "\n"):
+                possible = list(dict.fromkeys([current_cwd] + alternate_cwds))
+                targets = [os.path.realpath(os.path.join(c, os.path.expanduser(segment[i + 1])))
+                           for c in possible]
+                if previous_separator in ("&&", "||") or next_separator == "||":
+                    keep = possible + targets
+                else:
+                    keep = [target if os.path.isdir(target) else original
+                            for original, target in zip(possible, targets)]
+                    if (not any(os.path.isdir(target) for target in targets)
+                            and next_separator == "&&" and segment_index == 0):
+                        skip_next = True
+                keep = list(dict.fromkeys(keep))
+                current_cwd, alternate_cwds = keep[0], keep[1:]
+            continue
+        program = (os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
+                   if "/" in segment[i] else segment[i])
+        if not re.fullmatch(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?(?:-dbg)?", program):
+            continue
+
+        isolated = False
+        script = None
+        stop_at_cwd = False
+        j = i + 1
+        while j < len(segment):
+            arg = segment[j]
+            if arg in ("-c", "-m"):
+                stop_at_cwd = True
+                break
+            if arg in ("-W", "-X", "--check-hash-based-pycs"):
+                j += 2
+                continue
+            if arg == "--":
+                j += 1
+                if j < len(segment):
+                    script = segment[j]
+                break
+            if arg == "-":
+                break
+            if arg.startswith("-") and not arg.startswith("--"):
+                takes_separate_value = False
+                for offset, option in enumerate(arg[1:]):
+                    if option == "I":
+                        isolated = True
+                    elif option in ("c", "m"):
+                        stop_at_cwd = True
+                        break
+                    elif option in ("W", "X"):
+                        takes_separate_value = offset == len(arg) - 2
+                        break
+                if stop_at_cwd:
+                    break
+                j += 2 if takes_separate_value else 1
+                continue
+            if arg.startswith("--"):
+                j += 1
+                continue
+            script = arg
+            break
+        for invocation_cwd in dict.fromkeys([current_cwd] + alternate_cwds):
+            script_dir = None
+            if script and not stop_at_cwd:
+                script_dir = os.path.dirname(os.path.realpath(os.path.join(invocation_cwd, script)))
+            invocations.append((isolated, script_dir, invocation_cwd, pythonpath))
+    return invocations
+
+
+def _python_invocation(command: Optional[str], cwd: str) -> tuple:
+    """`(has_python, isolated, script_dir)` for the first direct Python invocation."""
+    invocations = _python_invocations(command, cwd)
+    if not invocations:
+        return (False, True, None)
+    isolated, script_dir, _cwd, _pythonpath = invocations[0]
+    return (True, isolated, script_dir)
+
+
+def _declared_package_root(cwd: str, workspace: str, scopes) -> Optional[str]:
+    """The nearest root carrying both an explicit path grant and package/source evidence."""
+    current = os.path.realpath(cwd)
+    evidence_dir = current
+    workspace = os.path.realpath(workspace)
+    markers = ("pyproject.toml", "setup.py", "setup.cfg", "Pipfile", ".git")
+    while True:
+        if any(os.path.exists(os.path.join(current, marker)) for marker in markers):
+            return current if _within_path_grant(evidence_dir, scopes, workspace) else None
+        if current == workspace or os.path.dirname(current) == current:
+            return None
+        current = os.path.dirname(current)
+
+
+def python_ambient_import_verdict(command: Optional[str], cwd: str, workspace: str, scopes) -> Optional[Verdict]:
+    """Warn when non-isolated Python runs without a declared trusted package root.
+
+    Trust requires an explicit `path:` grant that reaches the actual script/import directory
+    AND package evidence, never a marker or an exact grant on an ancestor alone. Existing denies
+    keep precedence: this is called only after scope has admitted the act. Only direct interpreter
+    commands are parsed; `sh -c`, `uv run`, command substitution, `if`/`while` bodies, subshells,
+    `pushd`, and heredoc-fed interpreters are outside this advisory, so no warning is not proof
+    of import safety.
+    """
+    for isolated, script_dir, invocation_cwd, pythonpath in _python_invocations(command, cwd):
+        if isolated:
+            continue
+        evidence_dir = script_dir or invocation_cwd
+        untrusted_pythonpath = None
+        path_entries = pythonpath.split(os.pathsep) if pythonpath is not None else ()
+        for entry in path_entries:
+            candidate = (invocation_cwd if not entry else os.path.realpath(
+                os.path.join(invocation_cwd, os.path.expanduser(entry))))
+            if _declared_package_root(candidate, workspace, scopes) is None:
+                untrusted_pythonpath = candidate
+                break
+        if (untrusted_pythonpath is None
+                and _declared_package_root(evidence_dir, workspace, scopes) is not None):
+            continue
+        evidence_dir = untrusted_pythonpath or evidence_dir
+        rule = "runtime.python_ambient_import"
+        return Verdict(
+            "warn",
+            rule,
+            f"Python is running without -I in a directory with no explicitly granted package root "
+            f"(script/import directory: {evidence_dir}); ambient module shadowing can change the effective program",
+            REMEDIES[rule].text,
+            target=evidence_dir,
+        )
+    return None
+
+
 def evaluate(event: NormalizedEvent, profile: HarnessProfile,
              workspace: Optional[str] = None,
              policy: Optional[AgentPolicy] = None) -> Verdict:
@@ -4164,7 +4422,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
         if not pol.stale:
             # Gate 1a swept only what link_reach reached; past its bound the rest is unchecked, so an
             # unscoped allow still refuses it (Nova's #1435 review: innate checks are never relaxed by scope).
-            return link_reach_too_wide(event) or ALLOW
+            return link_reach_too_wide(event) or python_ambient_import_verdict(
+                event.command, event.cwd or ws, ws, scopes) or ALLOW
         # Stale + unscoped: drop the wildcard so it cannot match downstream, and evaluate the
         # remaining standing scope normally. Fails narrow, which is the direction a replica may
         # move in.
@@ -4296,7 +4555,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     _repos, _roots = _scope_parts(scopes, ws)
     _wsr = os.path.realpath(os.path.expanduser(ws)).rstrip("/")
     within = tuple(_roots) + tuple(os.path.join(_wsr, r) for r in _repos if r and r != AgentPolicy.UNSCOPED)
-    return link_reach_too_wide(event, within) or ALLOW
+    return link_reach_too_wide(event, within) or python_ambient_import_verdict(
+        event.command, event.cwd or ws, ws, scopes) or ALLOW
 
 
 # ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
