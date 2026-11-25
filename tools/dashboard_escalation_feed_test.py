@@ -129,6 +129,16 @@ console.log(JSON.stringify({
     return {asker: slice.filter(e => e.plugin_id === 'claude-code').length,
             ruler: slice.filter(e => e.plugin_id === 'codex').length};
   })(),
+  auditEvents: (() => {
+    const events = [
+      asType(approvedOpen, 'gate_escalation_arbiter_refused', {chain_position: 80, hash: 'refusal'}),
+      asType(approvedOpen, 'gate_escalation_payload_drift', {chain_position: 81, hash: 'drift'}),
+      asType(approvedOpen, 'gate_escalation_payload_assertion_mismatch', {chain_position: 82, hash: 'mismatch'}),
+      ...rows('a0a0a0a0approved'),
+    ];
+    return projectEscalations(events, none)
+      .map(e => ({event_type: e.event_type, hash: e.hash, folded: !!e.escalation_view}));
+  })(),
   untouched: projectEscalations([{chain_position: 30, event_type: 'outcome', plugin_id: 'kimi-code', hash: 'o'}], none),
 }));
 """)
@@ -211,6 +221,16 @@ console.log(JSON.stringify({
               got["expiredNoKind"][0]["detail"].endswith("-> expired"), got["expiredNoKind"])
         check("a hostile marker is escaped on the rendered path",
               "<" not in got["hostileDetail"] and "&lt;img" in got["hostileDetail"], got["hostileDetail"])
+        audit = got["auditEvents"]
+        check("refused arbiters and payload drift stay separate from the lifecycle summary",
+              len(audit) == 4
+              and all(r["folded"] == (r["event_type"] == "gate_escalation_decided") for r in audit),
+              audit)
+        check("audit events keep their own event types and chain hashes",
+              {r["event_type"]: r["hash"] for r in audit if r["event_type"] != "gate_escalation_decided"}
+              == {"gate_escalation_arbiter_refused": "refusal",
+                  "gate_escalation_payload_drift": "drift",
+                  "gate_escalation_payload_assertion_mismatch": "mismatch"}, audit)
         check("non-escalation rows pass through unchanged", got["untouched"] == [{
             "chain_position": 30, "event_type": "outcome", "plugin_id": "kimi-code", "hash": "o",
         }])

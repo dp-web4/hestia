@@ -3126,9 +3126,13 @@
   }
 
   function projectEscalations(entries, pendingIds) {
+    const lifecycle = new Set([
+      'gate_escalation_opened', 'gate_escalation_decided', 'gate_escalation_withdrawn',
+      'gate_escalation_expired', 'gate_escalation_claimed',
+    ]);
     const groups = new Map();
     for (const e of entries) {
-      if (!e.event_type.startsWith('gate_escalation_') || !e.escalation_id) continue;
+      if (!e.escalation_id || !lifecycle.has(e.event_type)) continue;
       if (!groups.has(e.escalation_id)) groups.set(e.escalation_id, []);
       groups.get(e.escalation_id).push(e);
     }
@@ -3155,7 +3159,9 @@
       projections.set(id, {source, view: escalationView(source, pendingIds)});
     }
     return entries.flatMap(e => {
-      if (!e.escalation_id) return [e];
+      // Only lifecycle events fold into one summary. Refused arbiters, payload drift,
+      // assertion mismatches, corroborations and future audit kinds stay separate (#1653).
+      if (!e.escalation_id || !lifecycle.has(e.event_type)) return [e];
       const projection = projections.get(e.escalation_id);
       if (!projection) return [e];
       if (projection.source.chain_position !== e.chain_position) return [];
