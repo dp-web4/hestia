@@ -1841,10 +1841,23 @@ impl SqliteInboxStore {
                     "lease witness {event_key} does not match its durable intent and recipient"
                 );
                 if intent.action == "claim" {
+                    let written_expiry = written
+                        .claim_expires_at
+                        .as_deref()
+                        .map(DateTime::parse_from_rfc3339)
+                        .transpose()
+                        .context("parsing persisted written lease expiry")?
+                        .map(|value| value.with_timezone(&Utc));
+                    let witness_expiry = entry.event_data["claim_expires_at"]
+                        .as_str()
+                        .map(DateTime::parse_from_rfc3339)
+                        .transpose()
+                        .context("parsing witnessed lease expiry")?
+                        .map(|value| value.with_timezone(&Utc));
                     anyhow::ensure!(
                         written.claimed_by_session.as_deref() == Some(intent.actor_session.as_str())
-                            && entry.event_data["claim_expires_at"].as_str()
-                                == written.claim_expires_at.as_deref(),
+                            && written_expiry.is_some()
+                            && written_expiry == witness_expiry,
                         "lease witness {event_key} does not match the persisted written lease"
                     );
                 } else {
