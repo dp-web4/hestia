@@ -1585,9 +1585,41 @@ fn resolve_home(cli: &Cli) -> AnyResult<PathBuf> {
     default_hestia_home().context("could not resolve hestia home directory")
 }
 
+/// Read `$HESTIA_HOME/.passphrase` without putting its value in the daemon environment.
+fn read_passphrase_file(home: &std::path::Path) -> AnyResult<Option<String>> {
+    let path = home.join(".passphrase");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let pp = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if pp.is_empty() {
+        anyhow::bail!("{} is empty", path.display());
+    }
+    Ok(Some(pp))
+}
+
+/// The daemon's passphrase: `HESTIA_PASSPHRASE`, then `$HESTIA_HOME/.passphrase` read
+/// in-process, then the TTY. ONLY `cmd_serve` may call this. The file exists on every
+/// installed seat, so reading it in the shared `prompt_passphrase` let any same-UID
+/// CLI call (`vault get`, `vault remove`, `policy set`) unlock the vault with no env
+/// and no TTY (hestia#1587 hold; pinned by tests/passphrase_file_is_serve_only.rs).
+fn serve_passphrase(home: &std::path::Path, prompt: &str) -> AnyResult<String> {
+    if std::env::var_os("HESTIA_PASSPHRASE").is_none() {
+        if let Some(pp) = read_passphrase_file(home)? {
+            return Ok(pp);
+        }
+    }
+    prompt_passphrase(prompt)
+}
+
 /// Resolve a passphrase. Order:
 /// 1. `HESTIA_PASSPHRASE` env var (for automation; not recommended for daily use)
 /// 2. Prompt the TTY via rpassword
+///
+/// Never reads `.passphrase`: a CLI command needs env or a human (see `serve_passphrase`).
 fn prompt_passphrase(prompt: &str) -> AnyResult<String> {
     if let Ok(pp) = std::env::var("HESTIA_PASSPHRASE") {
         if pp.is_empty() {
@@ -1776,7 +1808,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
             path.display()
         );
     }
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let passphrase = serve_passphrase(home, "Vault passphrase: ")?;
     let vault = hestia::Vault::open(path, passphrase.clone())?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
 
@@ -6747,6 +6779,29 @@ mod member_key_source_tests {
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
 }
 
+#[cfg(test)]
+mod passphrase_file_tests {
+    use super::read_passphrase_file;
+
+    #[test]
+    fn a_missing_file_is_not_a_source_and_crlf_is_only_a_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_passphrase_file(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join(".passphrase"), " value with spaces \r\n").unwrap();
+        assert_eq!(
+            read_passphrase_file(dir.path()).unwrap().as_deref(),
+            Some(" value with spaces ")
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".passphrase"), "\r\n").unwrap();
+        let error = read_passphrase_file(dir.path()).unwrap_err().to_string();
+        assert!(error.contains(".passphrase") && error.contains("empty"), "{error}");
+    }
+}
 
 #[cfg(test)]
 mod gate_help_tests {
