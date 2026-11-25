@@ -1792,7 +1792,8 @@ impl SqliteInboxStore {
     /// A matching witness under this operation's unique key accepts the mutation only while
     /// the stored row still equals the persisted post-state; no witness restores the prior
     /// lease under the same operation-bound compare-and-swap. A drained notice is terminal,
-    /// so its intent is moot. Legacy, divergent, or otherwise ambiguous records fail explicitly.
+    /// so its intent is moot. Legacy releases and witnessed claims reconstruct their post-state;
+    /// unwitnessed legacy claims, divergent, or otherwise ambiguous records fail explicitly.
     fn reconcile_member_notice_lease_intents_matching(
         &self,
         chain: &SqliteChainStore,
@@ -1822,11 +1823,43 @@ impl SqliteInboxStore {
                 self.clear_member_notice_lease_intent(id, &to_plugin, &intent.operation_id)?;
                 continue;
             }
-            let Some(written) = intent.written.as_ref() else {
-                return Err(anyhow::anyhow!(
-                    "lease intent for notice {id} operation {} predates persisted post-state and cannot be reconciled automatically",
-                    intent.operation_id
-                ));
+            if let Some(entry) = witness.as_ref() {
+                anyhow::ensure!(
+                    entry.event_type == expected_type
+                        && entry.event_data["notice_id"] == id
+                        && entry.event_data["plugin_id"].as_str() == Some(to_plugin.as_str())
+                        && entry.event_data["session_id"].as_str()
+                            == Some(intent.actor_session.as_str())
+                        && entry.event_data["lease_operation_id"].as_str()
+                            == Some(intent.operation_id.as_str()),
+                    "lease witness {event_key} does not match its durable intent and recipient"
+                );
+            }
+            let synthesized;
+            let written = match intent.written.as_ref() {
+                Some(written) => written,
+                None if intent.action == "release" => {
+                    synthesized = MemberNoticeLease {
+                        claimed_by_session: None,
+                        claim_expires_at: None,
+                    };
+                    &synthesized
+                }
+                None if witness.is_some() => {
+                    synthesized = MemberNoticeLease {
+                        claimed_by_session: Some(intent.actor_session.clone()),
+                        claim_expires_at: current
+                            .as_ref()
+                            .and_then(|lease| lease.claim_expires_at.clone()),
+                    };
+                    &synthesized
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "lease intent for notice {id} operation {} predates persisted post-state and cannot be reconciled automatically",
+                        intent.operation_id
+                    ));
+                }
             };
             let Some(current) = current else {
                 return Err(anyhow::anyhow!(
@@ -1839,16 +1872,6 @@ impl SqliteInboxStore {
                 intent.operation_id
             );
             if let Some(entry) = witness {
-                anyhow::ensure!(
-                    entry.event_type == expected_type
-                        && entry.event_data["notice_id"] == id
-                        && entry.event_data["plugin_id"].as_str() == Some(to_plugin.as_str())
-                        && entry.event_data["session_id"].as_str()
-                            == Some(intent.actor_session.as_str())
-                        && entry.event_data["lease_operation_id"].as_str()
-                            == Some(intent.operation_id.as_str()),
-                    "lease witness {event_key} does not match its durable intent and recipient"
-                );
                 if intent.action == "claim" {
                     let written_expiry = written
                         .claim_expires_at
@@ -4788,7 +4811,92 @@ mod tests {
     }
 
     #[test]
-    fn legacy_lease_intent_without_a_persisted_post_state_fails_explicitly() {
+    fn a_legacy_lease_intent_witnessed_claim_reconstructs_its_post_state() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        let (expiry, operation_id) = claim_operation(&store, id, owner, 60);
+        witness_lease_operation(
+            &chain,
+            id,
+            owner,
+            "member_notice_claimed",
+            &operation_id,
+            Some(&expiry),
+        );
+        store.conn.lock().unwrap().execute(
+            "UPDATE member_notices
+             SET lease_intent_json = json_remove(lease_intent_json, '$.written')
+             WHERE id = ?1",
+            params![id as i64],
+        ).unwrap();
+        drop(store);
+        drop(chain);
+
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        let lease = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+        assert_eq!(lease.claimed_by_session, Some(owner.to_string()));
+        assert_eq!(lease.claim_expires_at, Some(expiry.to_rfc3339()));
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_lease_intent_release_reconstructs_its_empty_post_state() {
+        for witnessed in [false, true] {
+            let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+            let owner = Uuid::new_v4();
+            let later_session = Uuid::new_v4();
+            let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+            settled_claim(&store, &chain, id, owner, 60);
+            let prior = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+            let operation_id = release_operation(&store, id, owner);
+            if witnessed {
+                witness_lease_operation(
+                    &chain,
+                    id,
+                    owner,
+                    "member_notice_released",
+                    &operation_id,
+                    None,
+                );
+            }
+            store.conn.lock().unwrap().execute(
+                "UPDATE member_notices
+                 SET lease_intent_json = json_remove(lease_intent_json, '$.written')
+                 WHERE id = ?1",
+                params![id as i64],
+            ).unwrap();
+            drop(store);
+            drop(chain);
+
+            let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+            store.reconcile_member_notice_lease_intents(&chain).unwrap();
+            let expected = if witnessed {
+                MemberNoticeLease {
+                    claimed_by_session: None,
+                    claim_expires_at: None,
+                }
+            } else {
+                prior
+            };
+            assert_eq!(
+                store.member_notice_lease(id, "kimi-code").unwrap().unwrap(),
+                expected,
+                "witnessed={witnessed}"
+            );
+            assert!(store.member_notice_lease_intents().unwrap().is_empty());
+            if witnessed {
+                assert_eq!(store.drain_member_for_session("kimi-code", later_session).unwrap().len(), 1);
+            } else {
+                assert!(store.drain_member_for_session("kimi-code", later_session).unwrap().is_empty());
+                assert_eq!(store.drain_member_for_session("kimi-code", owner).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_lease_intent_unwitnessed_claim_without_a_persisted_post_state_fails_explicitly() {
         let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
         let owner = Uuid::new_v4();
         let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
