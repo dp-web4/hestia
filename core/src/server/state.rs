@@ -1082,6 +1082,8 @@ impl ServerState {
                 durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
             }));
         }
+        chain_store.durability().flush_committed_blocking()?;
+        inbox_store.reconcile_member_notice_lease_intents(&chain_store)?;
         // The disposition projection cursor is initialized HERE — synchronously,
         // at state open, before any ruling surface is reachable (revised #480
         // review, blocker 2). The r3 shape initialized it lazily on the worker's
@@ -2133,6 +2135,23 @@ impl ServerState {
         super::state_lock::time_section("chain.append", || {
             self.chain_store
                 .append(event_type, event_data, &self.sovereign_lct)
+        })
+    }
+
+    pub fn append_chain_once(
+        &self,
+        event_key: &str,
+        event_type: &str,
+        event_data: serde_json::Value,
+    ) -> Result<ChainEntry> {
+        #[cfg(test)]
+        if self.chain_fault_on.contains(event_type) {
+            anyhow::bail!("injected chain fault on {event_type} (test seam)");
+        }
+        super::state_lock::time_section("chain.append", || {
+            self.chain_store
+                .append_once(event_key, event_type, event_data, &self.sovereign_lct)
+                .map(|(entry, _)| entry)
         })
     }
 

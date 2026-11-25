@@ -583,12 +583,18 @@ pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
 /// the list is in control when it is not).
 fn hub_urls_response(vault: &Vault) -> serde_json::Value {
     let list = HubUrls::load(vault).unwrap_or_default();
+    let (stored_resolved, stored_source) = resolve_from_list(&list);
     let (resolved, source) = resolve_hub_url(vault);
     serde_json::json!({
         "active": list.active,
         "entries": list.entries,
         "resolved": resolved,
         "source": source,
+        "stored_active": list.active,
+        "stored_resolved": stored_resolved,
+        "stored_source": stored_source,
+        "effective_active": resolved,
+        "effective_source": source,
         // A truthful UI note: while the env override is set it wins over any
         // selection here, so editing the list will not change the dialed hub.
         "env_override_active": matches!(source, HubUrlSource::Env),
@@ -613,6 +619,37 @@ pub struct HubUrlAddReq {
     pub activate: Option<bool>,
 }
 
+fn hub_mutation_failure_response(
+    s: &mut crate::server::state::ServerState,
+    mut record: serde_json::Value,
+    intent: crate::storage::chain::ChainEntry,
+    stage: &str,
+    error: anyhow::Error,
+    restore: anyhow::Result<()>,
+) -> axum::response::Response {
+    let restore_error = restore.as_ref().err().map(ToString::to_string);
+    let restore_state = if restore.is_ok() { "restored" } else { "indeterminate" };
+    record["intent"] = serde_json::json!(intent.hash);
+    record["success"] = serde_json::json!(false);
+    record["stage"] = serde_json::json!(stage);
+    record["outcome"] = serde_json::json!(format!("{stage}_failed"));
+    record["error"] = serde_json::json!(error.to_string());
+    record["restore_success"] = serde_json::json!(restore.is_ok());
+    record["restore_state"] = serde_json::json!(restore_state);
+    record["restore_error"] = serde_json::json!(restore_error);
+    let (outcome_hash, outcome_record_error) = match s.append_chain("hub_url_mutation_outcome", record.clone()) {
+        Ok(entry) => (Some(entry.hash), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    record["outcomeEntryHash"] = serde_json::json!(outcome_hash);
+    record["outcome_record_error"] = serde_json::json!(outcome_record_error);
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(record),
+    )
+        .into_response()
+}
+
 fn commit_hub_mutation(
     s: &mut crate::server::state::ServerState,
     list: &HubUrls,
@@ -621,8 +658,22 @@ fn commit_hub_mutation(
     url: &str,
     gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
 ) -> Result<crate::storage::chain::ChainEntry, axum::response::Response> {
+    commit_hub_mutation_with_store(s, list, previous, operation, url, gate, HubUrls::store)
+}
+
+fn commit_hub_mutation_with_store(
+    s: &mut crate::server::state::ServerState,
+    list: &HubUrls,
+    previous: &HubUrls,
+    operation: &str,
+    url: &str,
+    gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
+    mut store: impl FnMut(&HubUrls, &mut Vault) -> anyhow::Result<()>,
+) -> Result<crate::storage::chain::ChainEntry, axum::response::Response> {
     let (previous_active, previous_active_source) = resolve_with_env(previous);
     let (new_active, new_active_source) = resolve_with_env(list);
+    let (previous_stored_resolved, previous_stored_source) = resolve_from_list(previous);
+    let (new_stored_resolved, new_stored_source) = resolve_from_list(list);
     let record = serde_json::json!({
         "operation": operation,
         "url": url,
@@ -630,6 +681,16 @@ fn commit_hub_mutation(
         "previous_active_source": previous_active_source,
         "new_active": new_active,
         "new_active_source": new_active_source,
+        "previous_stored_active": previous.active,
+        "previous_stored_resolved": previous_stored_resolved,
+        "previous_stored_source": previous_stored_source,
+        "new_stored_active": list.active,
+        "new_stored_resolved": new_stored_resolved,
+        "new_stored_source": new_stored_source,
+        "previous_effective_active": previous_active,
+        "previous_effective_source": previous_active_source,
+        "new_effective_active": new_active,
+        "new_effective_source": new_active_source,
     });
     let record = match gate {
         Some(axum::Extension(witness)) => witness.stamp(record),
@@ -645,36 +706,32 @@ fn commit_hub_mutation(
         }
     };
 
-    if let Err(error) = list.store(&mut s.vault) {
-        let restore = previous.store(&mut s.vault);
-        return Err(match restore {
-            Ok(()) => err_json(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persisting hub list failed ({error}); previous configuration restored"),
-            ),
-            Err(restore_error) => err_json(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persisting hub list failed ({error}); restore also failed ({restore_error})"),
-            ),
-        });
+    if let Err(error) = store(list, &mut s.vault) {
+        let restore = store(previous, &mut s.vault);
+        return Err(hub_mutation_failure_response(
+            s,
+            record,
+            intent,
+            "save",
+            error,
+            restore,
+        ));
     }
     let mut success = record;
     success["intent"] = serde_json::json!(intent.hash);
     success["success"] = serde_json::json!(true);
-    match s.append_chain("hub_url_mutation", success) {
+    match s.append_chain("hub_url_mutation", success.clone()) {
         Ok(entry) => Ok(entry),
         Err(error) => {
-            let restore = previous.store(&mut s.vault);
-            match restore {
-                Ok(()) => Err(err_json(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("hub mutation was not recorded ({error}); previous configuration restored"),
-                )),
-                Err(restore_error) => Err(err_json(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("hub mutation was not recorded ({error}); restore also failed ({restore_error})"),
-                )),
-            }
+            let restore = store(previous, &mut s.vault);
+            Err(hub_mutation_failure_response(
+                s,
+                success,
+                intent,
+                "witness",
+                error,
+                restore,
+            ))
         }
     }
 }
@@ -1417,6 +1474,12 @@ mod tests {
             Json(HubUrlAddReq { url: url.into(), label: None, activate: Some(true) }),
         ).await.into_response();
         assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["success"], false, "{body}");
+        assert_eq!(body["outcome"], "witness_failed", "{body}");
+        assert_eq!(body["restore_state"], "restored", "{body}");
+        assert!(body["outcomeEntryHash"].is_string(), "{body}");
 
         {
             let mut s = state.lock().await;
@@ -1431,6 +1494,13 @@ mod tests {
             assert_eq!(intents[0].event_data["url"], url);
             assert_eq!(intents[0].event_data["new_active"], url);
             assert_ne!(intents[0].event_data["success"], true);
+            let outcome = chain.iter()
+                .find(|entry| entry.event_type == "hub_url_mutation_outcome")
+                .expect("the failed success append has a terminal outcome");
+            assert_eq!(outcome.event_data["intent"], intents[0].hash);
+            assert_eq!(outcome.event_data["outcome"], "witness_failed");
+            assert_eq!(outcome.event_data["restore_state"], "restored");
+            assert_eq!(outcome.event_data["success"], false);
             assert!(!chain.iter().any(|entry| entry.event_type == "hub_url_mutation"),
                     "a failed append produced a success event");
             s.chain_fault_on.clear();
@@ -1453,6 +1523,78 @@ mod tests {
         assert!(!s.recent_chain(20).iter().any(|entry|
             entry.event_data["url"] == "https://must-not-persist.example"));
         restore_hub_env(previous);
+    }
+
+    #[tokio::test]
+    async fn failed_saves_record_restore_outcomes_and_stored_selection() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_env = take_hub_env();
+        for restore_ok in [true, false] {
+            let (_dir, state) = shared_state();
+            let url = if restore_ok { "https://restored.example" } else { "https://indeterminate.example" };
+            let list = HubUrls {
+                active: Some(url.into()),
+                entries: vec![HubUrlEntry { url: url.into(), label: None, added_at: None }],
+            };
+            let previous = HubUrls::default();
+            let gate = None;
+            let mut calls = 0;
+            let response = {
+                let mut s = state.lock().await;
+                commit_hub_mutation_with_store(
+                    &mut s,
+                    &list,
+                    &previous,
+                    "add",
+                    url,
+                    &gate,
+                    |candidate, vault| {
+                        calls += 1;
+                        if calls == 1 {
+                            Err(anyhow::anyhow!("injected save failure"))
+                        } else if restore_ok {
+                            candidate.store(vault)
+                        } else {
+                            Err(anyhow::anyhow!("injected restore failure"))
+                        }
+                    },
+                )
+            };
+            let response = match response {
+                Ok(entry) => panic!("a failed save unexpectedly succeeded: {entry:?}"),
+                Err(response) => response,
+            };
+            assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let expected_state = if restore_ok { "restored" } else { "indeterminate" };
+            assert_eq!(body["success"], false, "{body}");
+            assert_eq!(body["outcome"], "save_failed", "{body}");
+            assert_eq!(body["stage"], "save", "{body}");
+            assert_eq!(body["restore_state"], expected_state, "{body}");
+            assert_eq!(body["restore_success"], restore_ok, "{body}");
+            assert_eq!(body["new_stored_active"], url, "{body}");
+            assert!(body["outcomeEntryHash"].is_string(), "{body}");
+            if restore_ok {
+                assert_eq!(body["restore_error"], serde_json::Value::Null, "{body}");
+            } else {
+                assert!(body["restore_error"].as_str().unwrap().contains("restore failure"), "{body}");
+            }
+
+            let s = state.lock().await;
+            let chain = s.recent_chain(10);
+            let intent = chain.iter().find(|entry| entry.event_type == "hub_url_mutation_intent")
+                .expect("save intent");
+            let outcome = chain.iter().find(|entry| entry.event_type == "hub_url_mutation_outcome")
+                .expect("terminal save outcome");
+            assert_eq!(outcome.event_data["intent"], intent.hash);
+            assert_eq!(outcome.event_data["success"], false);
+            assert_eq!(outcome.event_data["outcome"], "save_failed");
+            assert_eq!(outcome.event_data["restore_state"], expected_state);
+            assert_eq!(outcome.event_data["new_stored_active"], url);
+            assert_eq!(outcome.event_data["previous_stored_active"], serde_json::Value::Null);
+        }
+        restore_hub_env(previous_env);
     }
 
     #[tokio::test]
@@ -1479,6 +1621,10 @@ mod tests {
             }),
         ).await.into_response();
         assert_eq!(added.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(added.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stored_active"], "https://second.example");
+        assert_eq!(body["effective_active"], "https://second.example");
 
         std::env::set_var("HESTIA_HUB_URL", "https://env.example/");
         let activated = hub_urls_set_active(
@@ -1487,6 +1633,13 @@ mod tests {
             Json(HubUrlRefReq { url: "https://first.example".into() }),
         ).await.into_response();
         assert_eq!(activated.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(activated.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["active"], "https://first.example");
+        assert_eq!(body["stored_active"], "https://first.example");
+        assert_eq!(body["effective_active"], "https://env.example");
+        assert_eq!(body["stored_source"], "active");
+        assert_eq!(body["effective_source"], "env");
         restore_hub_env(previous);
 
         let chain = state.lock().await.recent_chain(20);
@@ -1495,11 +1648,15 @@ mod tests {
         ).unwrap();
         assert_eq!(added.event_data["previous_active"], "https://first.example");
         assert_eq!(added.event_data["new_active"], "https://second.example");
+        assert_eq!(added.event_data["previous_stored_active"], serde_json::Value::Null);
+        assert_eq!(added.event_data["new_stored_active"], "https://second.example");
         let activated = chain.iter().find(|entry|
             entry.event_type == "hub_url_mutation" && entry.event_data["operation"] == "activate"
         ).unwrap();
         assert_eq!(activated.event_data["previous_active"], "https://env.example");
         assert_eq!(activated.event_data["new_active"], "https://env.example");
+        assert_eq!(activated.event_data["previous_stored_active"], "https://second.example");
+        assert_eq!(activated.event_data["new_stored_active"], "https://first.example");
         assert!(added.event_data["intent"].is_string());
         assert!(activated.event_data["intent"].is_string());
     }
