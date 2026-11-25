@@ -195,6 +195,27 @@ CASES = [
     ("patch__no_input_fails_closed",
      "patch -p1", "write", OPQ),
 
+    # --- destructive git reset (#798): valid hard-option abbreviations are opaque writes;
+    # other reset modes, invalid values, and pathspecs after `--` stay unmodified.
+    ("git_reset_hard__opaque_destructive",
+     "git reset --hard", "write", OPQ),
+    ("git_reset_h__opaque_destructive",
+     "git reset --h", "write", OPQ),
+    ("git_reset_ha__opaque_destructive",
+     "git reset -q --ha HEAD", "write", OPQ),
+    ("git_reset_har__opaque_destructive",
+     "git reset HEAD --har", "write", OPQ),
+    ("git_reset_hard_value__not_a_valid_hard_reset",
+     "git reset --hard=1", "none", None),
+    ("git_reset_hard_pathspec__not_a_mode",
+     "git reset -- --hard", "none", None),
+    ("git_reset_named_hard_pathspec__not_a_mode",
+     "git reset HEAD -- --hard", "none", None),
+    ("git_reset_soft__not_a_hard_reset",
+     "git reset --soft HEAD~1", "none", None),
+    ("git_reset_mixed__not_a_hard_reset",
+     "git reset HEAD~1", "none", None),
+
     # --- read-FP shapes: a quoted `>` or a heredoc body must NOT create a write target ---
     ("quoted_redirect_in_arg__not_write",
      f"echo 'a > {HOOKS}/{HOOK}'", "not-write", None),
@@ -552,7 +573,44 @@ def test_block_and_its_unblocked_body_agree():
     check("block_and_body_agree", not failures, "\n  ".join(failures))
 
 
+def test_git_reset_hard_abbreviations_match_real_git():
+    cases = [
+        (("--h",), True, "write"),
+        (("--ha",), True, "write"),
+        (("--har",), True, "write"),
+        (("--hard",), True, "write"),
+        (("--", "--hard"), False, "none"),
+        (("HEAD", "--", "--hard"), False, "none"),
+    ]
+    with tempfile.TemporaryDirectory(prefix="shell-grammar-reset-") as raw:
+        for index, (args, destroys, expected) in enumerate(cases):
+            repo = os.path.join(raw, str(index))
+            os.mkdir(repo)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "probe@example.invalid"],
+                           cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "probe"], cwd=repo, check=True)
+            tracked = os.path.join(repo, "tracked.txt")
+            with open(tracked, "w", encoding="utf-8") as fh:
+                fh.write("committed\n")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True,
+                           capture_output=True)
+            with open(tracked, "w", encoding="utf-8") as fh:
+                fh.write("uncommitted\n")
+            result = subprocess.run(["git", "reset", *args], cwd=repo,
+                                    capture_output=True, text=True)
+            check(f"real git reset {args} succeeds", result.returncode == 0, result.stderr)
+            with open(tracked, encoding="utf-8") as fh:
+                destroyed = fh.read() == "committed\n"
+            check(f"real git reset {args} destructive arm", destroyed == destroys)
+            verdict = cls("git reset " + " ".join(args))
+            check(f"classifier agrees with real git reset {args}",
+                  verdict.classification == expected, verdict)
+
+
 ALL = [
+    test_git_reset_hard_abbreviations_match_real_git,
     test_explicit_all_grammar_cases,
     test_differential_against_real_shell,
     test_block_and_its_unblocked_body_agree,
