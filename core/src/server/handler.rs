@@ -10817,7 +10817,7 @@ fn resolve_escalation_pointer_for_session(
         "factors_present": if asking_session_proven { settled_get("factors_present") } else { Value::Null },
         "reason": if asking_session_proven { settled_get("reason") } else { Value::Null },
         "settled_entry": if asking_session_proven {
-            settled.as_ref().map(chain_entry_json)
+            settled.as_ref().map(chain_entry_json).unwrap_or(Value::Null)
         } else {
             Value::Null
         },

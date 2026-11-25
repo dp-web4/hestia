@@ -1900,16 +1900,18 @@ impl SqliteChainStore {
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(
-            params![escalation_id, ESCALATION_HISTORY_MAX_ROWS + 1],
+            params![escalation_id, Self::ESCALATION_HISTORY_MAX_ROWS + 1],
             row_to_entry,
         )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r??);
         }
-        if out.len() as i64 > ESCALATION_HISTORY_MAX_ROWS {
+        if out.len() as i64 > Self::ESCALATION_HISTORY_MAX_ROWS {
             anyhow::bail!(
-                "escalation '{escalation_id}' exceeds {ESCALATION_HISTORY_MAX_ROWS} history rows; refusing a partial or unbounded recovery"
+                "escalation '{}' exceeds {} history rows; refusing a partial or unbounded recovery",
+                escalation_id,
+                Self::ESCALATION_HISTORY_MAX_ROWS
             );
         }
         Ok(out)
