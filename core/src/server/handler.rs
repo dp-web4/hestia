@@ -9424,6 +9424,7 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                     ));
                 }
             };
+            s.inbox_store.clear_member_notice_lease_intent(notice_id, &who.plugin_id)?;
             Ok(json!({
                 "notice_id": notice_id,
                 "claimed": true,
@@ -9460,6 +9461,9 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
             } else {
                 None
             };
+            if was_claimed {
+                s.inbox_store.clear_member_notice_lease_intent(notice_id, &who.plugin_id)?;
+            }
             Ok(json!({
                 "notice_id": notice_id,
                 "released": was_claimed,

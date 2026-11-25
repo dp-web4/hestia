@@ -1082,6 +1082,7 @@ impl ServerState {
                 durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
             }));
         }
+        inbox_store.reconcile_member_notice_lease_intents(&chain_store.read_recent(u64::MAX)?)?;
         // The disposition projection cursor is initialized HERE — synchronously,
         // at state open, before any ruling surface is reachable (revised #480
         // review, blocker 2). The r3 shape initialized it lazily on the worker's
