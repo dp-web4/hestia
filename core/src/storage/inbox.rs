@@ -1793,8 +1793,17 @@ impl SqliteInboxStore {
     /// the stored row still equals the persisted post-state; no witness restores the prior
     /// lease under the same operation-bound compare-and-swap. A drained notice is terminal,
     /// so its intent is moot. Legacy, divergent, or otherwise ambiguous records fail explicitly.
-    pub fn reconcile_member_notice_lease_intents(&self, chain: &SqliteChainStore) -> Result<()> {
+    fn reconcile_member_notice_lease_intents_matching(
+        &self,
+        chain: &SqliteChainStore,
+        only: Option<(u64, &str)>,
+    ) -> Result<()> {
         for (id, to_plugin, intent) in self.member_notice_lease_intents()? {
+            if only.is_some_and(|(wanted_id, wanted_plugin)| {
+                id != wanted_id || to_plugin != wanted_plugin
+            }) {
+                continue;
+            }
             let expected_type = match intent.action.as_str() {
                 "claim" => "member_notice_claimed",
                 "release" => "member_notice_released",
@@ -1882,6 +1891,19 @@ impl SqliteInboxStore {
             }
         }
         Ok(())
+    }
+
+    pub fn reconcile_member_notice_lease_intents(&self, chain: &SqliteChainStore) -> Result<()> {
+        self.reconcile_member_notice_lease_intents_matching(chain, None)
+    }
+
+    pub fn reconcile_member_notice_lease_intent(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        chain: &SqliteChainStore,
+    ) -> Result<()> {
+        self.reconcile_member_notice_lease_intents_matching(chain, Some((id, to_plugin)))
     }
 
     /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
@@ -3974,6 +3996,20 @@ mod tests {
         (tmp, store)
     }
 
+    fn clear_lease_intent_for_test(store: &SqliteInboxStore, id: u64) {
+        let intents: Vec<_> = store
+            .member_notice_lease_intents()
+            .unwrap()
+            .into_iter()
+            .filter(|(intent_id, _, _)| *intent_id == id)
+            .collect();
+        assert_eq!(intents.len(), 1);
+        let (_, to_plugin, intent) = &intents[0];
+        store
+            .clear_member_notice_lease_intent(id, to_plugin, &intent.operation_id)
+            .unwrap();
+    }
+
     /// Row-level probes for the retention tests. `pending_egress` is not usable for
     /// these: it filters on `drained_at IS NULL`, so a DELIVERED row and a DELETED one
     /// are indistinguishable through it — which is exactly the confusion T2 hid in.
@@ -4055,6 +4091,7 @@ mod tests {
             }
             other => panic!("first claim failed: {other:?}"),
         };
+        clear_lease_intent_for_test(&store, id);
         assert!(matches!(
             store
                 .claim_member_notice(id, "kimi-code", bystander, 60)
@@ -4076,6 +4113,7 @@ mod tests {
             }
             other => panic!("owner renewal failed: {other:?}"),
         }
+        clear_lease_intent_for_test(&store, id);
 
         assert!(store
             .drain_member_for_session("kimi-code", bystander)
@@ -4109,12 +4147,14 @@ mod tests {
                 ..
             }
         ));
+        clear_lease_intent_for_test(&store, id);
         assert!(matches!(
             store
                 .claim_member_notice(id, "kimi-code", bystander, 60)
                 .unwrap(),
             MemberNoticeClaimOutcome::Claimed { .. }
         ));
+        clear_lease_intent_for_test(&store, id);
         assert_eq!(
             store
                 .drain_member_for_session("kimi-code", bystander)
@@ -4147,6 +4187,7 @@ mod tests {
                 .unwrap(),
             MemberNoticeClaimOutcome::Claimed { .. }
         ));
+        clear_lease_intent_for_test(&store, id);
         store
             .conn
             .lock()
@@ -4171,6 +4212,7 @@ mod tests {
             }
             other => panic!("expired claim was not reclaimable: {other:?}"),
         }
+        clear_lease_intent_for_test(&store, id);
         assert!(matches!(
             store
                 .claim_member_notice(id, "kimi-code", owner, 60)
