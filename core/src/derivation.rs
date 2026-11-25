@@ -264,9 +264,9 @@ fn ema_fold(scores: &[f64]) -> Option<f64> {
 /// A projection that silently omits a key does not fail; it derives a WRONG number and
 /// looks fine, so this list is load-bearing and belongs next to the code that reads it.
 pub const DERIVATION_KEYS: &[&str] = &[
-    "about_deny_hash", "action_id", "adjudicator", "alias", "alias_of", "answers_deny",
+    "about_deny_hash", "action_id", "adjudicated_by", "adjudicator", "alias", "alias_of", "answers_deny",
     "attempted", "axis", "before_position", "cause", "charge", "charge_held_by", "class",
-    "conduct", "confirmed_by", "correction_hash", "data", "decision", "deny_hash", "depends_on",
+    "conduct", "confirmed_by", "correction_hash", "data", "decision", "declared_by", "deny_hash", "depends_on",
     "enforced", "escalation_id", "magnitude", "member", "method", "outcome_hash", "plugin_id",
     "reason", "ref", "reported_by", "requested_by", "reversal_hash", "role_lct", "row", "schema",
     "score", "session_id", "status", "subject_instance_lct", "subject_plugin_id", "subject_role",
@@ -1800,6 +1800,47 @@ mod tests {
              is what cost hestia its credibility in a screenshot"
         );
         assert_eq!(with.level, "high", "saturated volume, no adverse conduct");
+    }
+
+    #[test]
+    fn projected_authority_witnesses_match_full_row_derivation() {
+        let role = "role:constellation:interactive-dev";
+        let full = vec![
+            entry(1, 0, "policy_decision", json!({
+                "plugin_id":"codex", "role_lct":role, "decision":"deny",
+                "action_id":"a1", "tool_name":"Bash", "target":"synthetic"
+            })),
+            entry(2, 1, "amnesty", json!({
+                "declared_by":{"operator":true},
+                "data":{"class":"deny", "before_position":2}
+            })),
+            entry(3, 2, "adjudication", json!({
+                "subject_plugin_id":"codex", "subject_role":role, "axis":"validity",
+                "verdict":"refuted", "score":0.0,
+                "adjudicated_by":{"plugin_id":"claude-code"}
+            })),
+            entry(4, 3, "adjudication", json!({
+                "subject_plugin_id":"codex", "subject_role":role, "axis":"validity",
+                "verdict":"upheld", "score":1.0, "supersedes":"hash-3",
+                "adjudicated_by":{"plugin_id":"codex"}
+            })),
+        ];
+        let projected: Vec<_> = full.iter().map(|e| {
+            let data = serde_json::to_string(&e.event_data).unwrap();
+            let timestamp = e.timestamp.to_rfc3339();
+            project_row(crate::storage::chain::ChainRowRef {
+                chain_position:e.chain_position, hash:&e.hash, prev_hash:&e.prev_hash,
+                event_type:&e.event_type, event_data:&data, signer_lct:&e.signer_lct,
+                timestamp:&timestamp,
+            }).unwrap()
+        }).collect();
+        let expected = derive_evidence("codex", role, &full);
+        let actual = derive_evidence("codex", role, &projected);
+        assert_eq!(expected.temperament.observations, 0, "the sovereign amnesty is effective");
+        assert_eq!(expected.validity.observations, 2, "the subject replacement retires nothing");
+        assert_eq!(actual.temperament.observations, expected.temperament.observations);
+        assert_eq!(actual.validity.observations, expected.validity.observations);
+        assert_eq!(actual.validity.score, expected.validity.score);
     }
 
     /// THE WINDOW FIX, MEASURED — a differential, not an assertion about a constant.
