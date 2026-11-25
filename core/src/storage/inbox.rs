@@ -4820,6 +4820,45 @@ mod tests {
 
     #[test]
     fn a_legacy_lease_intent_witnessed_claim_reconstructs_its_post_state() {
+        for z_spelling in [false, true] {
+            let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+            let owner = Uuid::new_v4();
+            let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+            let (expiry, operation_id) = claim_operation(&store, id, owner, 60);
+            witness_lease_operation(
+                &chain,
+                id,
+                owner,
+                "member_notice_claimed",
+                &operation_id,
+                Some(&expiry),
+            );
+            let row_expiry = if z_spelling {
+                expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            } else {
+                expiry.to_rfc3339()
+            };
+            store.conn.lock().unwrap().execute(
+                "UPDATE member_notices
+                 SET lease_intent_json = json_remove(lease_intent_json, '$.written'),
+                     claim_expires_at = ?1
+                 WHERE id = ?2",
+                params![row_expiry, id as i64],
+            ).unwrap();
+            drop(store);
+            drop(chain);
+
+            let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+            store.reconcile_member_notice_lease_intents(&chain).unwrap();
+            let lease = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+            assert_eq!(lease.claimed_by_session, Some(owner.to_string()));
+            assert_eq!(lease.claim_expires_at, Some(row_expiry), "z_spelling={z_spelling}");
+            assert!(store.member_notice_lease_intents().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_legacy_lease_intent_witnessed_claim_rejects_a_divergent_row_expiry() {
         let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
         let owner = Uuid::new_v4();
         let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
@@ -4834,19 +4873,23 @@ mod tests {
         );
         store.conn.lock().unwrap().execute(
             "UPDATE member_notices
-             SET lease_intent_json = json_remove(lease_intent_json, '$.written')
-             WHERE id = ?1",
-            params![id as i64],
+             SET lease_intent_json = json_remove(lease_intent_json, '$.written'),
+                 claim_expires_at = ?1
+             WHERE id = ?2",
+            params!["2000-01-01T00:00:00+00:00", id as i64],
         ).unwrap();
         drop(store);
         drop(chain);
 
         let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
-        store.reconcile_member_notice_lease_intents(&chain).unwrap();
-        let lease = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
-        assert_eq!(lease.claimed_by_session, Some(owner.to_string()));
-        assert_eq!(lease.claim_expires_at, Some(expiry.to_rfc3339()));
-        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+        let err = store.reconcile_member_notice_lease_intents(&chain).unwrap_err();
+        assert!(err.to_string().contains("does not match the persisted written lease"), "{err:#}");
+        assert_eq!(store.member_notice_lease_intents().unwrap().len(), 1);
+        assert_eq!(
+            store.member_notice_lease(id, "kimi-code").unwrap().unwrap().claim_expires_at,
+            Some("2000-01-01T00:00:00+00:00".to_string()),
+            "recovery must surface the divergent row, not adopt or overwrite it"
+        );
     }
 
     #[test]
