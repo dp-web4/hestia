@@ -1680,6 +1680,20 @@ impl SqliteInboxStore {
         .context("reading member notice lease")
     }
 
+    fn member_notice_lease_intent_is_moot(&self, id: u64, to_plugin: &str) -> Result<bool> {
+        let conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        conn.query_row(
+            "SELECT drained_at FROM member_notices
+             WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL",
+            params![id as i64, to_plugin],
+            |row| Ok(row.get::<_, Option<String>>(0)?.is_some()),
+        )
+        .optional()
+        .map(|state| state.unwrap_or(false))
+        .context("checking whether a member notice lease intent is moot")
+    }
+
     /// Compare-and-swap a lease back to `prior`, but only while the row still holds exactly
     /// `written` (the change being undone) and is undrained. Returns whether the row was
     /// restored; `false` means something else changed it meanwhile and the caller must
@@ -1768,8 +1782,10 @@ impl SqliteInboxStore {
 
     /// Reconcile a lease intent left by a crash between the SQLite commit and its witness.
     /// A witness under this operation's unique key accepts the mutation; no witness restores
-    /// the prior lease. Any unreadable intent, conflicting witness, or failed restore is an
-    /// error, so the unresolved state stays visible instead of becoming consumable silently.
+    /// the prior lease. If a crash loses an acknowledged but not-yet-durable witness, the
+    /// restore still happens: this is at-least-once recovery, not a promise that every reply
+    /// survives every crash. A drained notice is already terminal, so its intent is moot and
+    /// cannot block state open. Other unreadable or uncertain states remain explicit errors.
     pub fn reconcile_member_notice_lease_intents(&self, chain: &SqliteChainStore) -> Result<()> {
         for (id, to_plugin, intent) in self.member_notice_lease_intents()? {
             let expected_type = match intent.action.as_str() {
@@ -1798,8 +1814,12 @@ impl SqliteInboxStore {
                 continue;
             }
             let Some(written) = self.member_notice_lease(id, &to_plugin)? else {
+                if self.member_notice_lease_intent_is_moot(id, &to_plugin)? {
+                    self.clear_member_notice_lease_intent(id, &to_plugin, &intent.operation_id)?;
+                    continue;
+                }
                 return Err(anyhow::anyhow!(
-                    "unwitnessed lease change for notice {id} is missing or already drained"
+                    "unwitnessed lease change for notice {id} is missing or ambiguous"
                 ));
             };
             if !self.restore_member_notice_lease(id, &to_plugin, &written, &intent.prior)? {
@@ -4378,6 +4398,24 @@ mod tests {
             "the unwitnessed claim must not block a post-restart session"
         );
         assert!(store.drain_member_for_session("kimi-code", later_session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_drained_lease_intent_is_moot_and_never_redelivers_the_notice() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        claim_operation(&store, id, owner, 60);
+        assert_eq!(store.drain_member_for_session("kimi-code", owner).unwrap().len(), 1);
+        assert_eq!(store.member_notice_lease_intents().unwrap().len(), 1);
+        drop(store);
+        drop(chain);
+
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+        assert!(store.drain_member_for_session("kimi-code", owner).unwrap().is_empty(),
+            "reconciling a moot intent must not redeliver the drained notice");
     }
 
     #[test]
