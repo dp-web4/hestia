@@ -3636,18 +3636,27 @@ fn redact_secrets(input: &str) -> String {
 
 /// Is `feedback.act` — a digest over `redacted`, the whole attempt after `redact_secrets` — an
 /// IDENTITY of the act, so that two equal digests mean two equal acts? Only when nothing was
-/// masked or bounded anywhere in the input: not by this daemon (`redacted` differs from the
-/// whitespace-normalised `raw`), and not by the sender (its `***` value mask, `[REDACTED —`
+/// masked, bounded, or whitespace-normalised anywhere in the input: not by this daemon
+/// (`redacted` differs from `raw`), and not by the sender (its `***` value mask, `[REDACTED —`
 /// withholding, or `…` cut, which `attempted_summary` applies before the daemon sees the text).
 /// Decided at the producer over the whole input because the row's `attempted` is capped at
 /// `ATTEMPTED_MAX`: a mask past the cap is invisible to any reader of the row (NOVA's re-review
 /// of 7c73d48c9). Conservative: a command that merely contains `***` or `…` reads as not exact.
 fn act_exact_of(raw: &str, redacted: &str) -> bool {
-    let normalised = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    redacted == normalised
+    redacted == raw
         && !redacted.contains('…')
         && !redacted.contains("[REDACTED —")
         && !redacted.contains("***")
+}
+
+#[test]
+fn literal_whitespace_differences_are_not_exact_retries() {
+    let quoted = "printf 'alpha beta'";
+    assert!(act_exact_of(quoted, quoted));
+    assert!(!act_exact_of(quoted, "printf 'alpha  beta'"));
+    assert!(!act_exact_of(quoted, "printf 'alpha beta' "));
+    let heredoc = "cat <<'EOF'\nalpha beta\nEOF";
+    assert!(!act_exact_of(heredoc, "cat <<'EOF'\nalpha  beta\nEOF"));
 }
 
 // =========================================================================
