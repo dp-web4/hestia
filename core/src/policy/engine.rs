@@ -62,6 +62,16 @@ impl PolicyEngine {
     /// are skipped *if under their limit* (the rule fires only when the
     /// limit has been exceeded).
     pub fn evaluate(&self, action: &PolicyAction<'_>) -> PolicyEvaluation {
+        self.evaluate_inner(action, false)
+    }
+
+    /// The same rules and fold inputs as `evaluate`, with no rate-limit mutation. A dry run
+    /// observes the limits a live call would see; it never consumes or prunes them.
+    pub fn evaluate_read_only(&self, action: &PolicyAction<'_>) -> PolicyEvaluation {
+        self.evaluate_inner(action, true)
+    }
+
+    fn evaluate_inner(&self, action: &PolicyAction<'_>, read_only: bool) -> PolicyEvaluation {
         // Accumulated across every rule consulted, not just the one that fires: the case
         // worth auditing is precisely the rule that did NOT match because its projection
         // blanked the token.
@@ -73,9 +83,14 @@ impl PolicyEngine {
             // Rate-limit gate
             if let Some(rl) = &rule.r#match.rate_limit {
                 let key = self.rate_limit_key(rule, action);
-                // Check and record as one step: evaluation runs concurrently (#1272).
-                if self.rate_limiter.admit(&key, rl.max_count, rl.window_ms).allowed {
-                    // Under the limit — firing recorded; skip (rule doesn't apply yet)
+                // Live admission is atomic (#1272); a dry run only observes the same window.
+                let admission = if read_only {
+                    self.rate_limiter.peek(&key, rl.max_count, rl.window_ms)
+                } else {
+                    self.rate_limiter.admit(&key, rl.max_count, rl.window_ms)
+                };
+                if admission.allowed {
+                    // Under the limit — a live call is recorded; skip (rule doesn't apply yet)
                     continue;
                 }
                 // Over the limit — rule fires
@@ -213,6 +228,30 @@ mod tests {
         let b = a.clone();
         assert!(std::sync::Arc::ptr_eq(&a.rate_limiter, &b.rate_limiter));
         assert_eq!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn read_only_evaluation_matches_live_without_consuming_the_limit() {
+        let engine = PolicyEngine::new(serde_json::from_value(serde_json::json!({
+            "name": "rl", "version": "1", "enforce": true, "default_policy": "allow",
+            "rules": [{"id": "one", "name": "one", "priority": 1,
+              "match": {"tools": ["Read"], "rate_limit": {"max_count": 1, "window_ms": 60000}},
+              "decision": "deny"}]
+        })).unwrap());
+        let action = PolicyAction {
+            tool_name: "Read", category: "file_read", target: Some("/tmp/example"), full_command: None,
+        };
+        for _ in 0..2 {
+            assert_eq!(engine.evaluate_read_only(&action).decision, PolicyDecision::Allow);
+        }
+        assert_eq!(engine.rate_limiter.count("ratelimit:one:tool:Read"), 0);
+        assert_eq!(engine.evaluate(&action).decision, PolicyDecision::Allow);
+        assert_eq!(engine.rate_limiter.count("ratelimit:one:tool:Read"), 1);
+        assert_eq!(engine.evaluate_read_only(&action).decision, PolicyDecision::Deny);
+        assert_eq!(engine.rate_limiter.count("ratelimit:one:tool:Read"), 1);
+        assert_eq!(engine.evaluate(&action).decision, PolicyDecision::Deny);
+        assert_eq!(engine.evaluate_read_only(&action).decision, PolicyDecision::Deny);
+        assert_eq!(engine.rate_limiter.count("ratelimit:one:tool:Read"), 1);
     }
 
     /// Codex's #1272 reproduction, as a guard: 16 threads on live and published clones of one

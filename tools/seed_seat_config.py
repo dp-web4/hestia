@@ -312,6 +312,75 @@ def verify_rendered(hestia_home: Path, documents: list[tuple[str, dict]]) -> lis
     return missing
 
 
+def projection_problems(result: dict, documents: list[tuple[str, dict]]) -> list[str]:
+    """Why this seed's projections are NOT ready, or [] when they are.
+
+    Ready needs both halves: the daemon's typed `ready: true`, and exactly one `verified` verdict
+    for every seat this tool asked for. Neither is trusted alone. A daemon that predates #993
+    sends no `ready` at all, and its `ok: true` meant only that the vault commit landed; that
+    is reported as "did not report readiness", never read as ready.
+    """
+    statuses: dict[str, list] = {}
+    for verdict in result.get("verdict") or []:
+        if isinstance(verdict, dict):
+            statuses.setdefault(verdict.get("member"), []).append(verdict.get("status"))
+    problems = []
+    if "ready" not in result:
+        problems.append("daemon: did not report readiness (a daemon older than #993?); "
+                        "its ok/seeded answer covers the vault commit only")
+    elif result.get("ready") is not True:
+        reason = result.get("ready_reason")
+        problems.append("daemon: ready is not true" + (f" ({reason})" if reason else ""))
+    for member, _ in documents:
+        if member == SHARED_MEMBER:
+            continue
+        seen = statuses.get(member) or []
+        if not seen:
+            problems.append(f"{member}: no projection verdict")
+        elif len(seen) > 1:
+            problems.append(f"{member}: {len(seen)} verdicts for one seat ({', '.join(map(str, seen))})")
+        elif seen[0] != "verified":
+            problems.append(f"{member}: {seen[0]}")
+    return problems
+
+
+def report_seed_result(result: dict, documents: list[tuple[str, dict]],
+                       hestia_home: Path) -> int:
+    for verdict in result.get("verdict") or []:
+        if isinstance(verdict, dict):
+            print(f"  {verdict.get('member', '?'):14} {verdict.get('status', verdict)}")
+    print(f"\nSeeded {result.get('seeded')} in one act "
+          f"(intent {str(result.get('intentEntryHash'))[:12]}).")
+
+    problems = projection_problems(result, documents)
+    if problems:
+        print("\nAUTHORITY SEEDED; PROJECTION NOT READY — the vault commit is preserved, but")
+        print("  every required installed seat must verify before the seats can act.")
+        for line in problems:
+            print(f"  ! {line}")
+        return 1
+
+    unrendered = verify_rendered(hestia_home, documents)
+    if unrendered:
+        print("\nAUTHORITY SEEDED; PROJECTION NOT READY — the vault commit is preserved, but")
+        print("  the local projection check failed. The daemon is the renderer; check it is")
+        print("  current and running, then repair/re-render without reseeding.")
+        for line in unrendered:
+            print(f"  ! {line}")
+        return 1
+    print("Every seeded seat's projection rendered with its keys.")
+    if result.get("readiness_recorded") is not True:
+        # The projections verified, here and at the daemon, but the daemon could not write its
+        # readiness observation to the chain. Say what is true and no more: nothing on the
+        # chain witnesses this readiness, so this run does not end as a clean success.
+        print("\nSEATS READY; READINESS NOT WITNESSED — the projections verified, but the daemon")
+        print("  did not record that on the chain (readiness_recorded is not true). The vault commit")
+        print("  and its own record stand. Check the daemon's chain before relying on this as evidence.")
+        return 1
+    print("The seats can act; the operator grants anything beyond the minimum.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Seed an EMPTY seat-config namespace.")
     parser.add_argument("--apply", action="store_true", help="write (default is a dry run)")
@@ -410,8 +479,8 @@ def main(argv: list[str] | None = None) -> int:
     # ONE ACT, NOT N WRITES (#987 review). This used to PUT each document in turn, which
     # meant a failure after the first left a namespace that was neither empty nor complete —
     # and this tool's own empty-only ratchet would then refuse to repair it, forever. The
-    # daemon owns the compare-and-commit: it re-checks emptiness under its own lock, validates
-    # and renders everything, and writes the vault once. This side is the planner.
+    # daemon owns the compare-and-commit: it re-checks emptiness under its own lock, validates,
+    # writes the vault once, then renders and reports readiness. This side is the planner.
     if verdict == "add":
         note = (f"added on {host}: an installed seat the vault did not declare "
                 f"(tools/seed_seat_config.py --add-missing)")
@@ -432,26 +501,7 @@ def main(argv: list[str] | None = None) -> int:
         print("  Nothing was written — the namespace is byte-identical.")
         return 1
 
-    for verdict in result.get("verdict") or []:
-        if isinstance(verdict, dict):
-            print(f"  {verdict.get('member', '?'):14} {verdict.get('status', verdict)}")
-    print(f"\nSeeded {result.get('seeded')} in one act "
-          f"(intent {str(result.get('intentEntryHash'))[:12]}).")
-
-    # VERIFY THE EFFECT, not the call. The daemon renders `$HESTIA_HOME/seats/<seat>.env` as
-    # part of the same act; a seat whose file is absent or short is a seat that will refuse
-    # its next tool call while this tool has just said "seeded". Report it as the failure
-    # it is, so the operator learns it from this line and not from the seat.
-    unrendered = verify_rendered(hestia_home, documents)
-    if unrendered:
-        print("\nSEEDED BUT NOT RENDERED — the vault holds the documents and the seats cannot")
-        print("  read them yet. The daemon is the renderer; check it is current and running.")
-        for line in unrendered:
-            print(f"  ! {line}")
-        return 1
-    print("Every seeded seat's projection rendered with its keys.")
-    print("The seats can act; the operator grants anything beyond the minimum.")
-    return 0
+    return report_seed_result(result, documents, hestia_home)
 
 
 if __name__ == "__main__":

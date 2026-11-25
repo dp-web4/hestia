@@ -36,6 +36,16 @@ function age(secs: number): string {
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
+function AskerAttribution({ basis }: { basis?: "session" | "asserted" | null }) {
+  if (basis === "session") {
+    return <span className="muted">(session-attributed; harness identity not independently observed)</span>;
+  }
+  if (basis === "asserted") {
+    return <strong>(UNVERIFIED: caller-asserted; no live session attribution)</strong>;
+  }
+  return <strong>(UNVERIFIED: no asker attribution recorded)</strong>;
+}
+
 function EscalationCard({
   esc,
   signedIn,
@@ -81,9 +91,8 @@ function EscalationCard({
 
       <dl className="kv">
         <dt>asked by</dt>
-        {/* Caller-asserted, not authenticated (HST-005). Say so where it is read. */}
         <dd>
-          {esc.claimed_by} <span className="muted">(claimed, not proved)</span>
+          {esc.claimed_by} <AskerAttribution basis={esc.asker_basis} />
           {esc.role ? ` · ${esc.role}` : ""}
         </dd>
         <dt>stated reason</dt>
@@ -215,7 +224,7 @@ function ScopeRequestCard({
       <dl className="kv">
         <dt>asked by</dt>
         <dd>
-          {req.claimed_by} <span className="muted">(claimed, not proved)</span>
+          {req.claimed_by} <AskerAttribution basis={req.asker_basis} />
           {req.role ? ` · ${req.role}` : ""}
         </dd>
         <dt>path</dt>

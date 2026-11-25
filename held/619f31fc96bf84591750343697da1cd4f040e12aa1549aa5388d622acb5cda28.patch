@@ -1,0 +1,320 @@
+diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
+--- a/plugins/_shared/hestia_governance_closure.py
++++ b/plugins/_shared/hestia_governance_closure.py
+@@ -1397,6 +1397,54 @@
+     return [pos[-1]] if len(pos) >= 2 else []
+ 
+ 
++_CHMOD_MODE = re.compile(r"(?:[ugoa]*[-+=][rwxXstugo]*(?:,[ugoa]*[-+=][rwxXstugo]*)*|[0-7]{3,4})")
++_CHMOD_FLAGS = frozenset({
++    "-R", "--recursive", "-v", "--verbose", "-f", "--silent", "--quiet", "-c", "--changes",
++    "--preserve-root", "--no-preserve-root",
++})
++
++
++def _chmod_write_targets(args: list) -> list:
++    """Targets after chmod's mode, including symbolic modes that begin with `-` (#660).
++
++    Known flags are consumed by name, `--reference` supplies the mode itself, and an unknown
++    option is out of grammar. `chown`/`chgrp` keep the existing positional implementation.
++    """
++    i, reference = 0, False
++    while i < len(args):
++        a = args[i]
++        if a == "--":
++            i += 1
++            break
++        if a in ("--help", "--version"):
++            return []
++        if a == "--reference":
++            if i + 1 >= len(args):
++                raise _OutOfGrammar()
++            reference, i = True, i + 2
++            continue
++        if a.startswith("--reference="):
++            if a == "--reference=":
++                raise _OutOfGrammar()
++            reference, i = True, i + 1
++            continue
++        if a in _CHMOD_FLAGS or (
++                a.startswith("-") and not a.startswith("--")
++                and len(a) > 1 and all(c in "Rvfc" for c in a[1:])):
++            i += 1
++            continue
++        if a.startswith("-") and not _CHMOD_MODE.fullmatch(a):
++            raise _OutOfGrammar()
++        break
++    if reference:
++        return args[i:]
++    if i >= len(args):
++        return []
++    if not _CHMOD_MODE.fullmatch(args[i]):
++        raise _OutOfGrammar()
++    return args[i + 1:]
++
++
+ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
+     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
+     their file args are read positions by default (the anti-FP stance; the daemon's
+@@ -1455,7 +1503,9 @@
+         if seen & {"-i", "--in-place"}:
+             return operands
+         return []
+-    if name in ("chmod", "chown", "chgrp"):
++    if name == "chmod":
++        return _chmod_write_targets(args)
++    if name in ("chown", "chgrp"):
+         pos = _positionals(args, opts_with_value=("--reference",))
+         return pos[1:]
+     if name == "truncate":
+diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/hestia_governance_closure.py
+--- a/hooks-gt/_shared/hestia_governance_closure.py
++++ b/hooks-gt/_shared/hestia_governance_closure.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 5716ff71f505af3ce72222d1b6ef4e2441164c396c7331f8b420a237f2848fa0  (published ground truth; manifest: hooks-gt)
+ """hestia_governance_closure — ONE governance-access classifier for every harness shim.
+ 
+ PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
+@@ -1398,6 +1398,54 @@
+     return [pos[-1]] if len(pos) >= 2 else []
+ 
+ 
++_CHMOD_MODE = re.compile(r"(?:[ugoa]*[-+=][rwxXstugo]*(?:,[ugoa]*[-+=][rwxXstugo]*)*|[0-7]{3,4})")
++_CHMOD_FLAGS = frozenset({
++    "-R", "--recursive", "-v", "--verbose", "-f", "--silent", "--quiet", "-c", "--changes",
++    "--preserve-root", "--no-preserve-root",
++})
++
++
++def _chmod_write_targets(args: list) -> list:
++    """Targets after chmod's mode, including symbolic modes that begin with `-` (#660).
++
++    Known flags are consumed by name, `--reference` supplies the mode itself, and an unknown
++    option is out of grammar. `chown`/`chgrp` keep the existing positional implementation.
++    """
++    i, reference = 0, False
++    while i < len(args):
++        a = args[i]
++        if a == "--":
++            i += 1
++            break
++        if a in ("--help", "--version"):
++            return []
++        if a == "--reference":
++            if i + 1 >= len(args):
++                raise _OutOfGrammar()
++            reference, i = True, i + 2
++            continue
++        if a.startswith("--reference="):
++            if a == "--reference=":
++                raise _OutOfGrammar()
++            reference, i = True, i + 1
++            continue
++        if a in _CHMOD_FLAGS or (
++                a.startswith("-") and not a.startswith("--")
++                and len(a) > 1 and all(c in "Rvfc" for c in a[1:])):
++            i += 1
++            continue
++        if a.startswith("-") and not _CHMOD_MODE.fullmatch(a):
++            raise _OutOfGrammar()
++        break
++    if reference:
++        return args[i:]
++    if i >= len(args):
++        return []
++    if not _CHMOD_MODE.fullmatch(args[i]):
++        raise _OutOfGrammar()
++    return args[i + 1:]
++
++
+ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
+     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
+     their file args are read positions by default (the anti-FP stance; the daemon's
+@@ -1456,7 +1504,9 @@
+         if seen & {"-i", "--in-place"}:
+             return operands
+         return []
+-    if name in ("chmod", "chown", "chgrp"):
++    if name == "chmod":
++        return _chmod_write_targets(args)
++    if name in ("chown", "chgrp"):
+         pos = _positionals(args, opts_with_value=("--reference",))
+         return pos[1:]
+     if name == "truncate":
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -17,7 +17,7 @@
+     },
+     {
+       "path": "hestia_governance_closure.py",
+-      "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc",
++      "sha256": "5716ff71f505af3ce72222d1b6ef4e2441164c396c7331f8b420a237f2848fa0",
+       "source": "plugins/_shared/hestia_governance_closure.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "382b9e12d614ead96b5c7628ca887afa5201062483326c49a8ff4c11e1b17904"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "382b9e12d614ead96b5c7628ca887afa5201062483326c49a8ff4c11e1b17904",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "5716ff71f505af3ce72222d1b6ef4e2441164c396c7331f8b420a237f2848fa0"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "64b28bc28c0df67fc8afb9c61193896d59e18f1f6232bd844eb9ff85e7566596"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "382b9e12d614ead96b5c7628ca887afa5201062483326c49a8ff4c11e1b17904",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "5716ff71f505af3ce72222d1b6ef4e2441164c396c7331f8b420a237f2848fa0"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "916c136643a9f5d1f20651264658ecdefc6a2a25ae8444823f880a5aaa5b5eda"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "382b9e12d614ead96b5c7628ca887afa5201062483326c49a8ff4c11e1b17904",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "5716ff71f505af3ce72222d1b6ef4e2441164c396c7331f8b420a237f2848fa0"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "06610c131217a6af5ecd4a754d0ae78df31b01b8816dd9a26ed62e2e742444c6"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "382b9e12d614ead96b5c7628ca887afa5201062483326c49a8ff4c11e1b17904",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "5716ff71f505af3ce72222d1b6ef4e2441164c396c7331f8b420a237f2848fa0"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "b62f14df7fd5df0919157413de52a40e0ea02679ccb5dbe2d1a3a37975c727fb"
+ }
+diff --git a/plugins/_shared/hestia_governance_closure_test.py b/plugins/_shared/hestia_governance_closure_test.py
+--- a/plugins/_shared/hestia_governance_closure_test.py
++++ b/plugins/_shared/hestia_governance_closure_test.py
+@@ -140,6 +140,32 @@
+     check("truncate_write", v2.classification == "write", str(v2))
+     v3 = cls("Bash", {"command": "ln -sf /tmp/evil.py plugins/kimi/hooks/pre_tool_use.py"})
+     check("ln_write", v3.classification == "write", str(v3))
++
++
++def test_chmod_short_modes_keep_their_targets():
++    target = "/w/hestia/plugins/kimi/hooks/observe.sh"
++    for command in (
++            f"chmod -x {target}", f"chmod -w {target}", f"chmod -r {target}",
++            f"chmod -rwx {target}", f"chmod -R -x {target}", f"chmod -- -x {target}",
++            f"chmod +x {target}", f"chmod a-x {target}", f"chmod go-rwx {target}",
++            f"chmod u-x,g+w {target}", f"chmod -R u-x,g+w {target}",
++            f"chmod 000 {target}", f"chmod a=r {target}",
++            f"chmod --reference=/tmp/reference {target}",
++            f"chmod --reference /tmp/reference {target}"):
++        v = cls("Bash", {"command": command}, cwd="/w/hestia")
++        check(f"chmod-target-is-write: {command}", v.classification == "write", str(v))
++    v = cls("Bash", {"command": f"chmod --help {target}"}, cwd="/w/hestia")
++    check("chmod-help-is-not-a-write", v.classification != "write", str(v))
++    v = cls("Bash", {"command": "chmod -R -x"}, cwd="/w/hestia")
++    check("chmod-without-target-is-not-invented", v.classification != "write", str(v))
++    v = cls("Bash", {"command": "chmod --reference"}, cwd="/w/hestia")
++    check("chmod-missing-reference-value-invents-no-target", v.classification != "write", str(v))
++    for command in (f"chmod --some-future-option {target}", f"chmod --reference= {target}"):
++        v = cls("Bash", {"command": command}, cwd="/w/hestia")
++        check(f"chmod-malformed-mode-or-option-fails-closed: {command}",
++              v.classification == "write" and v.rule == g.RULE_OUT_OF_GRAMMAR, str(v))
++    v = cls("Bash", {"command": f"chown -R member {target}"}, cwd="/w/hestia")
++    check("chown-still-writes", v.classification == "write", str(v))
+ 
+ 
+ def test_fd_dup_is_not_a_file_target():
+@@ -775,6 +801,7 @@
+     test_sed_in_place_on_gate_is_write_without_i_is_read,
+     test_git_checkout_pathspec_into_hooks_is_write,
+     test_chmod_truncate_ln_targets_are_write,
++    test_chmod_short_modes_keep_their_targets,
+     test_fd_dup_is_not_a_file_target,
+     test_heredoc_body_naming_gate_is_read_not_write,
+     test_here_string_is_not_a_heredoc_13545,

@@ -1,0 +1,296 @@
+{
+  "format": "hestia-chain-segment:v1",
+  "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+  "society_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+  "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "signed_from_position": 0,
+  "entries": [
+    {
+      "hash": "23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": "2026-11-22T20:40:47.235246798+00:00",
+      "event_type": "operator_bootstrap",
+      "event_data": {
+        "evidence": "sovereign-process-minting-first-operator",
+        "note": "bounded self-terminating bootstrap; no re-entry once operator_access is non-empty",
+        "operator": "lct:web4:mb32:brsnuprgkrrr6cxc2iwsgykqgvbmifqvc26yos2ni2ix2uthpezwa",
+        "window": "genesis"
+      },
+      "event_data_json": "{\"evidence\":\"sovereign-process-minting-first-operator\",\"note\":\"bounded self-terminating bootstrap; no re-entry once operator_access is non-empty\",\"operator\":\"lct:web4:mb32:brsnuprgkrrr6cxc2iwsgykqgvbmifqvc26yos2ni2ix2uthpezwa\",\"window\":\"genesis\"}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 0
+    },
+    {
+      "hash": "9d638b3ce0aa04fbc96ef1251b239a1e6e20157694cedea585b2283ea95cd3e2",
+      "prev_hash": "65d76001e3d181f5de4eab1cdfba00ad191527b0b2e7533cafa29f0210f76430",
+      "timestamp": "2026-11-22T20:40:56.872972203+00:00",
+      "event_type": "operator_gate",
+      "event_data": {
+        "act": "POST /api/scope/grant",
+        "evidence": "operator-lct-signature",
+        "signers": [
+          "lct:web4:mb32:brsnuprgkrrr6cxc2iwsgykqgvbmifqvc26yos2ni2ix2uthpezwa"
+        ],
+        "stakes": "high-reversible",
+        "verdict": "authorized"
+      },
+      "event_data_json": "{\"act\":\"POST /api/scope/grant\",\"evidence\":\"operator-lct-signature\",\"signers\":[\"lct:web4:mb32:brsnuprgkrrr6cxc2iwsgykqgvbmifqvc26yos2ni2ix2uthpezwa\"],\"stakes\":\"high-reversible\",\"verdict\":\"authorized\"}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 2
+    },
+    {
+      "hash": "65d76001e3d181f5de4eab1cdfba00ad191527b0b2e7533cafa29f0210f76430",
+      "prev_hash": "23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "timestamp": "2026-11-22T20:40:56.866468303+00:00",
+      "event_type": "operator_session_opened",
+      "event_data": {
+        "evidence": "operator-lct-signature",
+        "operator": "lct:web4:mb32:brsnuprgkrrr6cxc2iwsgykqgvbmifqvc26yos2ni2ix2uthpezwa"
+      },
+      "event_data_json": "{\"evidence\":\"operator-lct-signature\",\"operator\":\"lct:web4:mb32:brsnuprgkrrr6cxc2iwsgykqgvbmifqvc26yos2ni2ix2uthpezwa\"}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 1
+    },
+    {
+      "hash": "102d24a986603774af885ad548d437a9427c6fe79d33dd121d4c6821957324da",
+      "prev_hash": "9d638b3ce0aa04fbc96ef1251b239a1e6e20157694cedea585b2283ea95cd3e2",
+      "timestamp": "2026-11-22T20:40:56.874491603+00:00",
+      "event_type": "scope_grant_intent",
+      "event_data": {
+        "decision_reason": "install-smoke fixture grant",
+        "durability": "STANDING — written to the vault's standing-scope document; survives restart; revocable via /api/scope/standing/revoke; identity.json is untouched",
+        "granted_by": "operator",
+        "member_known": true,
+        "modes": "r",
+        "origin": "operator_initiated",
+        "path": "/fixture",
+        "path_as_asked": "/fixture",
+        "plugin_id": "fixture-member",
+        "recursive": true,
+        "replaces_existing": false,
+        "request_id": null,
+        "requested_because": null,
+        "standing": true,
+        "standing_expires_at": null,
+        "subject_instance_lct": "lct:web4:member:55aa51f36f7d8c3fd2f44bbe",
+        "via": "operator_session"
+      },
+      "event_data_json": "{\"decision_reason\":\"install-smoke fixture grant\",\"durability\":\"STANDING — written to the vault's standing-scope document; survives restart; revocable via /api/scope/standing/revoke; identity.json is untouched\",\"granted_by\":\"operator\",\"member_known\":true,\"modes\":\"r\",\"origin\":\"operator_initiated\",\"path\":\"/fixture\",\"path_as_asked\":\"/fixture\",\"plugin_id\":\"fixture-member\",\"recursive\":true,\"replaces_existing\":false,\"request_id\":null,\"requested_because\":null,\"standing\":true,\"standing_expires_at\":null,\"subject_instance_lct\":\"lct:web4:member:55aa51f36f7d8c3fd2f44bbe\",\"via\":\"operator_session\"}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 3
+    },
+    {
+      "hash": "df181878f590c6f457b1e4894bdc4358027ff2884c53617e65892a41eb1ed4e7",
+      "prev_hash": "102d24a986603774af885ad548d437a9427c6fe79d33dd121d4c6821957324da",
+      "timestamp": "2026-11-22T20:41:01.524723815+00:00",
+      "event_type": "scope_granted",
+      "event_data": {
+        "decision_reason": "install-smoke fixture grant",
+        "durability": "STANDING — written to the vault's standing-scope document; survives restart; revocable via /api/scope/standing/revoke; identity.json is untouched",
+        "granted_by": "operator",
+        "intent": "102d24a986603774af885ad548d437a9427c6fe79d33dd121d4c6821957324da",
+        "member_known": true,
+        "modes": "r",
+        "origin": "operator_initiated",
+        "path": "/fixture",
+        "path_as_asked": "/fixture",
+        "plugin_id": "fixture-member",
+        "recursive": true,
+        "replaces_existing": false,
+        "request_id": null,
+        "requested_because": null,
+        "standing": true,
+        "standing_expires_at": null,
+        "standing_generation": 1,
+        "subject_instance_lct": "lct:web4:member:55aa51f36f7d8c3fd2f44bbe",
+        "via": "operator_session"
+      },
+      "event_data_json": "{\"decision_reason\":\"install-smoke fixture grant\",\"durability\":\"STANDING — written to the vault's standing-scope document; survives restart; revocable via /api/scope/standing/revoke; identity.json is untouched\",\"granted_by\":\"operator\",\"intent\":\"102d24a986603774af885ad548d437a9427c6fe79d33dd121d4c6821957324da\",\"member_known\":true,\"modes\":\"r\",\"origin\":\"operator_initiated\",\"path\":\"/fixture\",\"path_as_asked\":\"/fixture\",\"plugin_id\":\"fixture-member\",\"recursive\":true,\"replaces_existing\":false,\"request_id\":null,\"requested_because\":null,\"standing\":true,\"standing_expires_at\":null,\"standing_generation\":1,\"subject_instance_lct\":\"lct:web4:member:55aa51f36f7d8c3fd2f44bbe\",\"via\":\"operator_session\"}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 4
+    },
+    {
+      "hash": "d0e8b8305256f2c8b6ae3e7158b42dc2bf6d4dfd7901c0b0c701b2e126a37306",
+      "prev_hash": "df181878f590c6f457b1e4894bdc4358027ff2884c53617e65892a41eb1ed4e7",
+      "timestamp": "2026-11-22T20:41:01.532789215+00:00",
+      "event_type": "policy_allow",
+      "event_data": {
+        "adjudicator": "install-smoke",
+        "attempted": "Read -> /fixture/book.txt",
+        "decision": "allow",
+        "enforced": true,
+        "feedback": {
+          "act": "ffbd5be16a7334fcf137055ffc78cdb8331949a633179b8a03daa90d6bf027fe",
+          "doors": [],
+          "effects": null,
+          "level": "act",
+          "premise_check": null,
+          "repeat_of": null,
+          "serves": "unknown"
+        },
+        "instance_lct": "lct:web4:member:55aa51f36f7d8c3fd2f44bbe",
+        "payload_sha256": null,
+        "plugin_id": "fixture-member",
+        "reason": "fixture allow",
+        "role_lct": "role:constellation:member",
+        "rule_id": "mrh.path",
+        "session_id": "25465c6c-b32c-49fd-8ec1-0036fb9843cb",
+        "target": "/fixture/book.txt",
+        "tool_name": "Read",
+        "verdict_available": null
+      },
+      "event_data_json": "{\"adjudicator\":\"install-smoke\",\"attempted\":\"Read -> /fixture/book.txt\",\"decision\":\"allow\",\"enforced\":true,\"feedback\":{\"act\":\"ffbd5be16a7334fcf137055ffc78cdb8331949a633179b8a03daa90d6bf027fe\",\"doors\":[],\"effects\":null,\"level\":\"act\",\"premise_check\":null,\"repeat_of\":null,\"serves\":\"unknown\"},\"instance_lct\":\"lct:web4:member:55aa51f36f7d8c3fd2f44bbe\",\"payload_sha256\":null,\"plugin_id\":\"fixture-member\",\"reason\":\"fixture allow\",\"role_lct\":\"role:constellation:member\",\"rule_id\":\"mrh.path\",\"session_id\":\"25465c6c-b32c-49fd-8ec1-0036fb9843cb\",\"target\":\"/fixture/book.txt\",\"tool_name\":\"Read\",\"verdict_available\":null}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 5
+    },
+    {
+      "hash": "a0fc10dcb69643d0397b15c1d5ae6a65258a732dccc81295b3a4a3c4270af7b4",
+      "prev_hash": "d0e8b8305256f2c8b6ae3e7158b42dc2bf6d4dfd7901c0b0c701b2e126a37306",
+      "timestamp": "2026-11-22T20:41:01.540242815+00:00",
+      "event_type": "policy_decision",
+      "event_data": {
+        "adjudicator": "install-smoke",
+        "attempted": "Read -> /tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt",
+        "decision": "deny",
+        "enforced": true,
+        "feedback": {
+          "act": "80a8f78aebb5c52e72fc20430ea0c3a15c5d7cf3361b680364ad3e265c9f676d",
+          "doors": [],
+          "effects": null,
+          "level": "act",
+          "premise_check": null,
+          "repeat_of": null,
+          "serves": "unknown"
+        },
+        "instance_lct": "lct:web4:member:55aa51f36f7d8c3fd2f44bbe",
+        "payload_sha256": null,
+        "plugin_id": "fixture-member",
+        "reason": "fixture deny",
+        "role_lct": "role:constellation:member",
+        "rule_id": "mrh.path",
+        "session_id": "25465c6c-b32c-49fd-8ec1-0036fb9843cb",
+        "target": "/tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt",
+        "tool_name": "Read",
+        "verdict_available": null
+      },
+      "event_data_json": "{\"adjudicator\":\"install-smoke\",\"attempted\":\"Read -> /tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt\",\"decision\":\"deny\",\"enforced\":true,\"feedback\":{\"act\":\"80a8f78aebb5c52e72fc20430ea0c3a15c5d7cf3361b680364ad3e265c9f676d\",\"doors\":[],\"effects\":null,\"level\":\"act\",\"premise_check\":null,\"repeat_of\":null,\"serves\":\"unknown\"},\"instance_lct\":\"lct:web4:member:55aa51f36f7d8c3fd2f44bbe\",\"payload_sha256\":null,\"plugin_id\":\"fixture-member\",\"reason\":\"fixture deny\",\"role_lct\":\"role:constellation:member\",\"rule_id\":\"mrh.path\",\"session_id\":\"25465c6c-b32c-49fd-8ec1-0036fb9843cb\",\"target\":\"/tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt\",\"tool_name\":\"Read\",\"verdict_available\":null}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 6
+    },
+    {
+      "hash": "9088975a721ddb938eb0ca1e939dbde10f0e9fcdb451affaec0eb3998ed36499",
+      "prev_hash": "a0fc10dcb69643d0397b15c1d5ae6a65258a732dccc81295b3a4a3c4270af7b4",
+      "timestamp": "2026-11-22T20:41:01.550241115+00:00",
+      "event_type": "scope_requested",
+      "event_data": {
+        "act": "Read -> /tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt",
+        "act_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "asker_basis": "session",
+        "assurance": "A1 — opened by the member's deliberate escalation of a gate refusal; the act is the gate's record, the reason is the member's. Tamper-EVIDENT, not tamper-proof.",
+        "decided_by_default": "operator (no admissible peer)",
+        "escalated_from": "refusal-095445615e6f",
+        "expires_at": 1795408861,
+        "host_session_id": null,
+        "invited_peers": [],
+        "member_reason": "install-smoke escalation for the denied read",
+        "origin": "gate_deny",
+        "path": "/tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt",
+        "path_as_asked": "/tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt",
+        "plugin_id": "fixture-member",
+        "reason": "install-smoke escalation for the denied read. Escalated by the member from a refused Read (mrh.path); act: Read -> /tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt",
+        "request_id": "scope-321ef57636a4",
+        "request_key": "080e15ffbc9a48498233adb39404ba6dcda085b477145436ba332eee8cdf8ae5",
+        "role": "",
+        "rule": "mrh.path",
+        "subject_instance_lct": "lct:web4:member:55aa51f36f7d8c3fd2f44bbe",
+        "subtree": false,
+        "tool_name": "Read"
+      },
+      "event_data_json": "{\"act\":\"Read -> /tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt\",\"act_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"asker_basis\":\"session\",\"assurance\":\"A1 — opened by the member's deliberate escalation of a gate refusal; the act is the gate's record, the reason is the member's. Tamper-EVIDENT, not tamper-proof.\",\"decided_by_default\":\"operator (no admissible peer)\",\"escalated_from\":\"refusal-095445615e6f\",\"expires_at\":1795408861,\"host_session_id\":null,\"invited_peers\":[],\"member_reason\":\"install-smoke escalation for the denied read\",\"origin\":\"gate_deny\",\"path\":\"/tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt\",\"path_as_asked\":\"/tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt\",\"plugin_id\":\"fixture-member\",\"reason\":\"install-smoke escalation for the denied read. Escalated by the member from a refused Read (mrh.path); act: Read -> /tmp/hestia-chain-segment-nrxaxhqh/outside/book.txt\",\"request_id\":\"scope-321ef57636a4\",\"request_key\":\"080e15ffbc9a48498233adb39404ba6dcda085b477145436ba332eee8cdf8ae5\",\"role\":\"\",\"rule\":\"mrh.path\",\"subject_instance_lct\":\"lct:web4:member:55aa51f36f7d8c3fd2f44bbe\",\"subtree\":false,\"tool_name\":\"Read\"}",
+      "signer_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "chain_position": 7
+    }
+  ],
+  "signatures": [
+    {
+      "chain_position": 0,
+      "row_hash": "23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:570db7bf63c610855e1076f7b52408c1c23a66a7ef15ce75b9f315e7ec23700d",
+      "signature": "652bfe40614481e208538cee64da9e252284e1d0ac50035b4c19f534cc16c47c968b5551202bb850349b7d179debafe8f5fd7712b4fd4df867c898716831a606"
+    },
+    {
+      "chain_position": 1,
+      "row_hash": "65d76001e3d181f5de4eab1cdfba00ad191527b0b2e7533cafa29f0210f76430",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:c81b5d630a6c610ff7aa2ea4588848830dd984a2520caeeaef16130d7e0fc42e",
+      "signature": "7ac7cf03ea931740a8c30ae8c33982cdb53cfda1a4ee49f09d8eb5a8cbe1b9cfc0a69a1e007cd1b7e779be1e648280fe1d128ddd0818fece150e00d4fded830e"
+    },
+    {
+      "chain_position": 2,
+      "row_hash": "9d638b3ce0aa04fbc96ef1251b239a1e6e20157694cedea585b2283ea95cd3e2",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:c81b5d630a6c610ff7aa2ea4588848830dd984a2520caeeaef16130d7e0fc42e",
+      "signature": "8e11a56fbd6c5201d29ee4dce83cb9f30d556166a0452068bfd9050b2f5d9b9d63af6c0b933870388187f3b7fc1dff401dda1f3c8111dc087a4d53a5ee838304"
+    },
+    {
+      "chain_position": 3,
+      "row_hash": "102d24a986603774af885ad548d437a9427c6fe79d33dd121d4c6821957324da",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:c81b5d630a6c610ff7aa2ea4588848830dd984a2520caeeaef16130d7e0fc42e",
+      "signature": "7bfc9ab17d0194bcba0fd37c5cd2c8071996e57d29fd054c55c130e367ea80af1eab2629772c400c26fcaadb6deb7074ed1d797ffa2815e0bd180a0d2819eb04"
+    },
+    {
+      "chain_position": 4,
+      "row_hash": "df181878f590c6f457b1e4894bdc4358027ff2884c53617e65892a41eb1ed4e7",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:c81b5d630a6c610ff7aa2ea4588848830dd984a2520caeeaef16130d7e0fc42e",
+      "signature": "ec18c43f6e99973dd69c8779b7b565d0a90d1b6fff0af887ef54c0363c18d060285059fc14a888b049acebc2a8524af09d56c35f5a038c42182262ca2a344e0c"
+    },
+    {
+      "chain_position": 5,
+      "row_hash": "d0e8b8305256f2c8b6ae3e7158b42dc2bf6d4dfd7901c0b0c701b2e126a37306",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:2e3d6b50a3bc53e7f5e13fb37ed94405161c33d2c23479917399c9f5758b952b",
+      "signature": "f948fcd53589933c0b019820093b4f4d1bff5d8f017a603f943e70a6d35cea10bf1e88c24a2924675454a96328ba66eb0feee4a5f66a548b225df46db8578d0f"
+    },
+    {
+      "chain_position": 6,
+      "row_hash": "a0fc10dcb69643d0397b15c1d5ae6a65258a732dccc81295b3a4a3c4270af7b4",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:2e3d6b50a3bc53e7f5e13fb37ed94405161c33d2c23479917399c9f5758b952b",
+      "signature": "fddc8d2b43fc8a58c94afa57086ddd63b1bfd189b4875d8abf0f3ac73da962971edeca62c47c4b5a1c69c6f6976ae083bf39449be57f68328532415c4fe52f08"
+    },
+    {
+      "chain_position": 7,
+      "row_hash": "9088975a721ddb938eb0ca1e939dbde10f0e9fcdb451affaec0eb3998ed36499",
+      "signature_version": 1,
+      "chain_id": "hestia-chain:23aa381c6b2639096baa2262ac502c204a61dc85163e88e168f4ffad736b7876",
+      "witness_lct": "lct:web4:mb32:brum42tpxz7qkzujwh3f5ejmszujvfer3glds4zifr2v6ixwwa7ya",
+      "witness_public_key": "deed60ecbfab7be4c474103aad79c5b0730da6ce63070c98f703c08704c408eb",
+      "policy_generation": "policy:sha256:2e3d6b50a3bc53e7f5e13fb37ed94405161c33d2c23479917399c9f5758b952b",
+      "signature": "5268c6800777d06d5b36a12a6d14cd93c0c2fb0d6f340e62d23c958c3a7706cce06d64ec4c3b3dc6a03d8d062b4b84a4c29d89bf4d2d67302dc6815d804e3e0f"
+    }
+  ]
+}

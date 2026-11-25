@@ -12,7 +12,10 @@ ratify-all is enabled only when the daemon says bulk_ratify.allowed. Stale rows 
 
 Run: python3 tools/dashboard_gates_pane_contract_test.py   (bare; exit 1 on failure)
 """
+import json
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,8 +34,90 @@ def block() -> str:
     return UI[a:b]
 
 
+def banner_block() -> str:
+    try:
+        a = UI.index("GATE INTEGRITY overview banner")
+        return UI[a:]
+    except ValueError:
+        return ""
+
+
+# Runs the banner's own loader (sliced from index.html) under node with a stubbed apiFetch and
+# timers, so "a verify read that never answers" is exercised, not just grepped for (NOVA's
+# negative on #1575: a stale VERIFIED state must not stay shown).
+STALE_HARNESS = r"""
+const src = process.argv[1];
+const els = {'gate-integrity-banner': {hidden: true}, 'gate-integrity-banner-text': {textContent: ''}};
+let nowMs = Date.parse('2026-11-23T10:00:00Z');
+const timers = [];
+class FakeDate extends Date { static now() { return nowMs; } }
+const load = new Function('$', 'apiFetch', 'setTimeout', 'clearTimeout', 'Date',
+  src + '\nreturn gateIntegrityLoad;');
+let answer;
+const fn = load(id => els[id], () => answer(), (f) => { timers.push(f); return timers.length; }, () => {}, FakeDate);
+const settle = () => new Promise(r => setImmediate(r));
+(async () => {
+  const out = {};
+  answer = async () => ({ ok: true, json: async () => ({ status: 'VERIFIED', gates: [] }) });
+  await fn(); await settle();
+  out.healthy_hidden = els['gate-integrity-banner'].hidden;
+  answer = () => new Promise(() => {});          // the daemon never answers
+  nowMs += 30000;
+  fn(); await settle();
+  nowMs += 15000;
+  timers.splice(0).forEach(f => f());            // fire the read's timeout, if it set one
+  await settle(); await settle();
+  out.hung_hidden = els['gate-integrity-banner'].hidden;
+  out.hung_text = els['gate-integrity-banner-text'].textContent;
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+def stale_harness(b: str):
+    node = shutil.which("node")
+    if not node:
+        return None
+    a = b.index("// ---- GATE INTEGRITY overview banner")
+    z = b.index("// ---- GATES pane", a)
+    run = subprocess.run([node, "-e", STALE_HARNESS, b[a:z]], capture_output=True, text=True, timeout=30)
+    if run.returncode != 0:
+        return {"error": run.stderr.strip()[-400:]}
+    return json.loads(run.stdout.strip().splitlines()[-1])
+
+
 def main() -> int:
     g = block()
+    b = banner_block()
+    check("#1378: a persistent overview banner exists", 'id="gate-integrity-banner"' in b)
+    check("#1378: the banner links to the Gates remedy pane",
+          'id="gate-integrity-banner-btn"' in b and "setView('govern', true); governShow('gates')" in b)
+    check("#1378: the overview polls without overlapping itself",
+          "gateIntegrityBusy" in b and re.search(r"setInterval\(\(\) => \{ if \(!document.hidden\) gateIntegrityLoad\(\); \}, GATE_INTEGRITY_POLL_MS\)", b) is not None
+          and "GATE_INTEGRITY_POLL_MS = 30000" in b)
+    check("#1378: UNKNOWN and a failed read never look healthy",
+          "r.status === 'UNKNOWN'" in b and "Gate integrity could not be read" in b)
+    check("#1378: deploy-pending, modified, deploy-different and bypass are distinct",
+          "g.status === 'unratified'" in b and "g.status === 'modified'" in b
+          and "g.deployment === 'differs'" in b and "g.not_registered === true" in b)
+    check("#1378: a verified set hides the banner", "gateIntegrityHealthy" in b)
+    check("#1378: verified deploy mismatches stay visible and totals count gates once",
+          b.count("g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs'") == 2
+          and "rows.length} gate${rows.length === 1 ? '' : 's'}:" in b)
+    check("#1575: the verify read is bounded by a timeout that aborts the fetch",
+          "new AbortController()" in b and "signal: ctl.signal" in b and "GATE_INTEGRITY_TIMEOUT_MS" in b)
+    check("#1575: returning to the tab re-reads gate integrity at once",
+          re.search(r"addEventListener\('visibilitychange', \(\) => \{ if \(!document\.hidden\) \{ tick\(\); gateIntegrityLoad\(\); \} \}\)", UI) is not None)
+    h = stale_harness(b)
+    if h is None:
+        print("SKIP #1575 stale-state harness: node not on PATH")
+    else:
+        check(f"#1575: harness ran ({h.get('error')})", "error" not in h)
+        check("#1575: a verified set hides the banner (harness)", h.get("healthy_hidden") is True)
+        check("#1575: a read that never answers after a healthy one goes loud as stale, not silent",
+              h.get("hung_hidden") is False and "unverified" in h.get("hung_text", "")
+              and "stale since" in h.get("hung_text", ""))
+
     check("govern sub-nav has the chip", 'data-gov="gates"' in UI)
     check("pane registered and mounts by loading",
           re.search(r"gates:\s*\{\s*el:\s*'govern-gates',\s*mount:\s*\(\)\s*=>\s*gatesLoad\(\)", UI) is not None)

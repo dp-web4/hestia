@@ -1,0 +1,175 @@
+diff --git a/hooks-gt/_shared/hestia_witness_core.py b/hooks-gt/_shared/hestia_witness_core.py
+--- a/hooks-gt/_shared/hestia_witness_core.py
++++ b/hooks-gt/_shared/hestia_witness_core.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1  (published ground truth; manifest: hooks-gt)
+ """The outcome witness — ONE implementation for every harness; the shims only say who they are.
+ 
+ WHY THIS EXISTS (findings/per-harness-witness-drift-2026-09-28.md; dp agreed all five
+@@ -310,7 +310,7 @@
+ def derive_success(event: dict) -> tuple[bool, Optional[str]]:
+     """Best-effort success flag across the harnesses' outcome shapes."""
+     forced = OUTCOME_EVENTS.get(event.get("hook_event_name"))
+-    if forced is False:  # kimi's PostToolUseFailure: the event IS the failure
++    if forced is False:  # PostToolUseFailure: the event IS the failure
+         err = event.get("error")
+         if isinstance(err, dict):
+             err = err.get("message") or json.dumps(err)
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -32,11 +32,11 @@
+     },
+     {
+       "path": "hestia_witness_core.py",
+-      "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777",
++      "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1",
+       "source": "plugins/_shared/hestia_witness_core.py"
+     }
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61"
+ }
+diff --git a/hooks-gt/claude-code/hooks/hooks.json b/hooks-gt/claude-code/hooks/hooks.json
+--- a/hooks-gt/claude-code/hooks/hooks.json
++++ b/hooks-gt/claude-code/hooks/hooks.json
+@@ -49,6 +49,18 @@
+         ]
+       }
+     ],
++    "PostToolUseFailure": [
++      {
++        "matcher": "*",
++        "hooks": [
++          {
++            "type": "command",
++            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/witness.py",
++            "timeout": 3
++          }
++        ]
++      }
++    ],
+     "UserPromptSubmit": [
+       {
+         "hooks": [
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -12,7 +12,7 @@
+     },
+     {
+       "path": "hooks/hooks.json",
+-      "sha256": "6b1c103d29ab0a19227b2e409a3a8a2b0560e576d82cac9c35f980a7da46b5ca",
++      "sha256": "acdf9560c75b354a9b7773cb1dbda2eea639fa3f65882b7cd32d3a868f6ea0b4",
+       "source": "plugins/claude-code/hooks/hooks.json"
+     },
+     {
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,7 +57,7 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1"
+       }
+     ]
+   },
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "236304cb256f787d54156d491a7f0cd6adb3e658de74c95566120c11cf62d98a"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,7 +57,7 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1"
+       }
+     ]
+   },
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "e5c2691b379ce709d7cde17c1f0920f8d9935452c7af8520dc042b2a14d05a41"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,10 +57,10 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1"
+       }
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "353623d87a8f35809f9facaf39247fa11767c8fcc31031ba6ad4f6fe040dd770"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,7 +57,7 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1"
+       }
+     ]
+   },
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "51ad7904c275883428a6d421dde9e5b0af7c635f80b788dee49c29c3a7a3cd27"
+ }
