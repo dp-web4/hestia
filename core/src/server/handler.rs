@@ -34847,42 +34847,40 @@ mod disposition_durability_tests {
     }
 
     /// Item 4 (revised review): the chain fallback carries the SAME decided-record
-    /// fields the live arm does — `factors_present` and `decided_at` included.
+    /// fields the live arm does for the original asking session, while an anonymous
+    /// read gets terminal truth without the private evidence.
     #[tokio::test]
     async fn the_chain_fallback_carries_the_decided_record_fields() {
-        let (_dir, state) = test_state().await;
-        let real_now = now_secs();
-        let id = {
-            let mut s = state.lock().await;
-            let id = witness_open(&mut s, "kimi-code", None, real_now - 3 * 3600, 3600);
-            s.append_chain(
-                "gate_escalation_decided",
-                json!({
-                    "escalation_id": id, "plugin_id": "kimi-code", "tool_name": "policy_edit",
-                    "marker": "policy.json", "status": "approved", "decided_by": "operator",
-                    "decided_at": real_now - 2 * 3600,
-                    "factors_present": [{"channel": "operator_session", "by": "operator",
-                                         "dissent": false, "at": real_now - 2 * 3600}],
-                    "reason": "reviewed the diff",
-                }),
-            )
-            .unwrap();
-            id
-        };
+        let (_dir, shared, session, id, _opened) = super::reaped_poll_subject().await;
+        let decided_at = now_secs();
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "tool_name": "policy_edit",
+                "marker": "policy.json", "status": "approved", "decided_by": "operator",
+                "decided_at": decided_at,
+                "factors_present": [{"channel": "operator_session", "by": "operator",
+                                     "dissent": false, "at": decided_at}],
+                "reason": "reviewed the diff",
+            }),
+        )
+        .unwrap();
 
-        let mut s = state.lock().await;
-        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
-        assert!(s.gate_escalations.get(&id).is_none());
-
-        let body = resolve_escalation_pointer(&s, &id);
+        let s = shared.lock().await;
+        let body = resolve_escalation_pointer_for_session(&s, &id, Some(&session));
         assert_eq!(body["source"], "witness_chain");
         assert_eq!(body["status"], "approved");
-        assert_eq!(body["decided_at"], json!(real_now - 2 * 3600), "{body}");
+        assert_eq!(body["decided_at"], json!(decided_at), "{body}");
         let factors = body["factors_present"]
             .as_array()
-            .expect("the evidence comes along, shape-parity with the live arm: {body}");
+            .unwrap_or_else(|| panic!("the evidence comes along, shape-parity with the live arm: {body}"));
         assert_eq!(factors[0]["by"], "operator");
         assert_eq!(factors[0]["dissent"], json!(false));
+
+        let anonymous = resolve_escalation_pointer(&s, &id);
+        assert_eq!(anonymous["source"], "witness_chain");
+        assert_eq!(anonymous["terminal"], true, "{anonymous}");
+        assert_eq!(anonymous["factors_present"], Value::Null, "{anonymous}");
     }
 
     /// #545: the covered set of `disposition_obligation`, pinned in BOTH directions —
