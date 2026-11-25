@@ -3481,7 +3481,7 @@ pub(crate) async fn scope_decide_as(
     body: serde_json::Value,
     decider: ScopeDecider,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use crate::server::state::SCOPE_REQUEST_TTL_SECS;
+    use crate::server::state::SCOPE_GRANT_TTL_SECS;
     let request_id = body
         .get("request_id")
         .and_then(|v| v.as_str())
@@ -3569,7 +3569,7 @@ pub(crate) async fn scope_decide_as(
         // dies on the same clock a one-time governance approval does.
         crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS
     } else {
-        body.get("expires_in_secs").and_then(|v| v.as_u64()).unwrap_or(SCOPE_REQUEST_TTL_SECS)
+        body.get("expires_in_secs").and_then(|v| v.as_u64()).unwrap_or(SCOPE_GRANT_TTL_SECS)
     };
     // The STANDING expiry is different on purpose: given a window, it is bounded by it;
     // absent one, it is durable until revoked — `None`, never a silent default TTL, because

@@ -55,7 +55,7 @@ use sha2::{Digest, Sha256};
 /// operator's bound passed, and the generation does not move on wall-clock expiry, so
 /// nothing else could repair the cached copy (GPT review of #431, blocker 3).
 ///
-/// Same 8 hours as `SCOPE_REQUEST_TTL_SECS`, and for the same reason: the longer the
+/// Same 8 hours as `SCOPE_GRANT_TTL_SECS`, and for the same reason: the longer the
 /// authority has been unreachable, the likelier a revocation the copy cannot know about.
 /// Bounded staleness is the only kind that is safe (hestia_gate_core, `AgentPolicy`).
 pub const STANDING_SNAPSHOT_TTL_SECS: u64 = 8 * 3600;
