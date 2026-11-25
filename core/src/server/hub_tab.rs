@@ -720,7 +720,7 @@ fn commit_hub_mutation_with_store(
     let mut success = record;
     success["intent"] = serde_json::json!(intent.hash);
     success["success"] = serde_json::json!(true);
-    match s.append_chain("hub_url_mutation", success) {
+    match s.append_chain("hub_url_mutation", success.clone()) {
         Ok(entry) => Ok(entry),
         Err(error) => {
             let restore = store(previous, &mut s.vault);
