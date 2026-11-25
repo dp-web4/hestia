@@ -743,6 +743,8 @@ impl SqliteChainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);
+             CREATE INDEX IF NOT EXISTS idx_chain_escalation_id
+                 ON chain_entries(json_extract(event_data, '$.escalation_id'));
 
              -- Idempotency metadata is deliberately OUTSIDE the hashed witness row.
              -- The mapping commits in the same transaction as its row, but changing
@@ -1878,31 +1880,50 @@ impl SqliteChainStore {
         Ok(out)
     }
 
-    /// Every witnessed entry about ONE gate escalation, oldest first, with no recency window
-    /// (#1014): its `gate_escalation_opened`, any decided / withdrawn / expired settlement, and
-    /// any `gate_escalation_claimed` spend.
-    ///
-    /// The escalation pointer used to page backward over the newest 1,000 chain entries, and
-    /// escalation events are under 1% of the chain, so a real ask became unreadable a median of
-    /// 7.3 hours after it opened (measured on CBP 2026-09-09) while the invitations and
-    /// disposition notices that carry its pointer live for days. Index-restricted to the five
-    /// event types, like `appeal_rows_for_pointer`; on the read connection, so a reader never
-    /// waits on the writer.
+    pub const ESCALATION_HISTORY_MAX_ROWS: i64 = 256;
+
+    /// The open and terminal rows about ONE gate escalation, plus only its newest spend,
+    /// oldest first (#1014, #1725). The exact id index keeps lookup proportional to this
+    /// escalation's history rather than the whole chain. More than 256 matching rows is an
+    /// error, never a partial answer that could omit the open or newest ruling. Spend-heavy
+    /// approvals do not overflow the bound: recovery needs only the latest claim.
     pub fn escalation_rows(&self, escalation_id: &str) -> Result<Vec<ChainEntry>> {
         let conn = self.observed(&self.read_conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
-             FROM chain_entries
-             WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
-                                  'gate_escalation_withdrawn', 'gate_escalation_expired',
-                                  'gate_escalation_claimed')
-               AND json_extract(event_data, '$.escalation_id') = ?1
-             ORDER BY chain_position ASC",
+             FROM (
+                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                 FROM chain_entries INDEXED BY idx_chain_escalation_id
+                 WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                      'gate_escalation_withdrawn', 'gate_escalation_expired')
+                   AND json_extract(event_data, '$.escalation_id') = ?1
+                 UNION ALL
+                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                 FROM (
+                     SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                     FROM chain_entries INDEXED BY idx_chain_escalation_id
+                     WHERE event_type = 'gate_escalation_claimed'
+                       AND json_extract(event_data, '$.escalation_id') = ?1
+                     ORDER BY chain_position DESC LIMIT 1
+                 )
+             )
+             ORDER BY chain_position ASC
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![escalation_id], row_to_entry)?;
+        let rows = stmt.query_map(
+            params![escalation_id, Self::ESCALATION_HISTORY_MAX_ROWS + 1],
+            row_to_entry,
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r??);
+        }
+        if out.len() as i64 > Self::ESCALATION_HISTORY_MAX_ROWS {
+            anyhow::bail!(
+                "escalation '{}' exceeds {} history rows; refusing a partial or unbounded recovery",
+                escalation_id,
+                Self::ESCALATION_HISTORY_MAX_ROWS
+            );
         }
         Ok(out)
     }
@@ -3183,6 +3204,67 @@ mod tests {
             Some(&cutoff), Some(&[]), None, ROUTINE_CHAIN_PAGE, |_| Some(()),
         ).unwrap();
         assert_eq!(empty, ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
+    }
+
+    #[test]
+    fn escalation_history_bounds_terminal_rows_without_counting_every_spend() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
+        store.append(
+            "gate_escalation_opened",
+            json!({"escalation_id": "crowded", "plugin_id": "codex"}),
+            "lct:test",
+        )
+        .unwrap();
+        for i in 0..50 {
+            store.append("outcome", json!({"filler": i}), "lct:test").unwrap();
+        }
+        assert_eq!(store.escalation_rows("crowded").unwrap().len(), 1);
+
+        let conn = store.observed(&store.read_conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT chain_position FROM chain_entries INDEXED BY idx_chain_escalation_id
+                 WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                      'gate_escalation_withdrawn', 'gate_escalation_expired',
+                                      'gate_escalation_claimed')
+                   AND json_extract(event_data, '$.escalation_id') = ?1
+                 ORDER BY chain_position ASC LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params!["crowded", 2], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(plan.join(" | ").contains("idx_chain_escalation_id"), "{plan:?}");
+        drop(conn);
+
+        for _ in 0..=SqliteChainStore::ESCALATION_HISTORY_MAX_ROWS {
+            store.append(
+                "gate_escalation_claimed",
+                json!({"escalation_id": "crowded", "plugin_id": "codex"}),
+                "lct:test",
+            )
+            .unwrap();
+        }
+        let recovered = store.escalation_rows("crowded").unwrap();
+        assert_eq!(recovered.len(), 2, "frequent spends collapse to the latest one");
+        assert_eq!(recovered[0].event_type, "gate_escalation_opened");
+        assert_eq!(recovered[1].event_type, "gate_escalation_claimed");
+
+        for _ in 0..=SqliteChainStore::ESCALATION_HISTORY_MAX_ROWS {
+            store.append(
+                "gate_escalation_decided",
+                json!({"escalation_id": "crowded", "plugin_id": "codex", "status": "denied",
+                       "decided_by": "operator"}),
+                "lct:test",
+            )
+            .unwrap();
+        }
+        let err = store.escalation_rows("crowded").unwrap_err();
+        assert!(err.to_string().contains("256 history rows"), "{err}");
+        assert!(err.to_string().contains("partial"), "{err}");
     }
 
     /// #1555: the bounded liveness scan stays on the rowid range. If the planner took the
