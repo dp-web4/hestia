@@ -7768,14 +7768,15 @@ fn register_refusal_not_here(atlas_id: &str, rec: &serde_json::Value) -> Option<
 ///    chain are preserved, and refusal restores the authority and projection]
 /// R: pass [construct: mounted behind `operator_gate` with the rest of /api/*]
 /// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
-/// O: pass [construct: ungovern_ordered — reason, then the agent_ungovern_intent record, then
-///    authority/projection removal, then the registrar's ownership-proved config edit]
-/// A: pass [construct: agent_ungovern_intent before the edit; agent_ungovern carries agent,
-///    reason, backup path, authority removal, quarantine and the intent hash; a failed terminal
-///    is reported, and a refused act writes agent_ungovern_failed]
+/// O: pass [construct: ungovern_ordered — reason and an exact-member recovery read, then the
+///    agent_ungovern_intent record, authority/projection removal, and the registrar's
+///    ownership-proved config edit]
+/// A: pass [construct: agent_ungovern_intent before the edit; agent_ungovern carries the canonical
+///    member id, reason, backup path, authority removal, quarantine and the intent hash; a failed
+///    terminal is reported, and a refused act writes agent_ungovern_failed]
 /// V: present [construct: unknown or ambiguous inventory records, unestablished registrar
-///    provenance, stale owned targets and unprovable edits are refused; authority and projection
-///    are restored if the registrar refuses]
+///    provenance, unreadable recovery state, stale owned targets and unprovable edits are refused;
+///    authority and projection are restored if the registrar refuses]
 /// verdict: PASS
 ///
 /// Ungoverning is deliberately louder than governing. Governing adds a gate and a bad
@@ -8440,7 +8441,7 @@ async fn agent_ungovern(
         Err(e) => return (StatusCode::CONFLICT, Json(serde_json::json!({"error": e.to_string()}))),
     };
     let mut s = state.lock().await;
-    let out = ungovern_ordered(&mut s, &id, &reason, &plan, crate::server::agents::ungovern);
+    let out = ungovern_ordered(&mut s, &plan.governance_id, &reason, &plan, crate::server::agents::ungovern);
     match out {
         Ok(v) => (StatusCode::OK, Json(v)),
         Err((code, v)) => (code, Json(v)),
@@ -8472,17 +8473,14 @@ fn restore_ungovern_projection(
 
 /// The newest ungovern row for `id`, when it is an intent with no terminal row after it: an
 /// attempt the daemon began and did not finish (it died, or its failure record itself failed).
-fn dangling_ungovern_intent(s: &super::state::ServerState, id: &str) -> Option<String> {
-    let rows = s
-        .chain_store
-        .read_recent_by_types(
-            None,
-            &["agent_ungovern_intent", "agent_ungovern", "agent_ungovern_failed"],
-            200,
-        )
-        .ok()?;
-    let newest = rows.iter().find(|row| row.event_data["agent"] == id)?;
-    (newest.event_type == "agent_ungovern_intent").then(|| newest.hash.clone())
+fn dangling_ungovern_intent(s: &super::state::ServerState, id: &str) -> anyhow::Result<Option<String>> {
+    let newest = s.chain_store.read_latest_by_types_for_agent(
+        &["agent_ungovern_intent", "agent_ungovern", "agent_ungovern_failed"],
+        id,
+    )?;
+    Ok(newest.and_then(|row| {
+        (row.event_type == "agent_ungovern_intent").then_some(row.hash)
+    }))
 }
 
 /// NOT ATOMIC, and it does not claim to be: vault, projection, harness config and chain are four
@@ -8517,7 +8515,14 @@ fn ungovern_ordered(
     // and chain cannot commit together, so a daemon that died part-way leaves an
     // `agent_ungovern_intent` with no terminal row after it. `completes` is that intent: this
     // run is then the retry that finishes it, and its terminal row says so.
-    let completes = dangling_ungovern_intent(s, id);
+    let completes = dangling_ungovern_intent(s, id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "error": format!("reading earlier ungovern attempts failed: {e}. Nothing was changed."),
+            }),
+        )
+    })?;
     let projection_present = sc::render_path(&s.home, id).exists();
     let document_present = s.vault.get_document(sc::SEAT_CONFIG_NS, id).is_some();
     if plan.owned_targets.is_empty() && !projection_present && !document_present && completes.is_none() {
@@ -16114,6 +16119,7 @@ mod operator_vault_tests {
     fn test_ungovern_plan() -> crate::server::agents::UngovernPlan {
         crate::server::agents::UngovernPlan {
             member: "claude-code".into(),
+            governance_id: "claude-code".into(),
             registrar: None,
             owned_targets: Vec::new(),
             unowned_targets: Vec::new(),
@@ -16196,6 +16202,7 @@ mod operator_vault_tests {
         std::fs::write(&config, &original_config).unwrap();
         let plan = crate::server::agents::UngovernPlan {
             member: "claude-code".into(),
+            governance_id: "claude-code".into(),
             registrar: Some(registrar),
             owned_targets: vec![pre.display().to_string(), witness.display().to_string()],
             unowned_targets: vec!["/elsewhere/foreign.js".into()],
@@ -16325,6 +16332,49 @@ mod operator_vault_tests {
             let error = run(&mut s).unwrap_err();
             assert!(error.1["error"].as_str().unwrap().contains("nothing to unwire"), "{error:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn ungovern_recovery_is_not_hidden_by_other_members_activity() {
+        let (_dir, state) = test_state().await;
+        let plan = test_ungovern_plan();
+        let dangling = {
+            let s = state.lock().await;
+            s.append_chain("agent_ungovern_intent", serde_json::json!({"agent": "claude-code", "reason": "died here"}))
+                .unwrap()
+                .hash
+        };
+        let mut s = state.lock().await;
+        for n in 0..205 {
+            s.append_chain("agent_ungovern_intent", serde_json::json!({"agent": format!("other-{n}"), "reason": "x"}))
+                .unwrap();
+        }
+        let value = ungovern_ordered(&mut s, "claude-code", "finish the stopped run", &plan, |_, _| {
+            Ok(crate::server::agents::UngovernOutcome { hooks_removed: 0, backup: None })
+        })
+        .unwrap();
+        assert_eq!(value["completes_intent"], dangling.as_str());
+    }
+
+    #[tokio::test]
+    async fn ungovern_with_an_unreadable_recovery_ledger_refuses_before_any_change() {
+        let (dir, state) = test_state().await;
+        let plan = test_ungovern_plan();
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("ALTER TABLE chain_entries RENAME TO unavailable_chain_entries").unwrap();
+        drop(conn);
+        let called = std::cell::Cell::new(false);
+        let mut s = state.lock().await;
+        let error = ungovern_ordered(&mut s, "claude-code", "retry", &plan, |_, _| {
+            called.set(true);
+            Ok(test_ungovern_outcome())
+        })
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.1["error"].as_str().unwrap().contains("reading earlier ungovern attempts failed"), "{error:?}");
+        assert!(!called.get(), "a recovery read failure must not become a fresh ungovern attempt");
     }
 
     #[tokio::test]

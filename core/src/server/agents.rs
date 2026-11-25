@@ -101,6 +101,7 @@ pub async fn inventory_off_thread() -> Result<Value> {
 #[derive(Debug, Clone)]
 pub struct UngovernPlan {
     pub member: String,
+    pub governance_id: String,
     pub registrar: Option<PathBuf>,
     pub owned_targets: Vec<String>,
     /// Hook targets the inventory reads for this member and does NOT attribute to hestia. They
@@ -136,6 +137,13 @@ pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<Ungovern
     if !unknown.is_empty() {
         bail!("the inventory could not fully classify '{id}' ({unknown:?}); nothing was changed");
     }
+    let governance_id = rec
+        .get("member")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("'{id}' has no canonical member id; nothing was changed"))?
+        .to_string();
     let member = rec
         .get("plugin")
         .and_then(Value::as_str)
@@ -181,7 +189,7 @@ pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<Ungovern
             .ok_or_else(|| anyhow::anyhow!("the inventory names no workspace for the registrar"))?;
         Some(PathBuf::from(workspace).join("hestia/deploy/register-members.py"))
     };
-    Ok(UngovernPlan { member, registrar, owned_targets, unowned_targets })
+    Ok(UngovernPlan { member, governance_id, registrar, owned_targets, unowned_targets })
 }
 
 /// The caller holds the daemon's state lock across the registrar (the act must not interleave
@@ -237,6 +245,27 @@ pub fn ungovern(plan: &UngovernPlan, hestia_home: &Path) -> Result<UngovernOutco
     ungovern_at(plan, hestia_home, &operator_home)
 }
 
+fn ungovern_registrar_command(
+    plan: &UngovernPlan,
+    registrar: &Path,
+    hestia_home: &Path,
+    operator_home: &Path,
+) -> Command {
+    let mut command = Command::new("python3");
+    command
+        .arg(registrar)
+        .arg("--remove")
+        .arg("--member")
+        .arg(&plan.member)
+        .arg("--json")
+        .arg("--home")
+        .arg(operator_home)
+        .args(plan.owned_targets.iter().flat_map(|target| ["--owned-target", target.as_str()]))
+        .env("HESTIA_HOME", hestia_home)
+        .env("DRY_RUN", "0");
+    command
+}
+
 pub(crate) fn ungovern_at(
     plan: &UngovernPlan,
     hestia_home: &Path,
@@ -250,17 +279,7 @@ pub(crate) fn ungovern_at(
         .as_ref()
         .filter(|path| path.is_file())
         .ok_or_else(|| anyhow::anyhow!("the member registrar is not installed; nothing was changed"))?;
-    let mut command = Command::new("python3");
-    command
-        .arg(registrar)
-        .arg("--remove")
-        .arg("--member")
-        .arg(&plan.member)
-        .arg("--json")
-        .arg("--home")
-        .arg(operator_home)
-        .args(plan.owned_targets.iter().flat_map(|target| ["--owned-target", target.as_str()]))
-        .env("HESTIA_HOME", hestia_home);
+    let command = ungovern_registrar_command(plan, registrar, hestia_home, operator_home);
     let out = output_within(command, REGISTRAR_TIMEOUT)?;
     let value: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
         anyhow::anyhow!(
@@ -305,6 +324,11 @@ mod tests {
                 ]
             }]
         });
+        for id in ["kimi-code", "kimi"] {
+            let plan = ungovern_plan_from_inventory(id, &report).unwrap();
+            assert_eq!(plan.member, "kimi");
+            assert_eq!(plan.governance_id, "kimi-code", "an inventory alias must not rename the authority");
+        }
         let plan = ungovern_plan_from_inventory("kimi-code", &report).unwrap();
         assert_eq!(plan.member, "kimi");
         assert_eq!(plan.owned_targets, [
@@ -337,9 +361,32 @@ mod tests {
     }
 
     #[test]
+    fn ungovern_registrar_cannot_inherit_dry_run() {
+        let plan = UngovernPlan {
+            member: "kimi".into(),
+            governance_id: "kimi-code".into(),
+            registrar: Some(PathBuf::from("/w/hestia/deploy/register-members.py")),
+            owned_targets: vec!["/h/.kimi-code/hooks/pre_tool_use.py".into()],
+            unowned_targets: Vec::new(),
+        };
+        let command = ungovern_registrar_command(
+            &plan,
+            Path::new("/w/hestia/deploy/register-members.py"),
+            Path::new("/h"),
+            Path::new("/operator"),
+        );
+        let dry_run = command
+            .get_envs()
+            .find(|(key, _)| *key == "DRY_RUN")
+            .map(|(_, value)| value);
+        assert_eq!(dry_run, Some(Some(std::ffi::OsStr::new("0"))));
+    }
+
+    #[test]
     fn an_ungovern_with_no_owned_targets_never_executes_a_registrar() {
         let plan = UngovernPlan {
             member: "codex".into(),
+            governance_id: "codex".into(),
             registrar: None,
             owned_targets: Vec::new(),
             unowned_targets: Vec::new(),

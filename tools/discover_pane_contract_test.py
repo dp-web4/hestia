@@ -597,11 +597,65 @@ def gate_bypass() -> None:
     check("a member whose gate is not hestia's is not offered bypass", rows["codex"][1].get("bypassable"), False)
 
 
+def unwire_results() -> None:
+    a = UI.index("  async function ungovernAgent(")
+    b = UI.index("  document.addEventListener('click'", a)
+    function = UI[a:b]
+    cases = [
+        {"ok": False, "status": 409, "out": {
+            "error": "registrar refused",
+            "rollback_errors": ["restoring the seat authority: read-only vault"],
+            "failureRecorded": False,
+            "failureRecordError": "witness db full",
+            "hooks_left_unowned": ["/elsewhere/foreign.js"],
+        }},
+        {"ok": True, "status": 200, "out": {
+            "message": "unwired", "recorded": False, "recordError": "witness db full",
+        }},
+    ]
+    driver = r"""
+(async () => {
+  const results = [];
+  for (const c of JSON.parse(process.argv[1])) {
+    const alerts = [];
+    let loads = 0;
+    global.confirm = () => true;
+    global.prompt = () => 'reason';
+    global.apiFetch = async () => ({ok: c.ok, status: c.status, json: async () => c.out});
+    global.alert = message => alerts.push(message);
+    global.discoverLoad = () => { loads += 1; };
+    await ungovernAgent('kimi-code');
+    results.push({alerts, loads});
+  }
+  process.stdout.write(JSON.stringify(results));
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+    r = subprocess.run(["node", "-e", function + driver, json.dumps(cases)],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        check("unwire result renderer executes", r.stderr.strip()[-300:], 0)
+        return
+    refusal, success = json.loads(r.stdout)
+    text = refusal["alerts"][0]
+    check("a refused unwire shows the refusal and does not reload",
+          (text.startswith("unwire refused: registrar refused"), refusal["loads"]), (True, 0))
+    check("a refused unwire names rollback failure and its unsafe state",
+          all(s in text for s in ["WARNING: rollback was incomplete", "restoring the seat authority: read-only vault",
+                                  "NOT put back as it was", "may now be refused, not intact"]))
+    check("a refused unwire never hides a failed terminal record",
+          "this refusal was not recorded on the chain (witness db full)" in text)
+    check("a refused unwire names hooks left in force", "/elsewhere/foreign.js" in text)
+    check("a successful unwire still warns when its terminal witness failed",
+          (success["alerts"], success["loads"]),
+          (["unwired\n\nWARNING: the act landed but its terminal witness failed: witness db full"], 1))
+
+
 def main() -> int:
     source_contract()
     if shutil.which("node"):
         behaviour()
         gate_bypass()
+        unwire_results()
         unaccounted()
         registry_members()
         cleanup()
