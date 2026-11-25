@@ -12,8 +12,44 @@ Run: python3 -m pytest <thisdir> -q   or   python3 hestia_gate_mechanism_test.py
 """
 import os
 import sys
+import tempfile
 import time
 import urllib.error
+from contextlib import contextmanager
+
+
+@contextmanager
+def _isolated_telemetry_home():
+    old = os.environ.get("HESTIA_HOME")
+    with tempfile.TemporaryDirectory(prefix="mechanism-telemetry-test-") as home:
+        os.environ["HESTIA_HOME"] = home
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop("HESTIA_HOME", None)
+            else:
+                os.environ["HESTIA_HOME"] = old
+
+
+# Pytest calls these xunit hooks without making the bare-Python suite depend on
+# pytest. The __main__ runner below has its own context for the same isolation.
+_telemetry_context = None
+
+
+def setup_function():
+    global _telemetry_context
+    _telemetry_context = _isolated_telemetry_home()
+    _telemetry_context.__enter__()
+
+
+def teardown_function():
+    global _telemetry_context
+    try:
+        if _telemetry_context is not None:
+            _telemetry_context.__exit__(None, None, None)
+    finally:
+        _telemetry_context = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hestia_gate_mechanism as m  # noqa: E402
@@ -765,13 +801,14 @@ ALL = [
 if __name__ == "__main__":
     print("shared society-safety mechanism — fail-closed + wire-shape contract")
     failed = []
-    for t in ALL:
-        try:
-            t()
-            print("PASS", t.__name__)
-        except AssertionError as e:
-            failed.append(t.__name__)
-            print("FAIL", t.__name__, "::", e)
+    with _isolated_telemetry_home():
+        for t in ALL:
+            try:
+                t()
+                print("PASS", t.__name__)
+            except AssertionError as e:
+                failed.append(t.__name__)
+                print("FAIL", t.__name__, "::", e)
     print()
     if failed:
         print(f"FAILURES: {failed}")
