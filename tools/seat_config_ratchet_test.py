@@ -72,8 +72,12 @@ class RecordingOperator:
                     seat.parent.mkdir(parents=True, exist_ok=True)
                     lines = [f"{k}={v}" for k, v in {**shared, **doc.get('env', {})}.items()]
                     seat.write_text("# rendered by the fixture daemon\n" + "\n".join(lines) + "\n")
-            return 200, {"seeded": sorted(docs), "intentEntryHash": "fixture-intent",
-                         "verdict": [{"member": m, "status": "seeded"} for m in docs]}
+            # The daemon's answer since #993: the vault commit and the projections' readiness
+            # are separate facts, and a verdict exists per SEAT (never for the shared set).
+            return 200, {"ok": True, "authority_committed": True, "ready": True,
+                         "ready_reason": "verified", "readiness_recorded": True,
+                         "seeded": sorted(docs), "intentEntryHash": "fixture-intent",
+                         "verdict": [{"member": m, "status": "verified"} for m in docs if m != "_shared"]}
         return 500, {"error": f"the fixture daemon does not serve {method} {path}"}
 
 

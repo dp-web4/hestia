@@ -133,14 +133,77 @@ def _load_registrar(repo: Path):
     return module if hasattr(module, "reconciled_commands") else None
 
 
+def _entry_mentions(commands: Iterable[str], entry: str) -> tuple[list[str], list[str]]:
+    """What the registered commands say about this gate entrypoint's basename.
+
+    -> (targets, unreadable). `targets` are the absolute paths with that basename. `unreadable` are
+    commands that name the basename in a way this cannot turn into a path: quoting that does not
+    parse, a relative or `~`/`$HOME` spelling, a `bash -c '...'` wrapper.
+
+    This is NOT a shell parser and does not claim to know what a command executes (NOVA's hold on
+    #1699). It reads a command two ways, as whitespace words (the installer's own rule,
+    register-members.py `target_path`) and as shell words, and takes the union, so a quoted path
+    the installer's rule does not see is still seen here. Where neither reading yields a path, the
+    answer is "unreadable", never "absent": the caller refuses instead of guessing.
+    """
+    import shlex
+    wanted = Path(entry).name
+    targets: list[str] = []
+    unreadable: list[str] = []
+    for command in commands:
+        if wanted not in command:
+            continue
+        words = set(command.split())
+        parsed = True
+        try:
+            words.update(shlex.split(command))
+        except ValueError:
+            parsed = False
+        hits = sorted(word for word in words if word.startswith("/") and Path(word).name == wanted)
+        targets.extend(hits)
+        if not parsed or not hits:
+            unreadable.append(command)
+    return targets, unreadable
+
+
+def _entry_targets(commands: Iterable[str], entry: str) -> list[str]:
+    """Absolute targets a registration invokes under this gate entrypoint's basename."""
+    return _entry_mentions(commands, entry)[0]
+
+
+def _declared_entry_target(home: Path, dest: Any, entry: str) -> Path | None:
+    if not isinstance(dest, str) or not dest:
+        return None
+    expanded = home.joinpath(dest[2:]) if dest.startswith("~/") else Path(os.path.expanduser(dest))
+    return expanded / Path(entry).name
+
+
+def _foreign_targets(commands: Iterable[str], entry: str, expected: Path | None) -> list[str]:
+    """Registrations of the same entry outside the location the reconciler owns.
+
+    Compared the way the reconciler compares (register-members.py `plan_reconcile`): normalised
+    text, NOT resolved through symlinks. A line that reaches the owned file through an alias is
+    still a line the reconciler will not rewrite, so it is FOREIGN here too. Resolving links would
+    call it owned and bring back #1255: a stale line the install leaves in force."""
+    if expected is None:
+        return []
+    owned = os.path.normpath(str(expected))
+    return sorted({os.path.normpath(target) for target in _entry_targets(commands, entry)
+                   if os.path.normpath(target) != owned})
+
+
+def _unreadable_registrations(commands: Iterable[str], entry: str, expected: Path | None) -> list[str]:
+    """Commands that name this entry but not as a path that can be compared with `expected`.
+    Like `_foreign_targets`, only for a member that declares a destination: a member the install
+    never touches keeps its old treatment."""
+    if expected is None:
+        return []
+    return _entry_mentions(commands, entry)[1]
+
+
 def _registered(commands: Iterable[str], entry: str) -> bool:
     """Whether a registration invokes exactly this gate entrypoint basename."""
-    wanted = Path(entry).name
-    for command in commands:
-        for token in command.split():
-            if token.startswith("/") and Path(token).name == wanted:
-                return True
-    return False
+    return bool(_entry_targets(commands, entry))
 
 
 def _render(value: Any, replacements: dict[str, str]) -> Any:
@@ -286,6 +349,41 @@ def _run_probes(
                 rows.append({"member": member, "status": "unmeasured", "reason": str(exc)})
                 good = False
                 continue
+        expected_target = _declared_entry_target(home, install.get("dest"), entry)
+        foreign = _foreign_targets(commands, entry, expected_target)
+        if foreign:
+            # #1255: never credit a same-basename FOREIGN line as this member's gate, and never
+            # probe only the owned half of a duplicate. The install would leave the other line in
+            # force, so refuse before running the candidate and name the actual repair.
+            shown = ", ".join(foreign[:3])
+            if len(foreign) > 3:
+                shown += f" (+{len(foreign) - 3} more)"
+            rows.append({
+                "member": member,
+                "status": "foreign",
+                "reason": (f"duplicate/foreign gate registration at {shown}, outside declared dest "
+                           f"{expected_target.parent}; the deploy will not rewrite it. Move the line "
+                           "under dest, or delete it and let the deploy register; resolve every "
+                           "duplicate before installing"),
+            })
+            good = False
+            continue
+        unreadable = _unreadable_registrations(commands, entry, expected_target)
+        if unreadable:
+            # The line names this gate but not as a path that can be told apart from the owned one.
+            # It may be a second gate the install would leave in force, so it is UNKNOWN, and an
+            # unknown registration is not "not registered".
+            rows.append({
+                "member": member,
+                "status": "unmeasured",
+                "reason": (f"a registration names {Path(entry).name} but not as an absolute path "
+                           f"this preflight can compare with dest {expected_target.parent} "
+                           f"(unparseable quoting, a relative or ~ path, or a wrapper): "
+                           f"{unreadable[0][:160]!r}. Register it as a plain absolute path under "
+                           "dest, or delete the line and let the deploy register")[:600],
+            })
+            good = False
+            continue
         if not _registered(commands, entry):
             rows.append({"member": member, "status": "not-registered"})
             continue

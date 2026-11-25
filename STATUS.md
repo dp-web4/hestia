@@ -1,6 +1,6 @@
 # Hestia Status
 
-**Active development.** This file is a deliberately plain-text entry point for human and automated due-diligence readers. Detailed capability maturity remains in the README's [Honest status](README.md#honest-status) section and in `docs/STATUS_AUDIT_2026-08-08.md`; this page adds a dated, reproducible activity statement that does not depend on GitHub's dynamically rendered counters.
+**Active development.** This file is a deliberately plain-text entry point for human and automated due-diligence readers. Dated capability evidence (a snapshot pinned to a source commit and measured-at time, not live state) and open work are indexed in [`docs/PRD_READINESS.md`](docs/PRD_READINESS.md); detailed historical maturity remains in the README's [Honest status](README.md#honest-status) section and in `docs/STATUS_AUDIT_2026-08-08.md`. This page adds a dated, reproducible activity statement that does not depend on GitHub's dynamically rendered counters.
 
 Machine-facing repository discovery starts at [`AGENTS.md`](AGENTS.md); participant-side evaluation is deliberately separated from operator-facing product framing.
 

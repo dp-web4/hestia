@@ -61,6 +61,7 @@ CLI = os.environ.get("HESTIA_MESH_CLI") or os.path.join(os.path.dirname(HERE), "
 
 # What the stub returns for the next tools/call, set per case.
 MODE = {"tool": "ok"}
+CONNECTS = {"count": 0}
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -82,8 +83,13 @@ class Stub(BaseHTTPRequestHandler):
 
         name = body.get("params", {}).get("name")
         if name == "hestia_connect":
+            CONNECTS["count"] += 1
             return self._sse(body["id"], {"sessionId": "s-1", "constellationRole":
                                           "role:constellation:member"})
+        if name == "hestia_gate_pending_escalations":
+            return self._sse(body["id"], {"pending": [{
+                "escalation_id": "subagent-pending", "asked_by": "test-member",
+                "host_session_id": "parent-session", "secs_remaining": 1800}]})
 
         if MODE["tool"] == "no_frame":
             # A 200 whose body has no `data:` line at all — the shape that used to
@@ -288,6 +294,18 @@ if __name__ == "__main__":
         # lazy: on a crashing CLI `out` is '', and an eager json.loads('') would raise
         # before check() is entered and abort the run three checks early.
         check(f"{label} stdout stays pure JSON", lambda o=out: json.loads(o) is not None, repr(out[:80]))
+
+    rc, out, _ = run(["pending"])
+    check("L  pending is a real read-only CLI command", rc == 0, f"rc={rc}; stdout={out[:120]!r}")
+    check("L  pending returns the daemon's pending rows", lambda: (
+        json.loads(out)["pending"][0]["escalation_id"] == "subagent-pending"), repr(out[:160]))
+    CONNECTS["count"] = 0
+    rc, out, _ = run(["sweep"])
+    check("L  sweep reuses one session for inbox and pending", rc == 0 and CONNECTS["count"] == 1,
+          f"rc={rc}; connects={CONNECTS['count']}")
+    check("L  sweep nests the pending response", lambda: (
+        json.loads(out)["pending"]["pending"][0]["escalation_id"] == "subagent-pending"),
+          repr(out[:180]))
 
     dead = f"http://127.0.0.1:{srv.server_port}/mcp"
     srv.shutdown()
