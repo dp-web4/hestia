@@ -28595,6 +28595,72 @@ fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value
 /// its session. Served in every response as `unbound_reads_since_start`, a bare number.
 static UNBOUND_SCOPE_STATUS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The most floor entries one status read will stat. The rest are reported as `unchecked`.
+const FLOOR_RESOLUTION_MAX: usize = 256;
+/// How long one status read waits for the filesystem pass. `hestia_scope_status` is what every
+/// gate fetches before it rules, so a floor path on a dead network mount must cost it this much
+/// and no more.
+const FLOOR_RESOLUTION_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// One pass at a time. A `stat` that never returns keeps its blocking thread; without this, each
+/// later status read would park another one behind it. The pass owns the permit, so a pass that
+/// outlives its caller still holds the slot.
+fn floor_resolution_slot() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone()
+}
+
+/// Why one floor path does not resolve, or `None` when it does. Runs on a blocking thread.
+fn floor_path_defect(path: &str) -> Option<Value> {
+    let e = std::fs::metadata(path).err()?;
+    // `metadata` follows links. A link that is itself present but points nowhere is a different
+    // repair (fix the link) from a path that was never there (fix the floor entry).
+    let kind = if e.kind() == std::io::ErrorKind::NotFound {
+        if std::fs::symlink_metadata(path).is_ok() { "dangling_link" } else { "missing" }
+    } else {
+        "unreadable"
+    };
+    Some(json!({ "path": path, "kind": kind, "error": e.to_string() }))
+}
+
+/// #940: which society-floor paths fail to resolve. EVIDENCE about the paths, never a filter on
+/// them. Bounded three ways (NOVA's hold on #1659): at most [`FLOOR_RESOLUTION_MAX`] entries, at
+/// most [`FLOOR_RESOLUTION_BUDGET`] of waiting, and one pass in flight ([`floor_resolution_slot`]). A pass that did not finish
+/// reports `count: null` -- "not established" must not read as "nothing unresolvable".
+async fn floor_resolution_report(paths: Vec<String>) -> Value {
+    floor_resolution_report_with(paths, FLOOR_RESOLUTION_BUDGET, floor_resolution_slot(), floor_path_defect).await
+}
+
+async fn floor_resolution_report_with(
+    paths: Vec<String>,
+    budget: std::time::Duration,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
+    defect: fn(&str) -> Option<Value>,
+) -> Value {
+    let total = paths.len();
+    let checked = total.min(FLOOR_RESOLUTION_MAX);
+    // The budget covers the wait for the slot AND the pass: behind a stuck pass, a read waits
+    // the budget once and answers "not established".
+    let pass = async move {
+        let permit = slot.acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            paths.iter().take(FLOOR_RESOLUTION_MAX).filter_map(|p| defect(p)).collect::<Vec<Value>>()
+        }).await.ok()
+    };
+    match tokio::time::timeout(budget, pass).await {
+        Ok(Some(rows)) => json!({
+            "status": if checked < total { "truncated" } else { "complete" },
+            "count": rows.len(), "entries": rows,
+            "checked": checked, "unchecked": total - checked,
+        }),
+        other => json!({
+            "status": if other.is_err() { "timed_out" } else { "failed" },
+            "count": Value::Null, "entries": [],
+            "checked": 0, "unchecked": total,
+        }),
+    }
+}
+
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     tool_scope_status_with_counter(state, args, &UNBOUND_SCOPE_STATUS_READS).await
 }
@@ -28754,6 +28820,11 @@ async fn tool_scope_status_with_counter(
         "added_by": f.added_by,
         "reason": f.reason,
     });
+    // #940: delivery and digest say the floor arrived intact, not that it points anywhere.
+    // Report resolution failures without changing the additive grant set or its digest.
+    let floor_resolution = floor_resolution_report(
+        s.standing_scope.floor.iter().map(|f| f.path.clone()).collect(),
+    ).await;
 
     Ok(json!({
         "plugin_id": plugin_id,
@@ -28842,6 +28913,10 @@ async fn tool_scope_status_with_counter(
             "added_by": f.added_by,
             "reason": f.reason,
         })).collect::<Vec<_>>(),
+        // Resolution is EVIDENCE ABOUT THE PATHS, never a filter on them (#940). An empty
+        // `society_floor` and a floor whose entries all fail to resolve must not look alike.
+        // `status` says whether the pass finished: `count` is null, never 0, when it did not.
+        "society_floor_unresolvable": floor_resolution,
         // Canonical over the path set, not presentation order or provenance. Combined with
         // `generation`, this lets two members prove they received the same society baseline
         // without learning anything about one another's personal expansions.
@@ -32826,6 +32901,117 @@ mod standing_scope_surface_tests {
         assert!(by_mode.iter().any(|f| f["path"] == "/w/governance/hestia" && f["modes"] == "r"));
         assert!(by_mode.iter().any(|f| f["path"] == "/w/shared" && f["modes"] == "rwed"));
         assert_eq!(out["society_floor_withheld"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn scope_status_reports_unresolvable_floor_entries_without_filtering_them() {
+        let (dir, state) = test_state().await;
+        let live = dir.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let missing = dir.path().join("missing");
+        let live = live.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: live.clone(), recursive: true, ..Default::default()
+            });
+            s.standing_scope.floor_add(FloorEntry {
+                path: missing.clone(), recursive: true, ..Default::default()
+            });
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        assert_eq!(out["society_floor"].as_array().map(Vec::len), Some(2),
+                   "reporting does not remove an entry from the additive floor");
+        let unresolved = &out["society_floor_unresolvable"];
+        assert_eq!(unresolved["count"], 1);
+        let rows = unresolved["entries"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], missing);
+        assert_eq!(rows[0]["kind"], "missing");
+        assert!(!rows[0]["error"].as_str().unwrap().is_empty());
+        assert_eq!(unresolved["status"], "complete");
+        assert_eq!(unresolved["checked"], 2);
+        assert_eq!(unresolved["unchecked"], 0);
+        assert_eq!(out["society_floor_digest"], state.lock().await.standing_scope.floor_digest());
+    }
+
+    /// Classification, then the three bounds. The bound cases use a private slot, so a pass they
+    /// leave running cannot make another test's status read wait.
+    #[tokio::test]
+    async fn floor_resolution_classifies_and_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let live = dir.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let dangling = dir.path().join("dangling");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        let good_link = dir.path().join("good-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&live, &good_link).unwrap();
+        // A file where a directory component is expected: ENOTDIR, neither missing nor a link.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+
+        let out = floor_resolution_report(vec![
+            s(live.clone()), s(dir.path().join("missing")), s(dangling.clone()),
+            s(good_link.clone()), s(file.join("below")),
+        ]).await;
+        assert_eq!(out["status"], "complete", "{out}");
+        let kind = |p: &std::path::Path| out["entries"].as_array().unwrap().iter()
+            .find(|r| r["path"] == s(p.to_path_buf())).map(|r| r["kind"].as_str().unwrap().to_string());
+        assert_eq!(kind(&live), None, "a live path is not reported");
+        assert_eq!(kind(&dir.path().join("missing")).as_deref(), Some("missing"));
+        #[cfg(unix)]
+        {
+            assert_eq!(kind(&dangling).as_deref(), Some("dangling_link"));
+            assert_eq!(kind(&good_link), None, "a link that resolves is not reported");
+            assert_eq!(kind(&file.join("below")).as_deref(), Some("unreadable"));
+            assert_eq!(out["count"], 3);
+        }
+        // The error text is the OS's, which does not repeat the path: nothing beyond what
+        // `society_floor` already tells this caller.
+        for r in out["entries"].as_array().unwrap() {
+            assert!(!r["error"].as_str().unwrap().contains(dir.path().to_str().unwrap()), "{r}");
+        }
+
+        // Bound 1: the entry cap. Unchecked entries are counted, never dropped silently.
+        let many: Vec<String> = (0..FLOOR_RESOLUTION_MAX + 3)
+            .map(|i| s(dir.path().join(format!("m{i}")))).collect();
+        let out = floor_resolution_report(many).await;
+        assert_eq!(out["status"], "truncated");
+        assert_eq!(out["checked"], FLOOR_RESOLUTION_MAX);
+        assert_eq!(out["unchecked"], 3);
+        assert_eq!(out["count"], FLOOR_RESOLUTION_MAX);
+
+        // Bound 2: a lookup that does not return costs the caller the budget, and the answer is
+        // UNKNOWN (count null), not "nothing unresolvable".
+        fn slow(_: &str) -> Option<Value> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            None
+        }
+        let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let short = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let out = floor_resolution_report_with(vec![s(live.clone())], short, slot.clone(), slow).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(300), "{:?}", started.elapsed());
+        assert_eq!(out["status"], "timed_out");
+        assert!(out["count"].is_null(), "an unfinished pass must not report a count: {out}");
+        assert_eq!(out["unchecked"], 1);
+
+        // Bound 3: while that pass is still out it holds the slot, so the next read does not
+        // start a second blocking pass. It waits its budget and is also UNKNOWN.
+        assert_eq!(slot.available_permits(), 0, "the abandoned pass still owns the slot");
+        let out = floor_resolution_report_with(vec![s(live.clone())], short, slot.clone(), floor_path_defect).await;
+        assert_eq!(out["status"], "timed_out");
+        assert!(out["count"].is_null());
+
+        // And the slot comes back when the slow pass ends.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let out = floor_resolution_report_with(vec![s(live)], short, slot, floor_path_defect).await;
+        assert_eq!(out["status"], "complete");
+        assert_eq!(out["count"], 0);
     }
 
     /// dp, 2026-10-23: "'floor' should not override the actual grants." A member whose own
