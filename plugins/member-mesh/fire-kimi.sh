@@ -472,5 +472,10 @@ cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-m
 # no longer knowable. The CONTENT was never at risk: the mesh is pointer-based
 # and every pointer is committed. A dead fire costs attention, not data.
 RC=$?
+# Only a completed member CLI wake mints invitation-specific observation; watcher drains do not.
+if [ "$RC" -eq 0 ]; then
+  printf '%s\n' "$DIGEST" | HESTIA_MESH_PLUGIN="$MEMBER" python3 "$HERE_DIR/hestia-mesh.py" presented >> "$LOG_DIR/kimi-$STAMP.log" 2>&1 || \
+    echo "[fire-kimi] WARNING: invitation presentation was not recorded; the member remains unanswered, not observed." >> "$LOG_DIR/kimi-$STAMP.log"
+fi
 echo "[fire-kimi] done rc=$RC (log: $LOG_DIR/kimi-$STAMP.log)"
 exit "$RC"

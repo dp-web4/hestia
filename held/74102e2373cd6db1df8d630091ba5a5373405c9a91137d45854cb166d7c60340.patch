@@ -1,0 +1,294 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3859,12 +3859,59 @@
+     return tuple(out)
+ 
+ 
++def _shell_without_comments(text: str) -> str:
++    out = []
++    quote = None
++    escaped = False
++    comment = False
++    word_start = True
++    for char in text:
++        if comment:
++            if char == "\n":
++                comment = False
++                word_start = True
++                out.append(char)
++            else:
++                out.append(" ")
++            continue
++        if escaped:
++            out.append(char)
++            escaped = False
++            word_start = False
++            continue
++        if quote is not None:
++            out.append(char)
++            if char == quote:
++                quote = None
++            continue
++        if char == "\\":
++            out.append(char)
++            escaped = True
++            word_start = False
++            continue
++        if char in ("'", '"'):
++            quote = char
++            out.append(char)
++            word_start = False
++            continue
++        if char == "#" and word_start:
++            comment = True
++            out.append(" ")
++            continue
++        out.append(char)
++        word_start = char.isspace() or char in ";|&()"
++    return "".join(out)
++
++
+ def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
+     """Parse direct interpreter command positions as `(isolated, script_dir, cwd, PYTHONPATH)`."""
+     if not command:
+         return []
+     try:
+-        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;")
++        command = _shell_without_comments(command)
++        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\n")
++        lexer.whitespace = " \t\r\f\v"
++        lexer.commenters = ""
+         lexer.whitespace_split = True
+         words = list(lexer)
+     except ValueError:
+@@ -3872,7 +3919,7 @@
+     segments = [[]]
+     separators = []
+     for word in words:
+-        if re.fullmatch(r"[&|;]+", word):
++        if re.fullmatch(r"(?:[&|;]|\n)+", word):
+             separators.append(word)
+             segments.append([])
+         else:
+@@ -3880,11 +3927,20 @@
+ 
+     invocations = []
+     current_cwd = os.path.realpath(cwd)
++    alternate_cwds = []
++    current_pythonpath = None
++    skip_next = False
+     for segment_index, segment in enumerate(segments):
++        if skip_next:
++            if not segment:
++                continue
++            skip_next = False
++            continue
+         if not segment:
+             continue
++        previous_separator = separators[segment_index - 1] if segment_index else None
+         i = 0
+-        pythonpath = None
++        pythonpath = current_pythonpath
+         while i < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[i]):
+             name, value = segment[i].split("=", 1)
+             if name == "PYTHONPATH":
+@@ -3911,14 +3967,40 @@
+                 else:
+                     break
+         if i >= len(segment):
++            if segment[0] != "env":
++                current_pythonpath = pythonpath
++            continue
++        if segment[i] in ("export", "local", "declare", "typeset", "readonly"):
++            for arg in segment[i + 1:]:
++                name, eq, value = arg.partition("=")
++                if eq and name == "PYTHONPATH":
++                    current_pythonpath = value
++            continue
++        if segment[i] == "unset":
++            if any(arg == "PYTHONPATH" for arg in segment[i + 1:]):
++                current_pythonpath = None
+             continue
+         if segment[i] == "cd":
+-            if (len(segment) == i + 2 and segment_index < len(separators)
+-                    and separators[segment_index] in ("&&", ";")):
+-                current_cwd = os.path.realpath(os.path.join(
+-                    current_cwd, os.path.expanduser(segment[i + 1])))
+-            continue
+-        if not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", os.path.basename(segment[i])):
++            next_separator = (separators[segment_index]
++                              if segment_index < len(separators) else None)
++            if len(segment) == i + 2 and next_separator in ("&&", "||", ";", "\n"):
++                possible = list(dict.fromkeys([current_cwd] + alternate_cwds))
++                targets = [os.path.realpath(os.path.join(c, os.path.expanduser(segment[i + 1])))
++                           for c in possible]
++                if previous_separator in ("&&", "||") or next_separator == "||":
++                    keep = possible + targets
++                else:
++                    keep = [target if os.path.isdir(target) else original
++                            for original, target in zip(possible, targets)]
++                    if (not any(os.path.isdir(target) for target in targets)
++                            and next_separator == "&&" and segment_index == 0):
++                        skip_next = True
++                keep = list(dict.fromkeys(keep))
++                current_cwd, alternate_cwds = keep[0], keep[1:]
++            continue
++        program = (os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
++                   if "/" in segment[i] else segment[i])
++        if not re.fullmatch(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?(?:-dbg)?", program):
+             continue
+ 
+         isolated = False
+@@ -3960,10 +4042,11 @@
+                 continue
+             script = arg
+             break
+-        script_dir = None
+-        if script and not stop_at_cwd:
+-            script_dir = os.path.dirname(os.path.realpath(os.path.join(current_cwd, script)))
+-        invocations.append((isolated, script_dir, current_cwd, pythonpath))
++        for invocation_cwd in dict.fromkeys([current_cwd] + alternate_cwds):
++            script_dir = None
++            if script and not stop_at_cwd:
++                script_dir = os.path.dirname(os.path.realpath(os.path.join(invocation_cwd, script)))
++            invocations.append((isolated, script_dir, invocation_cwd, pythonpath))
+     return invocations
+ 
+ 
+@@ -3979,11 +4062,12 @@
+ def _declared_package_root(cwd: str, workspace: str, scopes) -> Optional[str]:
+     """The nearest root carrying both an explicit path grant and package/source evidence."""
+     current = os.path.realpath(cwd)
++    evidence_dir = current
+     workspace = os.path.realpath(workspace)
+     markers = ("pyproject.toml", "setup.py", "setup.cfg", "Pipfile", ".git")
+     while True:
+         if any(os.path.exists(os.path.join(current, marker)) for marker in markers):
+-            return current if _within_path_grant(current, scopes, workspace) else None
++            return current if _within_path_grant(evidence_dir, scopes, workspace) else None
+         if current == workspace or os.path.dirname(current) == current:
+             return None
+         current = os.path.dirname(current)
+@@ -3992,8 +4076,12 @@
+ def python_ambient_import_verdict(command: Optional[str], cwd: str, workspace: str, scopes) -> Optional[Verdict]:
+     """Warn when non-isolated Python runs without a declared trusted package root.
+ 
+-    Trust requires an explicit `path:` grant AND package evidence, never a marker alone.
+-    Existing denies keep precedence: this is called only after scope has admitted the act.
++    Trust requires an explicit `path:` grant that reaches the actual script/import directory
++    AND package evidence, never a marker or an exact grant on an ancestor alone. Existing denies
++    keep precedence: this is called only after scope has admitted the act. Only direct interpreter
++    commands are parsed; `sh -c`, `uv run`, command substitution, `if`/`while` bodies, subshells,
++    `pushd`, and heredoc-fed interpreters are outside this advisory, so no warning is not proof
++    of import safety.
+     """
+     for isolated, script_dir, invocation_cwd, pythonpath in _python_invocations(command, cwd):
+         if isolated:
+diff --git a/plugins/claude-code/tests/python_ambient_import_test.py b/plugins/claude-code/tests/python_ambient_import_test.py
+--- a/plugins/claude-code/tests/python_ambient_import_test.py
++++ b/plugins/claude-code/tests/python_ambient_import_test.py
+@@ -93,9 +93,10 @@
+         (root / "nested").mkdir()
+         (root / "nested" / "helper.py").write_text("from sibling import VALUE\nprint(VALUE)\n")
+         nested_command = f"cd /tmp && python3 {root / 'nested' / 'helper.py'}"
++        nested_grants = [f"path:{tmp}{gate.RECURSIVE_SUFFIX}"]
+         check("file execution uses the script directory, not the invocation cwd",
+-              signal(nested_command, "/tmp", workspace=tmp, scopes=grants) is None,
+-              repr(signal(nested_command, "/tmp", workspace=tmp, scopes=grants)))
++              signal(nested_command, "/tmp", workspace=tmp, scopes=nested_grants) is None,
++              repr(signal(nested_command, "/tmp", workspace=tmp, scopes=nested_grants)))
+         with tempfile.TemporaryDirectory() as untrusted:
+             (Path(untrusted) / "helper.py").write_text("print('untrusted')\n")
+             outside = f"python3 {untrusted}/helper.py"
+@@ -277,6 +278,10 @@
+         check("a newline supplies the same command boundary as a semicolon",
+               signal(trusted_newline, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
+               repr(signal(trusted_newline, tmp, scopes=[f"path:{root / 'granted'}"])))
++        untrusted_newline = "echo hi\npython3 probe.py"
++        verdict = signal(untrusted_newline, tmp)
++        check("a newline does not hide a later interpreter invocation",
++              verdict is not None and verdict.target == str(root), repr(verdict))
+         conditional = f"false && cd {shlex.quote(str(root / 'granted'))}; python3 probe.py"
+         verdict = signal(conditional, tmp, scopes=[f"path:{root / 'granted'}"])
+         check("a failed conditional cd cannot manufacture package trust",
+@@ -285,6 +290,7 @@
+         check("a failed cd stops the dependent interpreter invocation",
+               signal(missing, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
+               repr(signal(missing, tmp, scopes=[f"path:{root / 'granted'}"])))
++        (root / "granted" / ".git").mkdir()
+         nested = root / "granted" / "downloads" / "untrusted"
+         nested.mkdir(parents=True)
+         (nested / "pyproject.toml").write_text("[project]\nname='nested-untrusted'\n")
+@@ -293,6 +299,71 @@
+         verdict = signal(nested_command, tmp, scopes=[f"path:{root / 'granted'}"])
+         check("an exact grant does not bless every nested package directory",
+               verdict is not None and verdict.target == str(nested), repr(verdict))
++        unmarked = root / "granted" / "downloads" / "no-marker"
++        unmarked.mkdir()
++        (unmarked / "probe.py").write_text("print('unmarked')\n")
++        unmarked_command = f"cd {shlex.quote(str(unmarked))} && python3 probe.py"
++        verdict = signal(unmarked_command, tmp, scopes=[f"path:{root / 'granted'}"])
++        check("an exact grant does not bless an unmarked nested directory",
++              verdict is not None and verdict.target == str(unmarked), repr(verdict))
++        recursive = [f"path:{root / 'granted'}{gate.RECURSIVE_SUFFIX}"]
++        check("a recursive grant still reaches a nested package directory",
++              signal(unmarked_command, tmp, scopes=recursive) is None,
++              repr(signal(unmarked_command, tmp, scopes=recursive)))
++        untrusted = root / "untrusted"
++        untrusted.mkdir()
++        (untrusted / "probe.py").write_text("print('untrusted')\n")
++        conditional_untrusted = f"true && cd {shlex.quote(str(untrusted))} && python3 probe.py"
++        verdict = signal(conditional_untrusted, root / "granted", workspace=tmp,
++                         scopes=[f"path:{root / 'granted'}"])
++        check("a conditional cd adds an untrusted possible cwd",
++              verdict is not None and verdict.target == str(untrusted), repr(verdict))
++        for label, prefix in (("cloned", "git clone example"), ("created", "mkdir -p")):
++            created = root / "granted" / (label + "-package")
++            command = f"{prefix} {created} && cd {created} && python3 setup.py install"
++            verdict = signal(command, root / "granted", workspace=tmp,
++                             scopes=[f"path:{root / 'granted'}"])
++            check(f"a {label} directory remains a possible cwd",
++                  verdict is not None and verdict.target == str(created), repr(verdict))
++        or_branch = f"cd {shlex.quote(str(untrusted))} || exit; python3 probe.py"
++        verdict = signal(or_branch, root / "granted", workspace=tmp,
++                         scopes=[f"path:{root / 'granted'}"])
++        check("an or-branch does not discard the cd target",
++              verdict is not None and verdict.target == str(untrusted), repr(verdict))
++        (root / "granted" / "sub").mkdir()
++        conditional_sequence = (
++            f"true && cd {shlex.quote(str(untrusted))}; cd sub; python3 probe.py")
++        verdict = signal(conditional_sequence, root / "granted", workspace=tmp, scopes=recursive)
++        check("a later cd preserves conditional cwd alternatives",
++              verdict is not None and verdict.target == str(untrusted), repr(verdict))
++        other_second = root / "other" / "second"
++        other_second.mkdir(parents=True)
++        (other_second / "pyproject.toml").write_text("[project]\n")
++        other_granted = root / "other" / "granted"
++        other_granted.mkdir()
++        (other_granted / "probe.py").write_text("print('other')\n")
++        other_grants = [f"path:{root / 'granted'}", f"path:{other_second}"]
++        relative_sequence = (
++            f"true && cd {shlex.quote(str(other_second))} && cd ../granted && python3 probe.py")
++        verdict = signal(relative_sequence, root / "granted", workspace=tmp, scopes=other_grants)
++        check("a relative cd composes over every possible cwd",
++              verdict is not None and verdict.target == str(other_granted), repr(verdict))
++        commented_cd = f"# note; cd {shlex.quote(str(root / 'granted'))}\npython3 probe.py"
++        verdict = signal(commented_cd, tmp)
++        check("a comment cannot manufacture a trusted cwd",
++              verdict is not None and verdict.target == str(root), repr(verdict))
++        quoted_hash = "echo '#'; python3 probe.py"
++        verdict = signal(quoted_hash, tmp)
++        check("a quoted hash does not start a comment",
++              verdict is not None and verdict.target == str(root), repr(verdict))
++        planted = root / "python3"
++        planted.symlink_to("/bin/true")
++        check("a planted bare-name symlink cannot silence the advisory",
++              signal("python3 probe.py", tmp) is not None)
++        comment_newline = "echo hi # comment\npython3 probe.py"
++        verdict = signal(comment_newline, tmp)
++        check("a comment does not swallow the newline before Python",
++              verdict is not None and verdict.target == str(root), repr(verdict))
+         with tempfile.TemporaryDirectory() as ambient:
+             exported = f"export PYTHONPATH={shlex.quote(ambient)}; python3 -c 'import x'"
+             verdict = signal(exported, tmp, scopes=[f"path:{root / 'granted'}"])
