@@ -1842,6 +1842,15 @@ def test_attempted_exact_preserves_raw_whitespace_identity(m, g, wc, home):
                   and first.get("attempted_exact") is True
                   and second.get("attempted_exact") is False,
                   (first, second))
+            for tool, tool_input in (
+                ("Bash", {"command": ["printf", "a b"]}),
+                _act(IN_SCOPE_EDIT),
+            ):
+                d, _ = _decide(g, "codex", tool, tool_input, home)
+                check("non-string-act-recorded", d.evidence_committed, d)
+                sent = stub.named("hestia_witness_decision")[-1][0]
+                check("only-a-preserved-string-command-can-be-exact",
+                      sent.get("attempted_exact") is False, sent)
     finally:
         stub.close()
 

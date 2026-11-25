@@ -91,7 +91,7 @@ as before.
 **Client (`hestia_gate_mechanism.record_decision`)**
 
 - **Signature.** `record_decision(client_or_none, *, plugin_id, decision, rule, tool_name, target, session_id, verdict_available, attempted_summary, action_id=None, correlation_key=None, deadline=None, attempted_exact=False) -> DecisionReceipt`.
-- **Act identity.** `attempted_exact` is true only when the sender preserved the raw act byte-for-byte before its bounded redaction, including whitespace. The common gate computes it from the raw tool input; an omitted or false value makes the daemon's `act_exact` false, so older senders cannot turn a normalized summary into exact-retry evidence.
+- **Act identity.** `attempted_exact` is true only when a string command was preserved byte-for-byte before bounded redaction, including whitespace. Edits, MCP inputs, argv lists, and other non-string or lossy forms are always inexact. The common gate computes it from the raw tool input; an omitted or false value makes the daemon's `act_exact` false, so older senders cannot turn a normalized summary into exact-retry evidence. If an older daemon rejects only `attempted_exact`, the sender retries once without it; when the input was already lossy, that retry adds an ellipsis so the older predicate cannot mark it exact.
 - **Status.** `DecisionReceipt.status` is one of `committed`, `refused`, `ambiguous` or `unreachable`. Only `committed` is evidence.
 - **Reply classification.** The reply is classified by the outcome witness's own `_classify_reply` (ok / ruled / ambiguous), so the two halves of the join can never disagree about what the daemon said.
 - **What counts as committed.** All of the following must hold:

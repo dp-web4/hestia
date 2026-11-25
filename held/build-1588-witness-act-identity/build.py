@@ -15,6 +15,7 @@ BUILD = pathlib.Path(__file__).resolve().parent
 MECHANISM = "plugins/_shared/hestia_gate_mechanism.py"
 SINGLE_GATE = "plugins/_shared/hestia_single_gate.py"
 CONTRACT = "tools/one_gate_decide_contract_test.py"
+DECISION_CONTRACT = "tools/decision_witness_contract_test.py"
 
 
 def blob(path):
@@ -52,11 +53,28 @@ def patch_mechanism(src):
         "attempted_exact": bool(attempted_exact),
         "action_id": action_id,
 ''')
-    return once(src, '''            "attempted": attempted_summary,
+    src = once(src, '''            "attempted": attempted_summary,
             "core_digest": record["core_digest"],
 ''', '''            "attempted": attempted_summary,
             "attempted_exact": bool(attempted_exact),
             "core_digest": record["core_digest"],
+''')
+    return once(src, '''        rpc = client.call_tool("hestia_witness_decision", args)
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
+''', '''        rpc = client.call_tool("hestia_witness_decision", args)
+        kind, payload = _classify_decision_reply(rpc)
+        if (kind == "ruled" and payload.get("code") == "hestia.witness_decision_unknown_arg"
+                and payload.get("data", {}).get("unknownKeys") == ["attempted_exact"]):
+            # ONE compatibility retry for an older daemon. If the input was already lossy, make
+            # that visible to its pre-attempted_exact predicate too; never trade availability for
+            # a false exact-retry identity (#1588 review).
+            args.pop("attempted_exact")
+            if (not attempted_exact
+                    and not any(mark in attempted_summary for mark in ("…", "[REDACTED —", "***"))):
+                args["attempted"] = attempted_summary + " …"
+            rpc = client.call_tool("hestia_witness_decision", args)
+            kind, payload = _classify_decision_reply(rpc)
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
 ''')
 
 
@@ -64,9 +82,9 @@ def patch_single_gate(src):
     src = once(src, '''def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
     return mechanism.record_decision(
 ''', '''def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
-    command = _command_text(inv.event.tool_input)
-    attempted_exact = attempted is None and (
-        command is None or " ".join(command.split()) == command)
+    command = inv.event.tool_input.get("command")
+    attempted_exact = (attempted is None and isinstance(command, str)
+                       and " ".join(command.split()) == command)
     return mechanism.record_decision(
 ''')
     return once(src, '''        correlation_key=inv.key,
@@ -126,12 +144,19 @@ def run_contract(root, mechanism, single_gate):
         }),
         PYTHONDONTWRITEBYTECODE="1",
     )
-    return subprocess.run(
+    commands = [
         [sys.executable, str(WT / CONTRACT), "--only", "contract"],
-        cwd=WT,
-        env=env,
-        text=True,
-        capture_output=True,
+        [sys.executable, str(WT / DECISION_CONTRACT)],
+    ]
+    runs = [
+        subprocess.run(command, cwd=WT, env=env, text=True, capture_output=True)
+        for command in commands
+    ]
+    return subprocess.CompletedProcess(
+        commands,
+        max(run.returncode for run in runs),
+        "\n".join(run.stdout for run in runs),
+        "\n".join(run.stderr for run in runs),
     )
 
 
