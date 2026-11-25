@@ -32,16 +32,24 @@ def _isolated_telemetry_home():
                 os.environ["HESTIA_HOME"] = old
 
 
-try:
-    import pytest
-except ImportError:
-    pytest = None
+# Pytest calls these xunit hooks without making the bare-Python suite depend on
+# pytest. The __main__ runner below has its own context for the same isolation.
+_telemetry_context = None
 
-if pytest is not None:
-    @pytest.fixture(autouse=True)
-    def _no_ambient_telemetry():
-        with _isolated_telemetry_home():
-            yield
+
+def setup_function():
+    global _telemetry_context
+    _telemetry_context = _isolated_telemetry_home()
+    _telemetry_context.__enter__()
+
+
+def teardown_function():
+    global _telemetry_context
+    try:
+        if _telemetry_context is not None:
+            _telemetry_context.__exit__(None, None, None)
+    finally:
+        _telemetry_context = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hestia_gate_mechanism as m  # noqa: E402
