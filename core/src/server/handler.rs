@@ -10574,6 +10574,14 @@ fn escalation_answer_guidance() -> Value {
 }
 
 fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    resolve_escalation_pointer_for_session(s, pointer, None)
+}
+
+fn resolve_escalation_pointer_for_session(
+    s: &super::state::ServerState,
+    pointer: &str,
+    session_id_arg: Option<&str>,
+) -> Value {
     let ptr = pointer.trim();
     if ptr.is_empty() {
         return hestia_error_envelope(
@@ -10678,11 +10686,54 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             .cloned()
     };
     let opened = newest(&["gate_escalation_opened"]);
-    let settled = newest(&[
-        "gate_escalation_decided",
-        "gate_escalation_withdrawn",
-        "gate_escalation_expired",
-    ]);
+    // A terminal event TYPE alone is not a valid ruling. Inspect the newest terminal candidate
+    // first: an unparseable newer ruling is UNKNOWN history, never permission to revive an older
+    // approval (#1661 review).
+    let settled = opened.as_ref().and_then(|opened| {
+        let opened_plugin = opened.event_data.get("plugin_id").and_then(Value::as_str);
+        rows.iter().rev().find(|e| {
+            e.chain_position > opened.chain_position
+                && opened_plugin.is_some()
+                && e.event_data.get("plugin_id").and_then(Value::as_str) == opened_plugin
+                && matches!(e.event_type.as_str(),
+                    "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired")
+        }).cloned()
+    });
+    if let Some(e) = settled.as_ref() {
+        let status = e.event_data.get("status").and_then(Value::as_str);
+        let decided_by = e
+            .event_data
+            .get("decided_by")
+            .and_then(Value::as_str)
+            .is_some_and(|by| !by.trim().is_empty());
+        let valid = match e.event_type.as_str() {
+            "gate_escalation_decided" => {
+                matches!(status, Some("approved") | Some("denied")) && decided_by
+            }
+            "gate_escalation_withdrawn" => {
+                status == Some("denied")
+                    && e.event_data.get("decided_via").and_then(Value::as_str)
+                        == Some("self_withdrawn")
+                    && decided_by
+            }
+            "gate_escalation_expired" => true,
+            _ => false,
+        };
+        if !valid {
+            let mut out = hestia_error_envelope(
+                "hestia.escalation_history_invalid",
+                &format!(
+                    "the newest terminal row for escalation {ptr} has an unrecognized status or decision shape; the older approval is not authoritative"
+                ),
+                Some(json!({"terminal_entry": chain_entry_json(e)})),
+            );
+            out["source"] = json!("witness_chain");
+            out["status"] = json!("unknown");
+            out["escalation_id"] = json!(ptr);
+            out["terminal_entry"] = chain_entry_json(e);
+            return out;
+        }
+    }
     // THE SPEND, which is not a settlement and must not be mistaken for one: a claimed entry
     // carries no `status`, and reading it as the settlement would render it `denied`.
     let claimed = newest(&["gate_escalation_claimed"]);
@@ -10710,6 +10761,12 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
     // the filtered-window illusion one level up.
     let d = &opened.event_data;
     let get = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
+    let asking_session_proven = resolve_attributed_caller(s, session_id_arg).is_some_and(|caller| {
+        let session = caller.session_uuid.map(|uuid| uuid.to_string());
+        caller.plugin_id == d.get("plugin_id").and_then(Value::as_str).unwrap_or_default()
+            && session.is_some()
+            && session.as_deref() == d.get("session_id").and_then(Value::as_str)
+    });
     let settled_get = |k: &str| {
         settled
             .as_ref()
@@ -10742,6 +10799,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "bar": get("bar"),
         "invited_peers": get("invited_peers"),
         "asker_basis": get("asker_basis"),
+        "asking_session_proven": asking_session_proven,
         // Shape parity with the live arm on the SPEND too — see there for why this
         // is not a fuse field. `claimed: false` is a measured absence here, not an
         // unsearched one: the exact lookup returns every entry naming this escalation
@@ -21379,6 +21437,318 @@ mod tests {
         assert!(!err.to_string().contains("unknown ids"), "{err}");
     }
 
+    async fn reaped_poll_subject() -> (TempDir, SharedState, String, String, Value) {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": session.clone(),
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.reap(
+                now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+            let rows = s.chain_store.escalation_rows(&id).unwrap();
+            let open = rows.iter().find(|e| e.event_type == "gate_escalation_opened").unwrap();
+            assert_eq!(open.event_data["session_id"], session);
+        }
+        (_dir, shared, session, id, opened)
+    }
+
+    async fn poll_reaped_ruling(approve: bool) -> Value {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": session,
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let reason = if approve { "approved after review" } else { "refused after review" };
+
+        let (expected_bar, expected_factors) = {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            let decided = s
+                .gate_escalations
+                .decide(
+                    &id,
+                    approve,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some(reason),
+                    now,
+                )
+                .unwrap();
+            let expected_bar = decided.bar;
+            let expected_factors = decided.factors.clone();
+            let bar_met = decided.bar_met();
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": id, "plugin_id": "codex",
+                    "status": decided.stored_status(),
+                    "decided_by": decided.decided_by,
+                    "decided_via": decided.decided_via,
+                    "reason": decided.reason,
+                    "bar": decided.bar,
+                    "bar_met": bar_met,
+                    "factors_present": decided.factors,
+                }),
+            )
+            .unwrap();
+            s.gate_escalations.reap(
+                now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+            let rows = s.chain_store.escalation_rows(&id).unwrap();
+            assert!(rows.iter().any(|e| e.event_type == "gate_escalation_opened"));
+            assert!(rows.iter().any(|e| e.event_type == "gate_escalation_decided"));
+            (expected_bar, expected_factors)
+        };
+
+        let polled = tool_gate_escalation_poll(
+            &shared,
+            &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["source"], "witness_chain", "{polled}");
+        assert_eq!(polled["history_lookup"], "terminal", "{polled}");
+        assert_eq!(polled["historical_details_proven"], true, "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["claim_window_secs_remaining"], 0, "{polled}");
+        assert_eq!(polled["observation_started_claim_window"], false, "{polled}");
+        assert_eq!(polled["decided_by"], "operator", "{polled}");
+        assert_eq!(polled["decided_via"], "operator_session", "{polled}");
+        assert_eq!(polled["reason"], reason, "{polled}");
+        assert_eq!(polled["bar"], json!(expected_bar), "{polled}");
+        assert_eq!(polled["bar_met"], true, "{polled}");
+        assert_eq!(polled["factors_present"], json!(expected_factors), "{polled}");
+        assert_eq!(polled["consumed_at"], Value::Null, "{polled}");
+        assert!(polled["note"].as_str().unwrap().contains("witness chain"), "{polled}");
+        polled
+    }
+
+    #[tokio::test]
+    async fn a_reaped_denial_polls_the_ruling_from_the_chain() {
+        let polled = poll_reaped_ruling(false).await;
+        assert_eq!(polled["status"], "denied", "{polled}");
+        assert_eq!(polled["reason"], "refused after review", "{polled}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_approval_polls_the_ruling_without_resurrecting_spend_authority() {
+        let polled = poll_reaped_ruling(true).await;
+        assert_eq!(polled["status"], "approved", "{polled}");
+        assert_eq!(polled["reason"], "approved after review", "{polled}");
+        assert_eq!(polled["bar_met"], true, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_poll_distinguishes_a_nonexistent_id_from_a_chain_outage() {
+        let (_dir, shared) = make_shared_state();
+        let args = json!({"escalation_id": "deadbeefdeadbeef"});
+        let missing = tool_gate_escalation_poll(&shared, &args).await.unwrap();
+        assert_eq!(missing["status"], "expired", "{missing}");
+        assert_eq!(missing["source"], "live_store", "{missing}");
+        assert_eq!(missing["history_lookup"], "not_found", "{missing}");
+        assert_eq!(missing["permits_write"], false, "{missing}");
+        assert_eq!(missing["granted"], false, "{missing}");
+        assert_eq!(missing["decided_by"], Value::Null, "{missing}");
+        assert_eq!(missing["reason"], Value::Null, "{missing}");
+        assert!(missing["note"].as_str().unwrap().contains("anywhere on the witness chain"));
+
+        let key = crate::storage::storage_key(_dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(_dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE chain_entries;").unwrap();
+        let outage = tool_gate_escalation_poll(&shared, &args).await.unwrap();
+        assert_eq!(outage["status"], "expired", "{outage}");
+        assert_eq!(outage["source"], "live_store", "{outage}");
+        assert_eq!(outage["history_lookup"], "error", "{outage}");
+        assert_eq!(outage["permits_write"], false, "{outage}");
+        assert_eq!(outage["granted"], false, "{outage}");
+        assert!(outage["note"].as_str().unwrap().contains("UNKNOWN, not absent"));
+    }
+
+    #[tokio::test]
+    async fn historical_poll_uses_the_latest_valid_terminal_row_without_leaking_superseded_fields() {
+        let (_dir, shared, session, id, opened) = reaped_poll_subject().await;
+        {
+            let s = shared.lock().await;
+            for (status, reason, by) in [
+                ("approved", "an earlier approval", "operator"),
+                ("denied", "the latest valid refusal", "peer:kimi-code"),
+            ] {
+                s.append_chain(
+                    "gate_escalation_decided",
+                    json!({
+                        "escalation_id": id, "plugin_id": "codex", "status": status,
+                        "decided_by": by, "decided_via": "operator_session", "reason": reason,
+                        "bar": "sovereign_plus_peer", "bar_met": status == "approved",
+                        "factors_present": [{"by": by, "argument": reason}],
+                    }),
+                )
+                .unwrap();
+            }
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({"escalation_id": id, "plugin_id": "kimi-code", "status": "approved",
+                       "decided_by": "operator", "reason": "another member cannot settle this"}),
+            )
+            .unwrap();
+        }
+        let denied = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied["history_lookup"], "terminal", "{denied}");
+        assert_eq!(denied["status"], "denied", "{denied}");
+        assert_eq!(denied["reason"], "the latest valid refusal", "{denied}");
+        assert_eq!(denied["factors_present"][0]["by"], "peer:kimi-code", "{denied}");
+        assert_eq!(denied["bar"], "sovereign_plus_peer", "{denied}");
+        assert_eq!(denied["bar_met"], false, "{denied}");
+        assert_eq!(denied["historical_details_proven"], true, "{denied}");
+        assert_eq!(denied["permits_write"], false, "{denied}");
+        assert_eq!(denied["granted"], false, "{denied}");
+
+        for extra in [
+            json!({"escalation_id": id, "plugin_id": "codex", "decided_by": "operator",
+                   "reason": "missing status must not become a denial"}),
+            json!({"escalation_id": id, "plugin_id": "codex", "status": "revoked",
+                   "decided_by": "operator", "reason": "not a supported terminal status"}),
+        ] {
+            shared.lock().await.append_chain("gate_escalation_decided", extra).unwrap();
+            let unknown = tool_gate_escalation_poll(
+                &shared, &json!({"escalation_id": id, "session_id": session}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unknown["status"], "unknown", "{unknown}");
+            assert_eq!(unknown["history_lookup"], "opened", "{unknown}");
+            assert_eq!(unknown["reason"], Value::Null, "{unknown}");
+            assert_eq!(unknown["permits_write"], false, "{unknown}");
+            assert_eq!(unknown["granted"], false, "{unknown}");
+        }
+
+        shared.lock().await.append_chain(
+            "gate_escalation_withdrawn",
+            json!({"escalation_id": id, "plugin_id": "codex", "status": "denied",
+                   "decided_by": "codex", "decided_via": "self_withdrawn"}),
+        )
+        .unwrap();
+        let withdrawn = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(withdrawn["status"], "denied", "{withdrawn}");
+        assert_eq!(withdrawn["decided_via"], "self_withdrawn", "{withdrawn}");
+        assert_eq!(withdrawn["reason"], Value::Null, "{withdrawn}");
+        assert_eq!(withdrawn["factors_present"], Value::Null, "{withdrawn}");
+        assert_eq!(withdrawn["bar"], opened["bar"], "{withdrawn}");
+        assert_eq!(withdrawn["permits_write"], false, "{withdrawn}");
+        assert_eq!(withdrawn["granted"], false, "{withdrawn}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_open_ask_does_not_wait_as_live_pending() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        let polled = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["status"], "expired", "{polled}");
+        assert_eq!(polled["history_lookup"], "opened", "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["claim_window_secs_remaining"], 0, "{polled}");
+        assert!(polled["note"].as_str().unwrap().contains("no live ruling path"), "{polled}");
+    }
+
+    #[tokio::test]
+    async fn historical_poll_reason_and_factors_require_the_original_asking_session() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "approved",
+                "decided_by": "operator", "decided_via": "operator_session",
+                "reason": "private review rationale", "bar_met": true,
+                "factors_present": [{"by": "operator", "argument": "private peer argument"}],
+            }),
+        )
+        .unwrap();
+        let other = tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let sibling = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h", "host_session_id": "a-different-wake",
+        }))
+        .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(sibling, session);
+
+        for session_id in [None, Some(other.as_str()), Some(sibling.as_str())] {
+            let mut args = json!({"escalation_id": id});
+            if let Some(session_id) = session_id {
+                args["session_id"] = json!(session_id);
+            }
+            let polled = tool_gate_escalation_poll(&shared, &args).await.unwrap();
+            assert_eq!(polled["status"], "approved", "{polled}");
+            assert_eq!(polled["history_lookup"], "terminal", "{polled}");
+            assert_eq!(polled["historical_details_proven"], false, "{polled}");
+            assert_eq!(polled["reason"], Value::Null, "{polled}");
+            assert_eq!(polled["factors_present"], Value::Null, "{polled}");
+            assert_eq!(polled["permits_write"], false, "{polled}");
+            assert_eq!(polled["granted"], false, "{polled}");
+        }
+
+        let mine = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mine["historical_details_proven"], true, "{mine}");
+        assert_eq!(mine["reason"], "private review rationale", "{mine}");
+        assert_eq!(mine["factors_present"][0]["argument"], "private peer argument", "{mine}");
+        assert_eq!(mine["permits_write"], false, "{mine}");
+        assert_eq!(mine["granted"], false, "{mine}");
+    }
+
     /// The positive control for the binding above, and the more important half of it: the fix
     /// must close the hole WITHOUT killing the feature. A guard that makes every invitation
     /// vanish would pass the test above while deleting the only production writer on the peer
@@ -29730,21 +30100,71 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     // inside it while a member working asynchronously watched grants die unspent. Reading
     // your own decision is how you learn it landed, so that is where the clock should start.
     //
-    // The READ stays open to anyone — poll has never required a session and a status query is
-    // not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here would
-    // let any caller extend (or, by racing, fix) another member's deadline. Unproven callers
-    // get exactly the answer they got before; nothing regresses for them.
+    // The status READ stays open to anyone — poll has never required a session and a status
+    // query is not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here
+    // would let any caller extend (or, by racing, fix) another member's deadline. Recovered
+    // rationale and factors also require the original asking session: knowing an escalation id
+    // is not evidence that a caller may read another member's review details.
     let observed = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
         Some(c) => s.gate_escalations.mark_observed(&id, &c.plugin_id, now),
         None => false,
     };
 
-    let status = s.gate_escalations.status_of(&id, now);
+    let live_status = s.gate_escalations.status_of(&id, now);
     let esc = s.gate_escalations.get(&id);
+    let chain_answer = if esc.is_none() {
+        Some(resolve_escalation_pointer_for_session(&s, &id, session_id_arg.as_deref()))
+    } else {
+        None
+    };
+    let history_lookup = match chain_answer.as_ref() {
+        None => "not_queried",
+        Some(answer) if answer["source"] == "witness_chain"
+            && answer.get("settled_entry").is_some_and(|e| !e.is_null()) => "terminal",
+        Some(answer) if answer["source"] == "witness_chain" => "opened",
+        Some(answer) if answer["_hestia_error"]["code"] == "hestia.escalation_pointer_not_found" => {
+            "not_found"
+        }
+        Some(_) => "error",
+    };
+    let historical = chain_answer.filter(|answer| answer["source"] == "witness_chain");
+    let historical_details_proven = historical
+        .as_ref()
+        .is_some_and(|answer| answer["asking_session_proven"] == true);
+    let historical_field = |key: &str| {
+        historical
+            .as_ref()
+            .and_then(|h| {
+                h["settled_entry"]["eventData"]
+                    .get(key)
+                    .or_else(|| h.get(key))
+            })
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let reply_status = historical
+        .as_ref()
+        .map(|h| h["status"].clone())
+        .unwrap_or_else(|| json!(live_status));
+    let reply_status = if esc.is_none() && history_lookup == "opened" && reply_status == "pending" {
+        // A recovered open record has no live ruling path. Do not keep `await_escalation`
+        // waiting as though this were a live pending row (#1661 review).
+        json!("expired")
+    } else {
+        reply_status
+    };
+    let granted = live_status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false);
 
     Ok(json!({
         "escalation_id": id,
-        "status": status,
+        "source": if historical.is_some() { "witness_chain" } else { "live_store" },
+        "history_lookup": history_lookup,
+        "historical_details_proven": if historical.is_some() {
+            json!(historical_details_proven)
+        } else {
+            Value::Null
+        },
+        "status": reply_status,
         // Told, not inferred: if this poll is what started the claim fuse, the member should
         // know its window is now measured from THIS moment and not from the ruling.
         "observation_started_claim_window": observed,
@@ -29765,18 +30185,17 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // existing somewhere does not put it on the path anyone takes. It goes HERE, where
         // the wrong field already was.
         "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
-        "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        "granted": granted,
         // THREE causes for `0`, one shape (#651) — and the fix is NOT to collapse all three
         // to `null`, because the two causes are not the same kind of thing.
         //
-        // UNKNOWN ID stays `0`. That is the deliberate policy stated on `note` below: an id
-        // this daemon has never seen is treated as EXPIRED, and the caller's only safe
-        // reading of "I do not know" is "no". An `and_then` here would have quietly widened
-        // the #651 repair into that contract and turned a fail-closed answer into `null`.
+        // NO LIVE ROW stays `0`, including a ruling recovered from the chain or a failed chain
+        // lookup. Recovery is history, not renewed spend authority; an `and_then` here would
+        // turn that fail-closed answer into `null`.
         //
-        // PENDING becomes `null`, because it is the opposite situation: a KNOWN record whose
-        // claim clock has not started. `0` there is not a safe "no", it is a false "your
-        // window shut" published against a petition the operator can still approve — measured
+        // A LIVE PENDING row becomes `null`, because it is a KNOWN record whose claim clock has
+        // not started. `0` there is not a safe "no", it is a false "your window shut"
+        // published against a petition the operator can still approve — measured
         // live 2026-08-26 22:18:45Z on `a0dc8225` (1203s of decision life) and `bc37287c`
         // (2460s). The safe-downgrade argument does not reach it: nothing is being permitted
         // by saying "not decided yet", so there is no failure to close toward.
@@ -29797,16 +30216,44 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // zero call sites, and the note stated the two-conjunct rule for six days after the
         // field it explains was moved to four. A peer auditing "which of these N approvals on
         // a shared marker was the one actually spent?" must not have to substring-match prose.
-        "consumed_at": esc.and_then(|e| e.consumed_at),
-        "bar": esc.map(|e| e.bar),
-        "bar_met": esc.map(|e| e.bar_met()),
-        "factors_present": esc.map(|e| e.factors.clone()),
+        "consumed_at": if esc.is_some() {
+            json!(esc.and_then(|e| e.consumed_at))
+        } else {
+            historical_field("consumed_at")
+        },
+        "bar": if esc.is_some() { json!(esc.map(|e| e.bar)) } else { historical_field("bar") },
+        "bar_met": if esc.is_some() {
+            json!(esc.map(|e| e.bar_met()))
+        } else {
+            historical_field("bar_met")
+        },
+        "factors_present": if esc.is_some() {
+            json!(esc.map(|e| e.factors.clone()))
+        } else if historical_details_proven {
+            historical_field("factors_present")
+        } else {
+            Value::Null
+        },
         "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
-        "decided_by": esc.and_then(|e| e.decided_by.clone()),
-        "decided_via": esc.and_then(|e| e.decided_via),
-        "reason": esc.and_then(|e| e.reason.clone()),
-        // An id this daemon has never seen and an id whose window closed are the SAME answer on
-        // purpose. The caller's only safe reading of "I do not know" is "no".
+        "decided_by": if esc.is_some() {
+            json!(esc.and_then(|e| e.decided_by.clone()))
+        } else {
+            historical_field("decided_by")
+        },
+        "decided_via": if esc.is_some() {
+            json!(esc.and_then(|e| e.decided_via))
+        } else {
+            historical_field("decided_via")
+        },
+        "reason": if esc.is_some() {
+            json!(esc.and_then(|e| e.reason.clone()))
+        } else if historical_details_proven {
+            historical_field("reason")
+        } else {
+            Value::Null
+        },
+        // No chain-recovered state restores spend authority. An unknown id and an expired id
+        // both fail closed even though `history_lookup` distinguishes their evidence.
         //
         // THE NOTE IS THE FIELD'S PROSE AND MUST TRACK THE SAME FOUR CONJUNCTS. It used to
         // read "authoritative as of now; only `approved` WITH the stated bar met permits the
@@ -29817,9 +30264,27 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // value was not, because nothing compiles a string. It now comes from
         // `Escalation::claim_note`, the single answer `decision_reply` already reads.
         "note": match esc {
-            None => "unknown escalation_id — treated as expired (a restart drops the store, and \
-                     an in-flight escalation must then read as denied)",
             Some(e) => e.claim_note(now),
+            None if history_lookup == "terminal" => "terminal record recovered from the witness \
+                                                     chain; permits_write stays false because no \
+                                                     spend authority is restored. To act on it, \
+                                                     open a new escalation for the act and cite \
+                                                     this id: the recovered ruling is evidence \
+                                                     for the decider, not a claim",
+            None if history_lookup == "opened" => "the recovered open record has no live ruling \
+                                                   path: treated as expired and permits_write stays \
+                                                   false",
+            None if history_lookup == "not_found" => "no escalation with this id exists in the \
+                                                      live store or anywhere on the witness chain; \
+                                                      treated as expired and permits_write stays \
+                                                      false",
+            None if history_lookup == "error" => "the live row is absent and the chain lookup \
+                                                  failed: any historical ruling is UNKNOWN, not \
+                                                  absent; treated as expired and permits_write \
+                                                  stays false",
+            None => "unknown to the live store: reaped (decided rows are kept about two hours \
+                     after open) or lost to a restart; this is NOT evidence that no one ruled — \
+                     check the chain before re-escalating.",
         },
     }))
 }
