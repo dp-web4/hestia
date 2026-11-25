@@ -1674,7 +1674,7 @@ impl SqliteInboxStore {
         written: &MemberNoticeLease,
         prior: &MemberNoticeLease,
     ) -> Result<bool> {
-        let conn = self.write_conn()?;
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member notice lease restore")?;
         let changed = tx
