@@ -1882,20 +1882,31 @@ impl SqliteChainStore {
 
     pub const ESCALATION_HISTORY_MAX_ROWS: i64 = 256;
 
-    /// Every witnessed entry about ONE gate escalation, oldest first, with no recency window
-    /// (#1014): its `gate_escalation_opened`, any decided / withdrawn / expired settlement, and
-    /// any `gate_escalation_claimed` spend. The exact id index keeps the lookup proportional to
-    /// this escalation's history rather than the whole chain. More than 256 matching rows is an
-    /// error, never a partial answer that could omit the open or newest ruling (#1725).
+    /// The open and terminal rows about ONE gate escalation, plus only its newest spend,
+    /// oldest first (#1014, #1725). The exact id index keeps lookup proportional to this
+    /// escalation's history rather than the whole chain. More than 256 matching rows is an
+    /// error, never a partial answer that could omit the open or newest ruling. Spend-heavy
+    /// approvals do not overflow the bound: recovery needs only the latest claim.
     pub fn escalation_rows(&self, escalation_id: &str) -> Result<Vec<ChainEntry>> {
         let conn = self.observed(&self.read_conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
-             FROM chain_entries INDEXED BY idx_chain_escalation_id
-             WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
-                                  'gate_escalation_withdrawn', 'gate_escalation_expired',
-                                  'gate_escalation_claimed')
-               AND json_extract(event_data, '$.escalation_id') = ?1
+             FROM (
+                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                 FROM chain_entries INDEXED BY idx_chain_escalation_id
+                 WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                      'gate_escalation_withdrawn', 'gate_escalation_expired')
+                   AND json_extract(event_data, '$.escalation_id') = ?1
+                 UNION ALL
+                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                 FROM (
+                     SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                     FROM chain_entries INDEXED BY idx_chain_escalation_id
+                     WHERE event_type = 'gate_escalation_claimed'
+                       AND json_extract(event_data, '$.escalation_id') = ?1
+                     ORDER BY chain_position DESC LIMIT 1
+                 )
+             )
              ORDER BY chain_position ASC
              LIMIT ?2",
         )?;
@@ -3196,7 +3207,7 @@ mod tests {
     }
 
     #[test]
-    fn escalation_history_uses_its_exact_index_and_never_returns_an_overflow_prefix() {
+    fn escalation_history_bounds_terminal_rows_without_counting_every_spend() {
         let dir = TempDir::new().unwrap();
         let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
         store.append(
@@ -3233,6 +3244,20 @@ mod tests {
             store.append(
                 "gate_escalation_claimed",
                 json!({"escalation_id": "crowded", "plugin_id": "codex"}),
+                "lct:test",
+            )
+            .unwrap();
+        }
+        let recovered = store.escalation_rows("crowded").unwrap();
+        assert_eq!(recovered.len(), 2, "frequent spends collapse to the latest one");
+        assert_eq!(recovered[0].event_type, "gate_escalation_opened");
+        assert_eq!(recovered[1].event_type, "gate_escalation_claimed");
+
+        for _ in 0..=SqliteChainStore::ESCALATION_HISTORY_MAX_ROWS {
+            store.append(
+                "gate_escalation_decided",
+                json!({"escalation_id": "crowded", "plugin_id": "codex", "status": "denied",
+                       "decided_by": "operator"}),
                 "lct:test",
             )
             .unwrap();
