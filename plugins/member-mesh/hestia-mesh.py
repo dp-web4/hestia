@@ -7,6 +7,8 @@ Usage:
   hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id] [--operation-id ID]
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
   hestia-mesh.py presented                               # record escalation ids in the completed wake digest (stdin)
+  hestia-mesh.py pending                                 # pending escalations, read-only
+  hestia-mesh.py sweep                                   # inbox + pending over one session
   hestia-mesh.py kinds [term]                            # KINDS.md, or its sections naming term
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
@@ -577,7 +579,8 @@ def send_operation_id_from_argv():
 def presented_invitations(text):
     """(escalation_id, notice_id) pairs rendered into one completed wake, first notice wins."""
     invitations = {}
-    for line in text.splitlines():
+    shown = (line for line in text.splitlines() if not line.lstrip().startswith("!"))
+    for line in shown:
         notice = re.search(r"\bid=(\d+)\b", line)
         pointer = re.search(r"hestia://escalation/([0-9a-f]{16})(?![0-9a-f])", line)
         if notice and pointer:
@@ -586,7 +589,7 @@ def presented_invitations(text):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered", "presented"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered", "presented", "pending", "sweep"):
         print(__doc__); sys.exit(2)
     cmd = sys.argv[1]
     try:
@@ -710,6 +713,16 @@ def act(cmd):
         if refusals:
             out["errors"] = refusals
             out["_hestia_error"] = refusals[0].get("_hestia_error", {})
+    elif cmd == "pending":
+        out = rpc(h, "hestia_gate_pending_escalations", {"session_id": s})
+    elif cmd == "sweep":
+        def read_only(name, args):
+            try:
+                return rpc(h, name, args)
+            except DaemonRefusal as r:
+                return {"_hestia_error": r.payload}
+        out = {"inbox": read_only("hestia_member_inbox", {"session_id": s, "peek": True}),
+               "pending": read_only("hestia_gate_pending_escalations", {"session_id": s})}
     else:
         # already_sent() ran above, before connect(). session_id is added here and is
         # deliberately NOT part of resend_key(): a fresh session is not a new act.

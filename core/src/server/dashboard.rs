@@ -1775,6 +1775,7 @@ impl ServerState {
                             // claim as an identity — the operator is deciding
                             // partly ON this string, and it is not authenticated.
                             "claimed_by": e.plugin_id,
+                            "asker_basis": e.asker_basis,
                             "role": e.role,
                             "tool_name": e.tool_name,
                             "marker": e.marker,
@@ -1897,7 +1898,11 @@ impl ServerState {
                             // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
                             // operator surfaces show who was invited and offer the OVERRIDE.
                             "invited_peers": r.ext.invited_peers,
-                            "asker_basis": r.ext.gate.as_ref().map(|g| g.asker_basis),
+                            // A member-filed ask records its basis on `ext.asker_basis`
+                            // (hestia#1409); a gate-opened one on `ext.gate`. Neither = null,
+                            // which the surfaces render as "no attribution recorded".
+                            "asker_basis": r.ext.asker_basis
+                                .or_else(|| r.ext.gate.as_ref().map(|g| g.asker_basis)),
                             // dp, 2026-10-13: a peer-routed request ESCALATES to the operator
                             // when no peer has ruled within the window (scope_decided_by).
                             "decided_by_default": crate::server::state::scope_decided_by(
@@ -2170,6 +2175,108 @@ mod tests {
         assert_eq!(s.society.chain_length, 0);
         assert!(s.trust.is_empty());
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn pending_escalations_carry_their_recorded_asker_basis() {
+        let (_dir, mut state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        let session = state
+            .gate_escalations
+            .open(
+                "session-member",
+                "role:constellation:member",
+                "Edit",
+                "plugins/_shared",
+                Some("Edit -> a governance file"),
+                Some("test the attribution projection"),
+                None,
+                now,
+                600,
+            )
+            .unwrap();
+        assert!(state.gate_escalations.record_asker_basis(
+            &session.id,
+            crate::arbiter::AskerBasis::Session,
+        ));
+        let asserted = state
+            .gate_escalations
+            .open(
+                "asserted-member",
+                "role:constellation:member",
+                "Edit",
+                "plugins/_shared",
+                Some("Edit -> a governance file"),
+                Some("test the attribution projection"),
+                None,
+                now,
+                600,
+            )
+            .unwrap();
+
+        let snapshot = state.dashboard_snapshot(20);
+        for (id, basis) in [(session.id, "session"), (asserted.id, "asserted")] {
+            let row = snapshot
+                .pending_escalations
+                .iter()
+                .find(|row| row["id"] == id)
+                .expect("the pending fixture must be present");
+            assert_eq!(row["asker_basis"], basis, "the decision surface needs the recorded basis: {row}");
+        }
+    }
+
+    /// A MEMBER-FILED scope request records its attribution on `ext.asker_basis`, not on
+    /// `ext.gate` (it has none). The decision surface must carry that recorded basis: a
+    /// session-attributed ask projected as `null` renders as "no asker attribution recorded".
+    #[tokio::test]
+    async fn member_filed_scope_requests_carry_their_recorded_asker_basis() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let sid = crate::server::handler::tool_connect(
+            &state,
+            &json!({"plugin_id": "codex", "host_agent": "codex"}),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let f = dir.path().join("member-filed.txt");
+        std::fs::write(&f, "x").unwrap();
+        let session = crate::server::handler::tool_request_scope(
+            &state,
+            &json!({"plugin_id": "codex", "session_id": sid, "path": f.to_str().unwrap(),
+                    "reason": "a session-attributed member-filed ask"}),
+        )
+        .await
+        .unwrap()["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let g = dir.path().join("member-asserted.txt");
+        std::fs::write(&g, "x").unwrap();
+        let asserted = crate::server::handler::tool_request_scope(
+            &state,
+            &json!({"plugin_id": "codex", "path": g.to_str().unwrap(),
+                    "reason": "an asserted member-filed ask"}),
+        )
+        .await
+        .unwrap()["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let snapshot = state.lock().await.dashboard_snapshot(20);
+        for (id, basis) in [(session, "session"), (asserted, "asserted")] {
+            let row = snapshot
+                .pending_scope_requests
+                .iter()
+                .find(|row| row["request_id"] == id)
+                .expect("the pending member-filed request must be present");
+            assert_eq!(row["origin"], "member_request", "{row}");
+            assert_eq!(row["asker_basis"], basis, "the decision surface needs the recorded basis: {row}");
+        }
     }
 
     #[test]

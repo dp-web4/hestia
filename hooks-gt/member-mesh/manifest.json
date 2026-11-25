@@ -7,12 +7,12 @@
   "files": [
     {
       "path": "hestia-mesh.py",
-      "sha256": "ad07dbccf698428cd02eaca5f1544e4c53a44b0037940f8206727c30c84eef79",
+      "sha256": "a20a0af34b0627659e56d9753141ddc764da61afba09d0ea0fce87a7df95af09",
       "source": "plugins/member-mesh/hestia-mesh.py"
     },
     {
       "path": "prompt-disposition-watch.sh",
-      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0",
+      "sha256": "02463f52fa051805a2dd56b72853bc79d8c5aca2284ce05279da0942cd858c94",
       "source": "plugins/member-mesh/prompt-disposition-watch.sh"
     },
     {
@@ -23,5 +23,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "db0c4782145ebc8710d425e83bd08c588a5acea34eabd3133387f7d7d7376697"
+  "gt_version": "b80682ac4dd745b2b05bd07b7a33aedee34cfe3010f47fe139b17a9d9bd7792d"
 }

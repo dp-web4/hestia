@@ -222,6 +222,12 @@ export interface PendingEscalation {
    * on this string and it is not proof of who asked.
    */
   claimed_by: string;
+  /**
+   * The daemon's recorded attribution, not harness authentication. `session` means the ask
+   * resolved to a live session's member binding; `asserted` means no such binding was presented.
+   * Absent on older daemon rows, which the UI must render as unknown rather than infer either way.
+   */
+  asker_basis?: "session" | "asserted" | null;
   role: string;
   tool_name: string;
   marker: string;

@@ -123,6 +123,19 @@ class PresentedTest(unittest.TestCase):
         self.assertEqual(len(payload["observations"]), 2)
         self.assertIn("presented 2 invitation(s) as test-member", err)
 
+    def test_own_bounced_notice_is_not_a_presentation(self):
+        own = "aaaaaaaaaaaaaaaa"
+        invited = "bbbbbbbbbbbbbbbb"
+        digest = (
+            f"!! NOT-AN-ANSWER id=7 kind=reply from=test-member queued_at=1 — YOUR OWN notice "
+            f"echoed back by the watcher (fire-rc=1). pointer=hestia://escalation/{own}#undelivered:fire-rc=1\n"
+            f"- id=8 kind=review_request from=kimi-code pointer=hestia://escalation/{invited}#corroborate-or-dissent queued_at=2\n"
+        )
+        rc, out, err = self.run_cli(digest)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([call["escalation_id"] for call in CALLS], [invited])
+        self.assertEqual([call["notice_id"] for call in CALLS], [8])
+
     def test_no_rendered_invitation_means_no_session_and_no_observation(self):
         rc, out, err = self.run_cli("ordinary activity with no invitation pointer\n")
         self.assertEqual(rc, 0, err)
