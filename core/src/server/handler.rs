@@ -10685,6 +10685,19 @@ fn resolve_escalation_pointer_for_session(
                     "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired")
         }).cloned()
     });
+    let asking_session_proven = resolve_attributed_caller(s, session_id_arg).is_some_and(|caller| {
+        let session = caller.session_uuid.map(|uuid| uuid.to_string());
+        let original_session = opened.as_ref()
+            .and_then(|opened| opened.event_data.get("session_id"))
+            .and_then(Value::as_str);
+        let original_plugin = opened.as_ref()
+            .and_then(|opened| opened.event_data.get("plugin_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        caller.plugin_id == original_plugin
+            && session.is_some()
+            && session.as_deref() == original_session
+    });
     if let Some(e) = settled.as_ref() {
         let status = e.event_data.get("status").and_then(Value::as_str);
         let decided_by = e
@@ -10706,17 +10719,27 @@ fn resolve_escalation_pointer_for_session(
             _ => false,
         };
         if !valid {
+            let terminal_entry = if asking_session_proven {
+                chain_entry_json(e)
+            } else {
+                Value::Null
+            };
             let mut out = hestia_error_envelope(
                 "hestia.escalation_history_invalid",
                 &format!(
                     "the newest terminal row for escalation {ptr} has an unrecognized status or decision shape; the older approval is not authoritative"
                 ),
-                Some(json!({"terminal_entry": chain_entry_json(e)})),
+                Some(json!({"terminal_entry": terminal_entry.clone()})),
             );
             out["source"] = json!("witness_chain");
             out["status"] = json!("unknown");
             out["escalation_id"] = json!(ptr);
-            out["terminal_entry"] = chain_entry_json(e);
+            out["terminal"] = json!(true);
+            out["historical_details_proven"] = json!(asking_session_proven);
+            out["terminal_event_type"] = json!(e.event_type);
+            out["terminal_chain_position"] = json!(e.chain_position);
+            out["terminal_hash"] = json!(e.hash);
+            out["terminal_entry"] = terminal_entry;
             return out;
         }
     }
@@ -10747,12 +10770,6 @@ fn resolve_escalation_pointer_for_session(
     // the filtered-window illusion one level up.
     let d = &opened.event_data;
     let get = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
-    let asking_session_proven = resolve_attributed_caller(s, session_id_arg).is_some_and(|caller| {
-        let session = caller.session_uuid.map(|uuid| uuid.to_string());
-        caller.plugin_id == d.get("plugin_id").and_then(Value::as_str).unwrap_or_default()
-            && session.is_some()
-            && session.as_deref() == d.get("session_id").and_then(Value::as_str)
-    });
     let settled_get = |k: &str| {
         settled
             .as_ref()
@@ -10814,6 +10831,7 @@ fn resolve_escalation_pointer_for_session(
         // `decided_at` passes through whatever the entry carries (null on
         // entries that predate the field, and while still unsettled).
         "decided_at": settled_get("decided_at"),
+        "terminal": settled.is_some(),
         "factors_present": if asking_session_proven { settled_get("factors_present") } else { Value::Null },
         "reason": if asking_session_proven { settled_get("reason") } else { Value::Null },
         "settled_entry": if asking_session_proven {
@@ -21790,6 +21808,35 @@ mod tests {
         assert_eq!(mine["reason"], "private review rationale", "{mine}");
         assert_eq!(mine["factors_present"][0]["argument"], "private peer argument", "{mine}");
         assert_eq!(mine["settled_entry"]["eventData"]["reason"], "private review rationale", "{mine}");
+
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "revoked",
+                "decided_by": "operator", "reason": "malformed private rationale",
+                "factors_present": [{"by": "operator", "argument": "malformed private factor"}],
+            }),
+        )
+        .unwrap();
+        let invalid = {
+            let s = shared.lock().await;
+            resolve_escalation_pointer(&s, &id)
+        };
+        assert_eq!(invalid["status"], "unknown", "{invalid}");
+        assert_eq!(invalid["terminal"], true, "{invalid}");
+        assert_eq!(invalid["historical_details_proven"], false, "{invalid}");
+        assert_eq!(invalid["terminal_entry"], Value::Null, "anonymous raw invalid row: {invalid}");
+        assert_eq!(invalid["_hestia_error"]["data"]["terminal_entry"], Value::Null,
+            "invalid error details cannot smuggle the raw row: {invalid}");
+        assert_eq!(invalid["terminal_event_type"], "gate_escalation_decided", "{invalid}");
+
+        let proven_invalid = {
+            let s = shared.lock().await;
+            resolve_escalation_pointer_for_session(&s, &id, Some(&session))
+        };
+        assert_eq!(proven_invalid["historical_details_proven"], true, "{proven_invalid}");
+        assert_eq!(proven_invalid["terminal_entry"]["eventData"]["reason"],
+            "malformed private rationale", "{proven_invalid}");
     }
 
     /// The positive control for the binding above, and the more important half of it: the fix
@@ -30067,8 +30114,9 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         Some(answer) if answer["_hestia_error"]["code"] == "hestia.escalation_history_invalid" => {
             "invalid"
         }
-        Some(answer) if answer["source"] == "witness_chain"
-            && answer.get("settled_entry").is_some_and(|e| !e.is_null()) => "terminal",
+        Some(answer) if answer["source"] == "witness_chain" && answer["terminal"] == true => {
+            "terminal"
+        }
         Some(answer) if answer["source"] == "witness_chain" => "opened",
         Some(answer) if answer["_hestia_error"]["code"] == "hestia.escalation_pointer_not_found" => {
             "not_found"
