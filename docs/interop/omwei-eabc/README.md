@@ -1,8 +1,10 @@
 # OMWEI EABC: bounded Hestia evaluation handoff (draft)
 
-Date: 2026-11-09. Status: **reviewable preparation; NOT an executed test, frozen runtime deployment, or EABC conformance claim**.
+Date: 2026-11-09; Arm A executed 2026-11-22. Status: **stock-A1 trial and evidence package attached; Arm B and full EABC conformance assessment remain pending**.
 
 Coordination: [Hestia #1541](https://github.com/dp-web4/hestia/issues/1541); [OMWEI #25](https://github.com/omwei-org/omwei-eabc/issues/25). Keep Kimi's backlog/release train separate. Use a synthetic, disposable isolated Linux environment; no production secrets or effects.
+
+**Executed Arm A:** [trial runner](stock_a1_trial.py), [evidence matrix](stock-a1-matrix.md), and [sanitized raw evidence](stock-a1-evidence.json). All 11 decision/effect expectations match, including direct same-UID bypasses and unchanged deny/tamper/unavailable targets. This is not an EABC conformance or non-bypassability claim.
 
 ## 1. Versions and existing evidence
 
@@ -57,7 +59,7 @@ Redact secrets, but disclose security-relevant *settings*, identities and exclus
 
 ## 5. Minimal reproducible trial plan and evidence contract
 
-Reset E to a recorded baseline before each test; collect synchronized timestamps and immutable artifact/config IDs. Tests are **proposed, not run**:
+Reset E to a recorded baseline before each test; collect synchronized timestamps and immutable artifact/config IDs. Arm A now covers the allow, deny, direct-path, tamper/unavailable, and crash/retry cases in the [executed package](stock-a1-matrix.md). Revocation/expiry and Arm B remain **proposed, not run**:
 
 1. **ALLOW:** authorized named tool mutates E; capture request, effective context/law, decision ID, tool attempt/return, broker/file mutation and independently measured before/after hash.
 2. **DENY:** forbidden named tool attempt; verify E unchanged, denial trace present, distinguish "tool blocked" from "effect absent for other reasons."

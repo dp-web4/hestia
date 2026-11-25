@@ -124,6 +124,7 @@ impl ServerHandler for HestiaServer {
             "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_cross_chain_checkpoint" => tool_cross_chain_checkpoint(&self.state, &args).await,
+            "hestia_gate_evaluate" => tool_gate_evaluate(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
@@ -133,6 +134,7 @@ impl ServerHandler for HestiaServer {
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
+            "hestia_member_claim" => tool_member_claim(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
             "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
@@ -238,8 +240,10 @@ impl ServerHandler for HestiaServer {
                 "hestia://escalation/{id}",
                 "Gate escalation and its decision by id",
                 "Dereference the pointer an escalation invitation (#corroborate-or-dissent) \
-                 or disposition notice (#decided, #459) carries: status/decided_by/decided_at/\
-                 reason. Unknown id answers UNKNOWN, never denied.",
+                 or disposition notice (#decided, #459) carries: status/decided_by/decided_at. \
+                 Historical reason/factors and stated rationale require the original asking \
+                 session, matching poll; unproven reads return null for those fields. Unknown \
+                 id answers UNKNOWN, never denied.",
             ),
             make_resource_template(
                 "hestia://chain/{hash}",
@@ -657,6 +661,7 @@ fn hestia_tools() -> Vec<Tool> {
                     "verdict_available": {"type": "boolean", "description": "False means the gate could not judge; records infrastructure, not member conduct."},
                     "rule_id": {"type": "string"},
                     "attempted": {"type": "string", "description": "Bounded, redacted summary of the act."},
+                    "attempted_exact": {"type": "boolean", "description": "True only when the sender preserved the act byte-for-byte before redaction; absent means not exact."},
                     "role": {"type": "string"},
                     "action_id": {"type": "string", "format": "uuid"},
                     "correlation_key": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,200}$"},
@@ -709,6 +714,23 @@ fn hestia_tools() -> Vec<Tool> {
                     "observed_at": {"type": "string", "format": "date-time", "description": "Optional RFC3339 observation time; defaults to the daemon's current time."},
                     "session_id": {"type": "string", "description": "Your own live session id from hestia_connect."},
                     "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_gate_evaluate",
+            "Side-effect-free SOCIETY-LAW evaluation for a trusted local client. Resolves the member from your live session, evaluates tool_name plus optional target/command against the SAME publication and law fold as hestia_query_policy, and returns an AuthZEN-shaped subject/action/resource, a fail-closed boolean decision plus a separate society_law_allows result, verdict, rule, reason and law generation. The decision is positive only when every required stage and input has been evaluated; unevaluable or partial probes are not authorization. It never begins an action, appends a witness, charges trust, consumes rate-limit capacity, opens a scope request or escalation, or grants permission. Local MRH/scope, governance closure and egress are explicitly NOT evaluated here; use the gate's dry run for those stages. Session identity is claimed, not authenticated (#824/#954)",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tool_name"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "tool_name": {"type": "string", "minLength": 1},
+                    "target": {"type": "string", "description": "Optional path or resource. Bash/Shell prefers command when both are present."},
+                    "command": {"type": "string", "description": "Optional complete Bash/Shell command; never executed"},
+                    "session_id": {"type": "string", "description": "Your live session id from hestia_connect"},
+                    "sessionId": {"type": "string", "description": "Alternate spelling; snake_case wins"}
                 }
             }),
         ),
@@ -856,7 +878,23 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_member_inbox",
-            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
+            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity). A consuming drain skips another session's unexpired claims and never marks those rows drained; peek:true remains non-consuming",
+        ),
+        t_args(
+            "hestia_member_claim",
+            "Claim one of YOUR queued notices before acting on it. The default action=claim takes a 15-minute lease; renew uses the same transition and reports renewed:false if it took an available claim rather than extending your live one; release returns your claim to the queue. A different session's unexpired claim is a conflict, never an overwrite. Expired claims may be reclaimed. Requires your own live session_id; only notices addressed to your member can be claimed. Claims and releases are witnessed; a bystander's consuming hestia_member_inbox neither returns nor marks a live-claimed notice",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["notice_id"],
+                "properties": {
+                    "notice_id": {"type": "integer", "minimum": 0},
+                    "action": {"type": "string", "enum": ["claim", "renew", "release"], "default": "claim"},
+                    "lease_secs": {"type": "integer", "minimum": 30, "maximum": 3600, "default": 900},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id."}
+                }
+            }),
         ),
         t(
             "hestia_egress_pending",
@@ -949,17 +987,20 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
     // real connect also re-checks. Both are reads.
     let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
         Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
-                          id.constellation_role.clone(), id.role_basis.clone())),
+                          id.constellation_role.clone(), id.role_basis.clone(),
+                          id.identity_basis, id.canonical_principal.clone())),
         None => {
             let s = state.lock().await;
             s.sessions
                 .find_reuse_id(&plugin_id, &host_session_id)
                 .and_then(|id| s.sessions.get(&id))
                 .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
-                          e.constellation_role.clone(), e.role_basis.clone()))
+                          e.constellation_role.clone(), e.role_basis.clone(),
+                          e.identity_basis, e.canonical_principal.clone()))
         }
     };
-    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis)) = found else {
+    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis,
+              identity_basis, canonical_principal)) = found else {
         return Ok(hestia_error_envelope(
             "hestia.connect_dry_run_no_session",
             "no live session for this (plugin_id, host_session_id): a real connect would mint \
@@ -975,6 +1016,8 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
         "constellationRole": constellation_role,
         "roleDeclarationHonored": !declared_role.is_empty() && declared_role == constellation_role,
         "roleBasis": role_basis,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "gateCapabilityReportAccepted": false,
         "protocolVersion": 1,
         "reused": true,
@@ -1109,6 +1152,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1153,6 +1198,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1179,6 +1226,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         assigned_role: requested_role.clone(),
         constellation_role: constellation_role.clone(),
         role_basis,
+        identity_basis: crate::server::state::IdentityBasis::Asserted,
+        canonical_principal: None,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
@@ -1261,6 +1310,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // and a later policy change can't silently split them.
     let assigned_role = s.sessions[&session_id].assigned_role.clone();
     let role_basis = s.sessions[&session_id].role_basis.clone();
+    let identity_basis = s.sessions[&session_id].identity_basis;
+    let canonical_principal = s.sessions[&session_id].canonical_principal.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -1275,6 +1326,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         "softLct": soft_lct,
         "assignedRole": assigned_role,
         "constellationRole": constellation_role,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "roleDeclarationHonored": role_declaration_honored,
         "roleBasis": role_basis,
         "gateCapabilityReportAccepted": gate_capability_report_accepted,
@@ -1776,6 +1829,95 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     }))
 }
 
+async fn tool_gate_evaluate(state: &SharedState, args: &Value) -> ToolResult {
+    let mut unknown: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|obj| obj.keys())
+        .map(String::as_str)
+        .filter(|key| !["tool_name", "target", "command", "session_id", "sessionId"].contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Ok(hestia_error_envelope(
+            "hestia.gate_evaluate_unknown_arg",
+            "unknown argument(s) refused rather than silently discarded",
+            Some(json!({"unknownKeys": unknown})),
+        ));
+    }
+    let tool_name = require_string(args, "tool_name")?;
+    if tool_name.trim().is_empty() {
+        return Err(anyhow::anyhow!("tool_name must not be empty"));
+    }
+    let published = state.published();
+    let Some(who) = published.resolve(optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.gate_evaluate_unattributed",
+            "a side-effect-free evaluation requires your own live session_id from hestia_connect; \
+             the member is resolved from that session, never from a caller-supplied plugin_id",
+            None,
+        ));
+    };
+    let command = optional_string(args, "command");
+    let target_arg = optional_string(args, "target");
+    let shell = matches!(tool_name.as_str(), "Bash" | "Shell");
+    let target = if shell { command.as_deref().or(target_arg.as_deref()) } else { target_arg.as_deref() };
+    let unevaluable = shell && target.is_none();
+    let pa = crate::policy::PolicyAction {
+        tool_name: &tool_name,
+        category: crate::policy::classify(&tool_name),
+        target,
+        full_command: command.as_deref(),
+    };
+    let evaluation = published.evaluate_read_only(&who.plugin_id, &who.role_lct, &pa);
+    let law_generation = published.policy_generation();
+    let policy_version = published.version;
+    let not_evaluated = ["local_mrh_scope", "governance_closure", "egress"];
+    let complete = not_evaluated.is_empty() && !unevaluable;
+    let society_law_allows = !unevaluable
+        && !(evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced);
+    let decision = complete && society_law_allows;
+    let resource = if shell && command.is_some() {
+        json!({"type": "command", "id": command})
+    } else {
+        json!({"type": "path", "id": target_arg})
+    };
+    Ok(json!({
+        "subject": {"type": "member", "id": who.plugin_id},
+        "action": {"name": tool_name, "properties": {"command": command}},
+        "resource": resource.clone(),
+        "decision": decision,
+        "society_law_allows": society_law_allows,
+        "context": {
+            "verdict": evaluation.decision.as_str(),
+            "rule": evaluation.rule_id,
+            "rule_name": evaluation.rule_name,
+            "reason": evaluation.reason,
+            "enforced": evaluation.enforced,
+            "stage": "society_law",
+            "not_evaluated": not_evaluated,
+            "complete": complete,
+            "evaluated": !unevaluable,
+            "unevaluable": unevaluable,
+            "inert_content_skipped": evaluation.inert_content_skipped,
+            "rate_limit": "observed_only",
+            "side_effects": {
+                "action_started": false, "chain_appended": false, "trust_charged": false,
+                "rate_limit_consumed": false, "scope_request_opened": false,
+                "escalation_opened": false,
+            },
+            "assurance": "trusted local client; session identity is claimed, not authenticated (#824/#954)",
+        },
+        "r6": {
+            "rules": {"rule_id": evaluation.rule_id, "law_generation": law_generation},
+            "resource": resource,
+            "reference": [],
+        },
+        "policyVersion": policy_version,
+        "permits": false,
+    }))
+}
+
 async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
     let action_id =
@@ -1995,6 +2137,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         &json!({"policy_version": policy_version, "role_lct": role_lct, "enforced": evaluation.enforced}),
     );
     feedback.act = Some(act);
+    // Whether that digest is an act IDENTITY: judged here over the whole input, where masking past
+    // the row's display cut is still visible (NOVA's re-review of 7c73d48c9). Null with no attempt.
+    let act_exact = full_command.zip(attempted_whole.as_deref()).map(|(raw, w)| act_exact_of(raw, w));
     let mut committed_feedback = None;
     let mut feedback_recorded = false;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
@@ -2079,6 +2224,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 // trace of the operation. Stored explicitly and scrubbed, so the UI has
                 // one field to read for every tool rather than a per-tool special case.
                 "attempted": attempted,
+                // True only when `feedback.act` digests the unmasked, unbounded attempt
+                // (`act_exact_of`); derivation scores a digest retry only on true on both sides.
+                "act_exact": act_exact,
                 // The verdict as feedback: level, serves, act key, doors, repeat_of (above).
                 "feedback": feedback.to_value(),
             });
@@ -2214,6 +2362,8 @@ fn resolve_attributed_caller(
 }
 
 /// Keep a valid caller key, or derive the hook's act-bound key for an open-door refusal (#540).
+/// The basis says what the key can and cannot correlate; a derived key is not assumed to be
+/// hook-compatible, an act identity, or evidence that an act was even supplied.
 fn refusal_request_key(
     s: &super::state::ServerState,
     plugin_id: &str,
@@ -2221,19 +2371,30 @@ fn refusal_request_key(
     attempted_act: Option<&str>,
     session_id_arg: Option<&str>,
     supplied: Option<&str>,
-) -> String {
+    identity_mismatch: bool,
+) -> (String, &'static str) {
     if let Some(key) = supplied.filter(|key| super::gate_escalation::valid_request_key(key)) {
-        return key.to_string();
+        return (key.to_string(), "caller_supplied");
     }
     let host_session_id = session_id_arg
         .and_then(|raw| Uuid::parse_str(raw).ok())
         .and_then(|uuid| s.sessions.get(&uuid))
         .and_then(|session| session.host_session_id.as_deref());
-    super::gate_escalation::request_key_for_act(
-        plugin_id,
-        marker,
-        attempted_act.unwrap_or(""),
-        host_session_id,
+    let basis = if identity_mismatch {
+        "derived_identity_mismatch"
+    } else if attempted_act.unwrap_or("").is_empty() {
+        "derived_without_act"
+    } else {
+        "derived"
+    };
+    (
+        super::gate_escalation::request_key_for_act(
+            plugin_id,
+            marker,
+            attempted_act.unwrap_or(""),
+            host_session_id,
+        ),
+        basis,
     )
 }
 
@@ -2269,8 +2430,8 @@ fn refuse_asker_mismatch(
 ) -> anyhow::Error {
     let session = session_id_arg.unwrap_or("?");
     let session_prefix: String = session.chars().take(8).collect();
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2278,7 +2439,7 @@ fn refuse_asker_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "asker mismatch",
             "asserted_plugin_id": plugin_id,
             "proven_plugin_id": who.plugin_id,
@@ -2329,8 +2490,8 @@ fn refuse_host_session_mismatch(
     attempted_act: Option<&str>,
     request_key: Option<&str>,
 ) -> anyhow::Error {
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2338,7 +2499,7 @@ fn refuse_host_session_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "host session mismatch",
             "asserted_host_session_id": stated,
             "proven_host_session_id": proven,
@@ -3474,6 +3635,31 @@ fn redact_secrets(input: &str) -> String {
         fin.push(t.to_string());
     }
     fin.join(" ")
+}
+
+/// Is `feedback.act` — a digest over `redacted`, the whole attempt after `redact_secrets` — an
+/// IDENTITY of the act, so that two equal digests mean two equal acts? Only when nothing was
+/// masked, bounded, or whitespace-normalised anywhere in the input: not by this daemon
+/// (`redacted` differs from `raw`), and not by the sender (its `attempted_exact: false` for
+/// whitespace collapse, `***` value mask, `[REDACTED —` withholding, or `…` cut).
+/// Decided at the producer over the whole input because the row's `attempted` is capped at
+/// `ATTEMPTED_MAX`: a mask past the cap is invisible to any reader of the row (NOVA's re-review
+/// of 7c73d48c9). Conservative: a command that merely contains `***` or `…` reads as not exact.
+fn act_exact_of(raw: &str, redacted: &str) -> bool {
+    redacted == raw
+        && !redacted.contains('…')
+        && !redacted.contains("[REDACTED —")
+        && !redacted.contains("***")
+}
+
+#[test]
+fn literal_whitespace_differences_are_not_exact_retries() {
+    let quoted = "printf 'alpha beta'";
+    assert!(act_exact_of(quoted, quoted));
+    assert!(!act_exact_of(quoted, "printf 'alpha  beta'"));
+    assert!(!act_exact_of(quoted, "printf 'alpha beta' "));
+    let heredoc = "cat <<'EOF'\nalpha beta\nEOF";
+    assert!(!act_exact_of(heredoc, "cat <<'EOF'\nalpha  beta\nEOF"));
 }
 
 // =========================================================================
@@ -4647,6 +4833,7 @@ const WITNESS_DECISION_ACCEPTED_KEYS: &[&str] = &[
     "verdict_available",
     "rule_id",
     "attempted",
+    "attempted_exact",
     "role",
     "action_id",
     "correlation_key",
@@ -4879,7 +5066,17 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     // intent — never persist an unbounded payload into a less-protected surface — by
     // requiring the SENDER to bound and scrub, and by clamping here regardless, since a
     // gate that over-shares must not be able to make the daemon over-store.
-    let attempted_whole = optional_string(args, "attempted").map(|a| redact_secrets(&a));
+    let attempted_raw = optional_string(args, "attempted");
+    let attempted_whole = attempted_raw.as_deref().map(redact_secrets);
+    // Judged over the WHOLE sent text: a gate's own mask or bound (`attempted_summary`'s
+    // `***`, `[REDACTED —`, ` …`) makes the digest below a digest of a summary, not of the act.
+    // The sender must also attest that it preserved the raw act's whitespace. Older senders
+    // omitted that evidence and are conservatively not exact (#1588's witness-route gap).
+    let sender_act_exact = args.get("attempted_exact").and_then(Value::as_bool) == Some(true);
+    let act_exact = attempted_raw
+        .as_deref()
+        .zip(attempted_whole.as_deref())
+        .map(|(raw, w)| sender_act_exact && act_exact_of(raw, w));
     let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
             a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
@@ -5028,6 +5225,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "reason": reason,
         "payload_sha256": payload_sha256,
         "attempted": attempted,
+        "act_exact": act_exact,
         "rule_id": rule_id,
         "verdict_available": verdict_available,
     });
@@ -9005,8 +9203,18 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 // verbatim prose and belongs in the escalation, not copied into a
                 // second append-only store where no retention rule reaches it.
                 "factors_present": esc.factors.len(),
-                "factors_concurring": esc.factors.iter().filter(|f| !f.dissent).count(),
-                "factors_dissenting": esc.factors.iter().filter(|f| f.dissent).count(),
+                // The asker's own statements (#935) are counted apart. Folded into the two
+                // counts below, an ask nobody answered would read as one a peer answered,
+                // which is the distinction these fields exist to make.
+                "factors_concurring": esc.factors.iter()
+                    .filter(|f| f.channel != crate::server::gate_escalation::Channel::SelfEvidence && !f.dissent)
+                    .count(),
+                "factors_dissenting": esc.factors.iter()
+                    .filter(|f| f.channel != crate::server::gate_escalation::Channel::SelfEvidence && f.dissent)
+                    .count(),
+                "factors_self_evidence": esc.factors.iter()
+                    .filter(|f| f.channel == crate::server::gate_escalation::Channel::SelfEvidence)
+                    .count(),
                 "factors_by": esc.factors.iter().map(|f| &f.by).collect::<Vec<_>>(),
                 // Who was asked, and which of them no watcher had ever read for at
                 // invite time. Without these, an unanswered petition cannot be
@@ -9071,7 +9279,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("peeking member inbox: {e}"))?
     } else {
         s.inbox_store
-            .drain_member(&who.plugin_id)
+            .drain_member_for_session(
+                &who.plugin_id,
+                who.session_uuid.expect("attributed callers have a session"),
+            )
             .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
     };
     // Silently-dropped mail, reported to the only party who can tell what is
@@ -9093,6 +9304,245 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
     Ok(out)
+}
+
+/// Witness is finality for a lease change (NOVA re-review of #1513, mirroring #1650's
+/// corroboration undo): when the `member_notice_claimed` / `member_notice_released` append
+/// fails, put the lease back to its exact prior owner/expiry while the state lock is still
+/// held, and say so. The restore is compare-and-swap against what this act wrote; if it does
+/// not apply (or `prior` is unknown) the answer is explicitly `lease_state: "uncertain"`.
+fn undo_unwitnessed_member_claim(
+    store: &crate::storage::SqliteInboxStore,
+    notice_id: u64,
+    to_plugin: &str,
+    action: &str,
+    written: &crate::storage::inbox::MemberNoticeLease,
+    prior: Option<&crate::storage::inbox::MemberNoticeLease>,
+    append_err: &anyhow::Error,
+) -> Value {
+    let restore = match prior {
+        Some(prior) => store
+            .restore_member_notice_lease(notice_id, to_plugin, written, prior)
+            .map_err(|e| e.to_string()),
+        None => Err("the prior lease was not readable before the change".to_string()),
+    };
+    let (lease_state, restore_error) = match &restore {
+        Ok(true) => ("restored_to_prior", None),
+        Ok(false) => ("uncertain", Some("the row changed after this act; nothing was restored".to_string())),
+        Err(e) => ("uncertain", Some(e.clone())),
+    };
+    hestia_error_envelope(
+        "hestia.member_claim_unwitnessed",
+        if lease_state == "restored_to_prior" {
+            "the lease change was NOT recorded — its witness append failed; the lease is back to its exact prior owner and expiry"
+        } else {
+            "the lease change was NOT recorded — its witness append failed, and the rollback could not be confirmed; treat the lease state as uncertain"
+        },
+        Some(json!({
+            "notice_id": notice_id,
+            "action": action,
+            "lease_state": lease_state,
+            "restore_error": restore_error,
+            "append_error": append_err.to_string(),
+        })),
+    )
+}
+
+async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::storage::inbox::MemberNoticeClaimOutcome;
+
+    let Some(notice_id) = args.get("notice_id").and_then(Value::as_u64) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "member_claim requires a nonnegative integer notice_id",
+            None,
+        ));
+    };
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("claim");
+    if !matches!(action, "claim" | "renew" | "release") {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "action must be claim, renew, or release",
+            None,
+        ));
+    }
+    let lease_secs = args
+        .get("lease_secs")
+        .and_then(Value::as_i64)
+        .unwrap_or(crate::storage::inbox::MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS);
+    if !(crate::storage::inbox::MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS
+        ..=crate::storage::inbox::MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS)
+        .contains(&lease_secs)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid_lease",
+            "lease_secs must be between 30 and 3600",
+            Some(json!({"lease_secs": lease_secs})),
+        ));
+    }
+
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_unattributed",
+            "member_claim requires the caller's own live session_id (from hestia_connect)",
+            None,
+        ));
+    };
+    let target = format!("notice:{notice_id}");
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_member_claim",
+        "member_notify",
+        &target,
+    ) {
+        return Ok(denied);
+    }
+    let session = who.session_uuid.expect("attributed callers have a session");
+    // The exact lease before this act, read under the same state lock as the change, so a
+    // failed witness append can put it back (fresh claim, renewal, expired takeover, release).
+    let prior_lease = s
+        .inbox_store
+        .member_notice_lease(notice_id, &who.plugin_id)
+        .map_err(|e| anyhow::anyhow!("reading member notice lease: {e}"))?;
+    let outcome = if action == "release" {
+        s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
+    } else {
+        s.inbox_store.claim_member_notice(
+            notice_id,
+            &who.plugin_id,
+            session,
+            lease_secs,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("changing member notice claim: {e}"))?;
+
+    match outcome {
+        MemberNoticeClaimOutcome::Claimed {
+            claim_expires_at,
+            renewed,
+            superseded_expired_claim,
+            lease_operation_id,
+        } => {
+            let event_key = crate::storage::inbox::member_notice_lease_event_key(&lease_operation_id);
+            let entry = match s.append_chain_once(
+                &event_key,
+                "member_notice_claimed",
+                json!({
+                    "notice_id": notice_id,
+                    "plugin_id": who.plugin_id,
+                    "role_lct": who.role_lct,
+                    "session_id": session,
+                    "claim_expires_at": claim_expires_at,
+                    "lease_secs": lease_secs,
+                    "renewed": renewed,
+                    "superseded_expired_claim": superseded_expired_claim,
+                    "lease_operation_id": lease_operation_id.as_str(),
+                }),
+            ) {
+                Ok(entry) => entry,
+                Err(append_err) => {
+                    let written = crate::storage::inbox::MemberNoticeLease {
+                        claimed_by_session: Some(session.to_string()),
+                        claim_expires_at: Some(claim_expires_at.to_rfc3339()),
+                    };
+                    return Ok(undo_unwitnessed_member_claim(
+                        &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                        prior_lease.as_ref(), &append_err,
+                    ));
+                }
+            };
+            s.inbox_store.clear_member_notice_lease_intent(
+                notice_id,
+                &who.plugin_id,
+                &lease_operation_id,
+            )?;
+            Ok(json!({
+                "notice_id": notice_id,
+                "claimed": true,
+                "renewed": renewed,
+                "superseded_expired_claim": superseded_expired_claim,
+                "claim_expires_at": claim_expires_at,
+                "witnessEntryHash": entry.hash,
+            }))
+        }
+        MemberNoticeClaimOutcome::Released {
+            was_claimed,
+            lease_operation_id,
+        } => {
+            let witness = if was_claimed {
+                let operation_id = lease_operation_id
+                    .as_deref()
+                    .expect("an actual release has a lease operation id");
+                let event_key = crate::storage::inbox::member_notice_lease_event_key(operation_id);
+                match s.append_chain_once(
+                    &event_key,
+                    "member_notice_released",
+                    json!({
+                        "notice_id": notice_id,
+                        "plugin_id": who.plugin_id,
+                        "role_lct": who.role_lct,
+                        "session_id": session,
+                        "lease_operation_id": operation_id,
+                    }),
+                ) {
+                    Ok(entry) => Some(entry),
+                    Err(append_err) => {
+                        // An unwitnessed release must not free the notice for a sibling drain.
+                        let written = crate::storage::inbox::MemberNoticeLease {
+                            claimed_by_session: None,
+                            claim_expires_at: None,
+                        };
+                        return Ok(undo_unwitnessed_member_claim(
+                            &s.inbox_store, notice_id, &who.plugin_id, action, &written,
+                            prior_lease.as_ref(), &append_err,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(operation_id) = lease_operation_id {
+                s.inbox_store.clear_member_notice_lease_intent(
+                    notice_id,
+                    &who.plugin_id,
+                    &operation_id,
+                )?;
+            }
+            Ok(json!({
+                "notice_id": notice_id,
+                "released": was_claimed,
+                "witnessEntryHash": witness.map(|entry| entry.hash),
+            }))
+        }
+        MemberNoticeClaimOutcome::Conflict {
+            claimed_by_session,
+            claim_expires_at,
+        } => {
+            let owner_prefix: String = claimed_by_session.chars().take(8).collect();
+            Ok(hestia_error_envelope(
+                "hestia.member_claim_conflict",
+                "this notice is claimed by another session; wait for its lease to expire or coordinate with that session",
+                Some(json!({
+                    "notice_id": notice_id,
+                    "claimed_by_session_prefix": owner_prefix,
+                    "claim_expires_at": claim_expires_at,
+                })),
+            ))
+        }
+        MemberNoticeClaimOutcome::NotFound => Ok(hestia_error_envelope(
+            "hestia.member_claim_not_found",
+            "no queued notice with that id is addressed to your member on this machine",
+            Some(json!({"notice_id": notice_id})),
+        )),
+        MemberNoticeClaimOutcome::AlreadyDrained => Ok(hestia_error_envelope(
+            "hestia.member_claim_already_drained",
+            "this notice has already been drained and cannot be claimed",
+            Some(json!({"notice_id": notice_id})),
+        )),
+    }
 }
 
 /// "Which notices were queued and never answered?" — the query the mesh could
@@ -9159,47 +9609,51 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
-    // #1354: a transient ask dies with its target. A `review_request` row whose
-    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
-    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
-    // is read-time against the live request map — no sweep — so a request the map
-    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
-    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
-    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
-    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
-    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
-    // terminal transition) is #1354's named follow-up, not this slice.
+    // #1354: a transient ask dies with its terminal scope/escalation target. The
+    // disposition projection durably marks that evidence; a live terminal target is also
+    // recognized at read time, without a sweep or a mutation by this read-only tool. Once
+    // live evidence is gone (scope eviction, escalation reaping, restart), an unmarked row
+    // fails back to owed: unknown is NOT moot. Durable marks do not un-derive.
     //
     // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
-    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
-    // recipient is still owed — mooting it would silently erase debt. The match is
-    // by kind ROOT, because the send gate admits dotted specializations
-    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
-    // must agree here too.
+    // target. A durable `reply` carrying a terminal target is CONTENT the recipient is
+    // still owed — mooting it would silently erase debt. The match is by kind ROOT, because
+    // the send gate admits dotted specializations (review_request.pr) and the ledger's own
+    // kind matching is by prefix; the two must agree here too.
     //
     // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
     // the misroute is sender-actionable, mootness is not.
     let now = super::gate_escalation::now_secs();
-    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
-        if kind.split('.').next() != Some("review_request") {
+    let target_moot = |n: &crate::storage::inbox::UnansweredNotice| -> bool {
+        if n.kind.split('.').next() != Some("review_request") {
             return false;
         }
-        let Some(p) = pointer_uri.as_deref() else {
+        if n.mooted_at.is_some()
+            && n.moot_reason.as_deref().is_some_and(|r| !r.trim().is_empty())
+        {
+            return true;
+        }
+        let Some(p) = n.pointer_uri.as_deref() else {
             return false;
         };
-        let Some(rest) = p.strip_prefix("hestia://scope/") else {
-            return false;
-        };
-        let id = rest.split('#').next().unwrap_or(rest);
-        match s.scope_requests.get(id) {
-            Some(req) => {
+        if let Some(rest) = p.strip_prefix("hestia://scope/") {
+            let id = rest.split('#').next().unwrap_or(rest);
+            return s.scope_requests.get(id).is_some_and(|req| {
                 req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
-            }
-            None => false,
+            });
         }
+        if let Some(rest) = p.strip_prefix("hestia://escalation/") {
+            let id = rest.split('#').next().unwrap_or(rest);
+            // status_of deliberately maps an UNKNOWN id to Expired for gate denial. Mootness
+            // is evidence classification instead: only a record actually present can be terminal.
+            return s.gate_escalations.get(id).is_some_and(|esc| {
+                esc.status_at(now) != super::gate_escalation::Status::Pending
+            });
+        }
+        false
     };
     let (mine, mine_moot): (Vec<_>, Vec<_>) =
-        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
+        mine.into_iter().partition(|n| !target_moot(&n));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
@@ -9209,7 +9663,7 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
-            let moot = scope_moot(&n.kind, &n.pointer_uri);
+            let moot = target_moot(&n);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
@@ -9233,15 +9687,19 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe_moot": mine_moot,
         "owed_to_me_moot": theirs_moot,
         "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
-                       reply never moots) whose pointer names a scope request that is \
-                       TERMINAL (ruled, revoked, or past its window), derived at read \
-                       time against the live request map — no sweep (#1354). A request \
-                       the memory-only map no longer holds reads UNKNOWN, and unknown \
-                       stays owed: absence of evidence is not mootness. Eviction or \
-                       restart therefore reverts moot -> owed; that non-monotonicity is \
-                       intentional until durable mooted_at evidence lands (the #1354 \
-                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
-                       outranks mootness — the misroute is sender-actionable.",
+                       reply never moots) whose scope/escalation target is terminal. Moot means \
+                       no longer counted as responsiveness debt, not that late review is \
+                       worthless: a factor filed now is still recorded. A terminal disposition \
+                       durably marks mooted_at and moot_reason on rows already queued and on \
+                       late asks enqueued after the ruling; those marks survive map eviction, \
+                       escalation reaping, and restart. A still-live target can also be derived \
+                       at read time, with no sweep and no mutation by this read-only tool. An \
+                       undecided scope request whose window merely lapses has no disposition, \
+                       so its live-derived mootness returns to owed after map eviction or \
+                       restart; the same fail-back applies to every unmarked target. An absent \
+                       target is UNKNOWN, never terminal. In owed_to_me a misroute \
+                       (recipient_liveness unknown) outranks mootness — the misroute is \
+                       sender-actionable (#1354).",
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null means the drain mark is absent; a peek may still \
                   have seen it. A mark does not prove it was returned or read; \
@@ -9369,6 +9827,8 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(json!({ "total": 0, "secrets": [], "note": "no hub connection" }));
     };
 
+    let rest_endpoint = crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)?;
+
     // Member identity keypair — same load path as tool_inbox.
     let secret_hex = s
         .vault
@@ -9389,7 +9849,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     for p in &snapshot {
         // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
         let detail = match client
-            .get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id)
+            .get_pair(&rest_endpoint, conn.hub_lct_id, p.pair_id)
             .await
         {
             Ok(d) if d.is_active() => d,
@@ -9401,7 +9861,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         };
         let since = pairings.cursor(&p.pair_id);
         let msgs = match client
-            .get_pair_messages(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id, since)
+            .get_pair_messages(&rest_endpoint, conn.hub_lct_id, p.pair_id, since)
             .await
         {
             Ok(m) => m,
@@ -10149,6 +10609,14 @@ fn escalation_answer_guidance() -> Value {
 }
 
 fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
+    resolve_escalation_pointer_for_session(s, pointer, None)
+}
+
+fn resolve_escalation_pointer_for_session(
+    s: &super::state::ServerState,
+    pointer: &str,
+    session_id_arg: Option<&str>,
+) -> Value {
     let ptr = pointer.trim();
     if ptr.is_empty() {
         return hestia_error_envelope(
@@ -10253,11 +10721,77 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             .cloned()
     };
     let opened = newest(&["gate_escalation_opened"]);
-    let settled = newest(&[
-        "gate_escalation_decided",
-        "gate_escalation_withdrawn",
-        "gate_escalation_expired",
-    ]);
+    // A terminal event TYPE alone is not a valid ruling. Inspect the newest terminal candidate
+    // first: an unparseable newer ruling is UNKNOWN history, never permission to revive an older
+    // approval (#1661 review).
+    let settled = opened.as_ref().and_then(|opened| {
+        let opened_plugin = opened.event_data.get("plugin_id").and_then(Value::as_str);
+        rows.iter().rev().find(|e| {
+            e.chain_position > opened.chain_position
+                && opened_plugin.is_some()
+                && e.event_data.get("plugin_id").and_then(Value::as_str) == opened_plugin
+                && matches!(e.event_type.as_str(),
+                    "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired")
+        }).cloned()
+    });
+    let asking_session_proven = resolve_attributed_caller(s, session_id_arg).is_some_and(|caller| {
+        let session = caller.session_uuid.map(|uuid| uuid.to_string());
+        let original_session = opened.as_ref()
+            .and_then(|opened| opened.event_data.get("session_id"))
+            .and_then(Value::as_str);
+        let original_plugin = opened.as_ref()
+            .and_then(|opened| opened.event_data.get("plugin_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        caller.plugin_id == original_plugin
+            && session.is_some()
+            && session.as_deref() == original_session
+    });
+    if let Some(e) = settled.as_ref() {
+        let status = e.event_data.get("status").and_then(Value::as_str);
+        let decided_by = e
+            .event_data
+            .get("decided_by")
+            .and_then(Value::as_str)
+            .is_some_and(|by| !by.trim().is_empty());
+        let valid = match e.event_type.as_str() {
+            "gate_escalation_decided" => {
+                matches!(status, Some("approved") | Some("denied")) && decided_by
+            }
+            "gate_escalation_withdrawn" => {
+                status == Some("denied")
+                    && e.event_data.get("decided_via").and_then(Value::as_str)
+                        == Some("self_withdrawn")
+                    && decided_by
+            }
+            "gate_escalation_expired" => true,
+            _ => false,
+        };
+        if !valid {
+            let terminal_entry = if asking_session_proven {
+                chain_entry_json(e)
+            } else {
+                Value::Null
+            };
+            let mut out = hestia_error_envelope(
+                "hestia.escalation_history_invalid",
+                &format!(
+                    "the newest terminal row for escalation {ptr} has an unrecognized status or decision shape; the older approval is not authoritative"
+                ),
+                Some(json!({"terminal_entry": terminal_entry.clone()})),
+            );
+            out["source"] = json!("witness_chain");
+            out["status"] = json!("unknown");
+            out["escalation_id"] = json!(ptr);
+            out["terminal"] = json!(true);
+            out["historical_details_proven"] = json!(asking_session_proven);
+            out["terminal_event_type"] = json!(e.event_type);
+            out["terminal_chain_position"] = json!(e.chain_position);
+            out["terminal_hash"] = json!(e.hash);
+            out["terminal_entry"] = terminal_entry;
+            return out;
+        }
+    }
     // THE SPEND, which is not a settlement and must not be mistaken for one: a claimed entry
     // carries no `status`, and reading it as the settlement would render it `denied`.
     let claimed = newest(&["gate_escalation_claimed"]);
@@ -10312,11 +10846,16 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "marker": get("marker"),
         "status": status,
         "how_to_answer": escalation_answer_guidance(),
-        "stated_reason": get("stated_reason"),
-        "stated_detail": get("stated_detail"),
+        // Historical rationale and peer factors follow the same rule as poll: only the original
+        // asking session may read them. An unauthenticated resource read must not expose them
+        // directly or smuggle them inside the full terminal entry (#1725).
+        "stated_reason": if asking_session_proven { get("stated_reason") } else { Value::Null },
+        "stated_detail": if asking_session_proven { get("stated_detail") } else { Value::Null },
         "bar": get("bar"),
         "invited_peers": get("invited_peers"),
         "asker_basis": get("asker_basis"),
+        "asking_session_proven": asking_session_proven,
+        "historical_details_proven": asking_session_proven,
         // Shape parity with the live arm on the SPEND too — see there for why this
         // is not a fuse field. `claimed: false` is a measured absence here, not an
         // unsearched one: the exact lookup returns every entry naming this escalation
@@ -10341,9 +10880,14 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         // `decided_at` passes through whatever the entry carries (null on
         // entries that predate the field, and while still unsettled).
         "decided_at": settled_get("decided_at"),
-        "factors_present": settled_get("factors_present"),
-        "reason": settled_get("reason"),
-        "settled_entry": settled.as_ref().map(chain_entry_json),
+        "terminal": settled.is_some(),
+        "factors_present": if asking_session_proven { settled_get("factors_present") } else { Value::Null },
+        "reason": if asking_session_proven { settled_get("reason") } else { Value::Null },
+        "settled_entry": if asking_session_proven {
+            settled.as_ref().map(chain_entry_json).unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        },
         "searched": searched,
         "complete": true,
         "lookup": "exact",
@@ -12508,6 +13052,8 @@ mod inbox_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -12688,6 +13234,8 @@ mod inbox_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: "role:constellation:mesh-worker".into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
                     host_session_id: None,
@@ -13286,6 +13834,177 @@ mod member_mesh_tests {
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
     }
 
+    #[tokio::test]
+    async fn a_claim_routes_one_notice_to_its_owner_without_blocking_other_mail() {
+        let (_dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let bystander = connect(&state, "kimi-code").await;
+
+        let mut queued = Vec::new();
+        for pointer in ["shared-context/forum/claimed.md", "shared-context/forum/other.md"] {
+            let sent = tool_member_notify(
+                &state,
+                &json!({
+                    "to_plugin_id": "kimi-code",
+                    "kind": "review_request",
+                    "pointer_uri": pointer,
+                    "session_id": sender,
+                }),
+            )
+            .await
+            .unwrap();
+            queued.push(sent["queued_id"].as_u64().expect("notice queued"));
+        }
+
+        let claimed = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": owner}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], json!(true), "claim failed: {claimed}");
+        assert!(claimed["witnessEntryHash"].is_string());
+
+        let conflict = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict["_hestia_error"]["code"], json!("hestia.member_claim_conflict"));
+        assert!(conflict["_hestia_error"]["data"]["claim_expires_at"].is_string());
+
+        let bystander_mail = tool_member_inbox(
+            &state,
+            &json!({"session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bystander_mail["total"], json!(1));
+        assert_eq!(bystander_mail["notices"][0]["id"], json!(queued[1]));
+
+        let owner_mail = tool_member_inbox(&state, &json!({"session_id": owner}))
+            .await
+            .unwrap();
+        assert_eq!(owner_mail["total"], json!(1), "the bystander consumed the claim: {owner_mail}");
+        assert_eq!(owner_mail["notices"][0]["id"], json!(queued[0]));
+
+        let s = state.lock().await;
+        let event = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|entry| entry.event_type == "member_notice_claimed")
+            .expect("claim was not witnessed");
+        assert_eq!(event.event_data["notice_id"], json!(queued[0]));
+        assert_eq!(event.event_data["plugin_id"], json!("kimi-code"));
+    }
+
+    /// NOVA re-review of #1513: a lease change whose witness append fails must not stay
+    /// effective. For each of fresh claim, renewal, expired takeover and release, inject a
+    /// failure on exactly that act's chain event, and require (a) an explicit unwitnessed
+    /// error with `lease_state: restored_to_prior`, (b) the row's owner/expiry byte-identical
+    /// to before, and (c) for release, that a sibling session still cannot drain the notice.
+    async fn unwitnessed_lease_change_rolls_back(arm: &str) {
+        let (dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let sibling = connect(&state, "kimi-code").await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let witness = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        witness.pragma_update(None, "key", hex::encode(key)).unwrap();
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "shared-context/forum/lease.md", "session_id": sender}),
+        )
+        .await
+        .unwrap();
+        let id = sent["queued_id"].as_u64().expect("notice queued");
+        let lease = || {
+            let state = state.clone();
+            async move {
+                state.lock().await.inbox_store.member_notice_lease(id, "kimi-code").unwrap()
+                    .expect("notice still undrained")
+            }
+        };
+        let claim = |session: &str, extra: Value| {
+            let state = state.clone();
+            let mut args = json!({"notice_id": id, "session_id": session});
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            async move { tool_member_claim(&state, &args).await.unwrap() }
+        };
+
+        // Arrange the lease the failing act starts from.
+        let (actor, extra, event) = match arm {
+            "fresh" => (&owner, json!({}), "member_notice_claimed"),
+            "renew" => {
+                let ok = claim(&owner, json!({"lease_secs": 120})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"lease_secs": 3600}), "member_notice_claimed")
+            }
+            "takeover" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                let inbox = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+                inbox.pragma_update(None, "key", hex::encode(key)).unwrap();
+                inbox.execute("UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                              rusqlite::params!["2000-01-01T00:00:00+00:00", id as i64]).unwrap();
+                (&sibling, json!({}), "member_notice_claimed")
+            }
+            "release" => {
+                let ok = claim(&owner, json!({})).await;
+                assert_eq!(ok["claimed"], json!(true), "{ok}");
+                (&owner, json!({"action": "release"}), "member_notice_released")
+            }
+            other => panic!("unknown arm {other}"),
+        };
+        let prior = lease().await;
+        assert_eq!(prior.claimed_by_session.is_some(), arm != "fresh", "{arm}: setup {prior:?}");
+
+        witness.execute_batch(&format!(
+            "CREATE TRIGGER fail_lease BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = '{event}'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;")).unwrap();
+        let r = claim(actor, extra).await;
+        witness.execute_batch("DROP TRIGGER fail_lease").unwrap();
+
+        assert_eq!(r["_hestia_error"]["code"], json!("hestia.member_claim_unwitnessed"),
+                   "{arm}: {r}");
+        assert_eq!(r["_hestia_error"]["data"]["lease_state"], json!("restored_to_prior"),
+                   "{arm}: {r}");
+        assert_eq!(lease().await, prior, "{arm}: the lease change stayed effective unwitnessed");
+        if arm == "release" {
+            let sibling_mail = tool_member_inbox(&state, &json!({"session_id": sibling}))
+                .await
+                .unwrap();
+            assert_eq!(sibling_mail["total"], json!(0),
+                       "an unwitnessed release let a sibling consume the notice: {sibling_mail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_fresh_claim_is_rolled_back() {
+        unwitnessed_lease_change_rolls_back("fresh").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_renewal_is_rolled_back_to_the_prior_expiry() {
+        unwitnessed_lease_change_rolls_back("renew").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_expired_takeover_is_rolled_back_to_the_prior_owner() {
+        unwitnessed_lease_change_rolls_back("takeover").await;
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_release_is_rolled_back_and_blocks_sibling_drain() {
+        unwitnessed_lease_change_rolls_back("release").await;
+    }
+
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
     /// accepted one **on the chain**, not just in an ephemeral tool response.
     ///
@@ -13844,9 +14563,9 @@ mod member_mesh_tests {
     /// post-restart every id is unknown, and unknown fails toward owed), a durable
     /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
     /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
-    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
-    /// request from the map moves the row BACK to owed (moot -> owed): read-time
-    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// dotted specialization of the ask kind moots exactly like its root. Without durable
+    /// evidence, evicting the request moves a live-derived row BACK to owed (moot -> owed).
+    /// Once the terminal disposition marks mooted_at/moot_reason, eviction cannot un-moot it.
     /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
     /// because the misroute is the sender-actionable signal. Binding to a mooted row
     /// still works: mootness reclassifies the debt, it does not close the row.
@@ -13984,12 +14703,10 @@ mod member_mesh_tests {
         assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
         assert_eq!(owed_moot.len(), 1, "{rows}");
 
-        // Eviction/restart regression (dp-web4 review of #1357): the request map is
-        // memory-only, so losing the request must move the row BACK to owed. Mootness
-        // is a read-time property of available evidence, not a row state — the
-        // non-monotonicity is intentional until durable `mooted_at` evidence lands
-        // (the #1354 follow-up), and this transition is the proof it fails toward
-        // visibility rather than silently staying moot.
+        // Eviction/restart regression (dp-web4 review of #1357): with no terminal
+        // disposition yet, mootness is only derived from the live request. Losing that
+        // evidence must move the row BACK to owed rather than silently staying moot.
+        // The next block proves the durable-mark arm does not revert.
         {
             let mut s = state.lock().await;
             s.scope_requests.remove("scope-moot-decided");
@@ -14019,6 +14736,49 @@ mod member_mesh_tests {
         assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
                 "nothing stays moot on absent evidence: {rows2}");
 
+        // The terminal disposition carries durable evidence. Once it has landed, eviction of
+        // the memory-only request cannot resurrect the transient ask as debt.
+        {
+            let s = state.lock().await;
+            ensure_disposition(&s, "cbp-being", "hestia://scope/scope-moot-decided",
+                               "scope-ruling-hash");
+        }
+        let late_scope_ptr =
+            "hestia://scope/scope-moot-decided#peer-decide;late-after-eviction";
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_scope_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let rows3 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let durable = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == "hestia://scope/scope-moot-decided#peer-decide")
+            .unwrap_or_else(|| panic!("durable scope mootness survives eviction: {rows3}"));
+        assert!(durable["mooted_at"].is_string(), "{rows3}");
+        assert!(durable["moot_reason"].as_str().unwrap_or_default().contains("scope-ruling-hash"),
+                "the evidence names the ruling that made it moot: {rows3}");
+        let late_scope = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_scope_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling scope ask inherits durable mootness: {rows3}")
+            });
+        assert!(late_scope["mooted_at"].is_string(), "{rows3}");
+        assert!(late_scope["moot_reason"].as_str().unwrap_or_default()
+                .contains("scope-ruling-hash"), "{rows3}");
+
         // Mootness reclassifies; it does not close. The ASKED member can still bind late.
         let late = tool_member_notify(
             &state,
@@ -14029,6 +14789,134 @@ mod member_mesh_tests {
         .await
         .unwrap();
         assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
+    }
+
+    #[tokio::test]
+    async fn unanswered_moots_terminal_escalations_without_treating_unknown_as_expired() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = now_secs();
+        let (decided, expired, pending) = {
+            let mut s = state.lock().await;
+            let decided = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now, 3600)
+                .unwrap()
+                .id;
+            s.gate_escalations
+                .decide(&decided, false, "claude-code", "role:constellation:member",
+                        Channel::SelfWithdrawn, None, Some("false positive"), now)
+                .unwrap();
+            let expired = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now - 10, 1)
+                .unwrap()
+                .id;
+            let pending = s.gate_escalations
+                .open("claude-code", "role:constellation:member", "Edit", "test-marker",
+                      Some("Edit -> /tmp/x"), None, None, now, 3600)
+                .unwrap()
+                .id;
+            (decided, expired, pending)
+        };
+        let decided_ptr = format!("hestia://escalation/{decided}#corroborate-or-dissent");
+        let expired_ptr = format!("hestia://escalation/{expired}#corroborate-or-dissent");
+        let pending_ptr = format!("hestia://escalation/{pending}#corroborate-or-dissent");
+        let unknown_ptr = "hestia://escalation/not-present#corroborate-or-dissent";
+        for (kind, pointer) in [
+            ("review_request", decided_ptr.as_str()),
+            ("review_request", expired_ptr.as_str()),
+            ("review_request.pr", expired_ptr.as_str()),
+            ("review_request", pending_ptr.as_str()),
+            ("review_request", unknown_ptr),
+            ("reply", decided_ptr.as_str()),
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": kind,
+                        "pointer_uri": pointer, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let pointers = |rows: &Value, key: &str| {
+            rows[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["pointer_uri"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for ptr in [&decided_ptr, &expired_ptr] {
+            assert!(pointers(&rows, "i_owe_moot").contains(ptr),
+                    "a live terminal escalation moots its transient ask: {rows}");
+        }
+        for ptr in [&pending_ptr, &unknown_ptr.to_string()] {
+            assert!(pointers(&rows, "i_owe").contains(ptr),
+                    "pending and UNKNOWN targets stay owed: {rows}");
+        }
+        assert!(rows["i_owe"].as_array().unwrap().iter().any(|r|
+                r["kind"] == "reply" && r["pointer_uri"] == decided_ptr),
+                "a durable reply remains content even when its target is terminal: {rows}");
+
+        {
+            let s = state.lock().await;
+            ensure_disposition(&s, "claude-code",
+                               &format!("hestia://escalation/{decided}#withdrawn"),
+                               "withdrawn-ruling-hash");
+        }
+        let late_ptr = format!("{decided_ptr};exact-reviewed-v2-late-follow-up");
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        {
+            let mut s = state.lock().await;
+            s.gate_escalations.reap(now + 7200, 0);
+        }
+        let after = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let durable = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == decided_ptr)
+            .unwrap_or_else(|| panic!("terminal evidence survives escalation eviction: {after}"));
+        assert!(durable["mooted_at"].is_string(), "{after}");
+        assert!(durable["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        let late = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling ask keeps durable mootness after reaping: {after}")
+            });
+        assert!(late["mooted_at"].is_string(), "{after}");
+        assert!(late["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        assert!(pointers(&after, "i_owe").contains(&expired_ptr),
+                "an unmarked expired row fails back to owed after its live evidence is gone: {after}");
+        assert!(!pointers(&after, "i_owe_moot").contains(&pending_ptr),
+                "a pending ask never becomes moot merely because its live row was reaped: {after}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
@@ -15737,6 +16625,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: role.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -16071,6 +16961,42 @@ mod tests {
         assert_eq!(s.sessions.len(), 2, "one session per (member, host session)");
         assert!(s.sessions.values().any(|session| session.plugin_id == "victim"));
         assert!(s.sessions.values().any(|session| session.plugin_id == "other-member"));
+    }
+
+    /// #824 stage A: the identity basis is explicit metadata, never a caller-selected
+    /// upgrade. Current sessions are asserted/A1, and Guard-A reuse cannot change that fact.
+    #[tokio::test]
+    async fn connect_labels_legacy_identity_basis_asserted_and_reuse_does_not_upgrade() {
+        let (_dir, shared) = make_shared_state();
+        let fresh = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(fresh["identityBasis"], "asserted");
+        assert!(fresh["canonicalPrincipal"].is_null());
+        let session_id = fresh["sessionId"].as_str().unwrap();
+        {
+            let s = shared.lock().await;
+            let stored = &s.sessions[&Uuid::parse_str(session_id).unwrap()];
+            assert_eq!(stored.identity_basis, crate::server::state::IdentityBasis::Asserted);
+            assert_eq!(stored.canonical_principal, None);
+        }
+
+        let reused = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["sessionId"], session_id);
+        assert_eq!(reused["identityBasis"], "asserted");
+        assert!(reused["canonicalPrincipal"].is_null());
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(dry["identityBasis"], "asserted");
+        assert!(dry["canonicalPrincipal"].is_null());
     }
 
     /// The declared constellation role must be READABLE BACK. Before this, a member
@@ -18544,6 +19470,7 @@ mod tests {
         assert_eq!(row.event_data["proven_plugin_id"], "claude-code");
         assert_eq!(row.event_data["spent"], false);
         assert_eq!(row.event_data["request_key"], "a".repeat(64));
+        assert_eq!(row.event_data["request_key_basis"], "caller_supplied");
         // The chain is broadly readable; the session id is a live capability.
         let prefix = row.event_data["session_prefix"].as_str().unwrap();
         assert_eq!(prefix.len(), 8, "a prefix, not the whole session: {prefix}");
@@ -18554,6 +19481,44 @@ mod tests {
                 .contains(&session_of["claude-code"])),
             "no row may carry the full session id"
         );
+    }
+
+    #[tokio::test]
+    async fn distinct_acts_sharing_a_request_key_keep_distinct_chain_identities() {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "hs-acts",
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        for tool_name in ["Edit", "Write"] {
+            let error = gate_claim_and_escalate(&shared, &json!({
+                "plugin_id": "codex", "session_id": &session,
+                "tool_name": tool_name, "marker": "pre_tool_use.py",
+                "reason": format!("{tool_name} -> pre_tool_use.py"),
+                "request_key": "a".repeat(64),
+            })).await.expect_err("the mismatched asker must be refused");
+            assert!(error.to_string().contains("asker mismatch"), "{error}");
+        }
+
+        let rows: Vec<_> = shared.lock().await.recent_chain(20)
+            .into_iter()
+            .filter(|e| e.event_type == "gate_escalation_refused")
+            .collect();
+        assert_eq!(rows.len(), 2, "distinct acts must not be deduplicated");
+        let request_keys: std::collections::HashSet<_> = rows.iter()
+            .map(|e| e.event_data["request_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(request_keys.len(), 1, "the correlation key groups retries, not act identities");
+        let chain_hashes: std::collections::HashSet<_> = rows.iter().map(|e| &e.hash).collect();
+        assert_eq!(chain_hashes.len(), 2, "chain identity remains exact per act");
+        let tool_names: std::collections::HashSet<_> = rows.iter()
+            .map(|e| e.event_data["tool_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_names.len(), 2, "the different act classes remain distinguishable");
+        let s = shared.lock().await;
+        assert!(s.recent_chain(20).iter().all(|e| {
+            !matches!(e.event_type.as_str(),
+                "gate_escalation_opened" | "gate_escalation_coalesced" | "gate_escalation_claimed")
+        }), "the correlation key confers no authority, coalescing, or spend");
     }
 
     /// Open + sovereign-approve, the setup half of the claim-joinability test below —
@@ -18618,6 +19583,316 @@ mod tests {
     async fn connect_as(shared: &SharedState, who: &str) -> String {
         let r = tool_connect(shared, &json!({ "plugin_id": who, "host_agent": "h" })).await.unwrap();
         r["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn record_bash_refusal(
+        shared: &SharedState,
+        session: &str,
+        marker: &str,
+        act: &str,
+    ) -> String {
+        let refused = tool_gate_escalation_claim(
+            shared,
+            &json!({
+                "plugin_id": "kimi-code", "session_id": session,
+                "tool_name": "Bash", "marker": marker, "act": act, "reason": act,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["not_asked"], true, "{refused}");
+        refused["refusal_id"].as_str().unwrap().to_string()
+    }
+
+    fn manual_open_args(session: &str, marker: &str, act: &str) -> Value {
+        json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Bash", "marker": marker, "act": act,
+            "reason": "review this exact refused act before I re-issue it",
+        })
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_refuses_a_bare_command_when_the_refusal_has_the_gate_act() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let marker = "pre_tool_use.py";
+        let canonical = "Bash: echo patch | sha256sum";
+        let refusal_id = record_bash_refusal(&shared, &session, marker, canonical).await;
+        let open = |act: &str| {
+            json!({
+                "plugin_id": "kimi-code", "session_id": session,
+                "tool_name": "Bash", "marker": marker, "act": act,
+                "reason": "review the exact patch command before I re-issue it",
+            })
+        };
+
+        let mismatch = tool_gate_escalation_open(&shared, &open("echo patch | sha256sum"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mismatch["_hestia_error"]["code"],
+            "hestia.escalation_open_binding_mismatch",
+            "{mismatch}"
+        );
+        assert_eq!(mismatch["_hestia_error"]["data"]["refusal_id"], refusal_id, "{mismatch}");
+        assert_eq!(
+            mismatch["_hestia_error"]["data"]["expected"]["act"], canonical,
+            "{mismatch}"
+        );
+        assert!(mismatch["escalation_id"].is_null(), "{mismatch}");
+        assert!(
+            !shared.lock().await.recent_chain(50).iter()
+                .any(|e| e.event_type == "gate_escalation_opened"),
+            "a mismatched ask must not reach reviewers"
+        );
+
+        let opened = tool_gate_escalation_open(&shared, &open(canonical)).await.unwrap();
+        assert!(opened["escalation_id"].as_str().is_some(), "{opened}");
+        assert_eq!(opened["marker_recognised"], true, "{opened}");
+        assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+        assert_eq!(opened["binding_verified"], true, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+        let row = shared.lock().await.recent_chain(50).into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened"
+                && e.event_data["escalation_id"] == opened["escalation_id"])
+            .expect("the exact open is witnessed");
+        assert_eq!(row.event_data["escalated_from"], refusal_id, "{row:?}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_refuses_a_marker_the_gate_will_not_claim() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let marker = "plugins/_shared";
+        let wrong_marker = "hestia_governance_closure.py";
+        let canonical = "Bash: cp /tmp/fix.py /repo/plugins/_shared/hestia_gate_mechanism.py";
+        let refusal_id = record_bash_refusal(&shared, &session, marker, canonical).await;
+        let open = |act: &str| {
+            json!({
+                "plugin_id": "kimi-code", "session_id": session,
+                "tool_name": "Bash", "marker": wrong_marker, "act": act,
+                "reason": "review this governance repair before I re-issue it",
+            })
+        };
+
+        let mismatch = tool_gate_escalation_open(&shared, &open(canonical)).await.unwrap();
+        assert_eq!(
+            mismatch["_hestia_error"]["code"],
+            "hestia.escalation_open_binding_mismatch",
+            "{mismatch}"
+        );
+        assert_eq!(
+            mismatch["_hestia_error"]["data"]["expected"]["marker"], marker,
+            "{mismatch}"
+        );
+        let different_act = tool_gate_escalation_open(&shared, &open("Bash: cp /tmp/other.py /repo/x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            different_act["_hestia_error"]["code"],
+            "hestia.escalation_open_marker_mismatch",
+            "{different_act}"
+        );
+        assert!(
+            !shared.lock().await.recent_chain(50).iter()
+                .any(|e| e.event_type == "gate_escalation_opened"),
+            "neither wrong-marker ask may be minted"
+        );
+
+        let mut exact = open(canonical);
+        exact["marker"] = json!(marker);
+        let opened = tool_gate_escalation_open(&shared, &exact).await.unwrap();
+        assert!(opened["escalation_id"].as_str().is_some(), "{opened}");
+        assert_eq!(opened["marker_recognised"], true, "{opened}");
+        assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+        assert_eq!(opened["binding_verified"], true, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_disambiguates_same_act_refusals_by_marker_and_session() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let canonical = "Bash: echo patch | sha256sum";
+        let first_marker = "pre_tool_use.py";
+        let second_marker = "plugins/_shared";
+        let first = record_bash_refusal(&shared, &session, first_marker, canonical).await;
+        let second = record_bash_refusal(&shared, &session, second_marker, canonical).await;
+
+        let mismatch = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, "third.marker", canonical)).await.unwrap();
+        let data = &mismatch["_hestia_error"]["data"];
+        assert_eq!(mismatch["_hestia_error"]["code"], "hestia.escalation_open_binding_mismatch");
+        assert_eq!(data["expected"], Value::Null, "no arbitrary expected refusal: {mismatch}");
+        assert_eq!(data["refusal_id"], Value::Null, "{mismatch}");
+        let alternatives = data["alternatives"].as_array().unwrap();
+        assert_eq!(alternatives.len(), 2, "{mismatch}");
+        assert!(alternatives.iter().any(|r| r["refusal_id"] == first));
+        assert!(alternatives.iter().any(|r| r["refusal_id"] == second));
+        assert!(alternatives.iter().all(|r| r["act"] == canonical));
+
+        for (marker, refusal_id) in [(first_marker, first), (second_marker, second)] {
+            let opened = tool_gate_escalation_open(
+                &shared, &manual_open_args(&session, marker, canonical)).await.unwrap();
+            assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+            assert_eq!(opened["binding_verified"], true, "{opened}");
+            assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+        }
+
+        let sibling = connect_as(&shared, "kimi-code").await;
+        assert_ne!(sibling, session);
+        let independent = tool_gate_escalation_open(
+            &shared, &manual_open_args(&sibling, first_marker, "Bash: echo independent"))
+            .await
+            .unwrap();
+        assert_eq!(independent["binding_status"], "marker_history_only", "{independent}");
+        assert_eq!(independent["binding_verified"], false, "{independent}");
+        assert_eq!(independent["bound_refusal_id"], Value::Null, "{independent}");
+        assert!(independent.get("expected").is_none(), "no other session's act: {independent}");
+
+        let other = connect_as(&shared, "codex").await;
+        let forged = tool_gate_escalation_open(
+            &shared, &manual_open_args(&other, first_marker, "echo a different command"))
+            .await
+            .expect_err("a codex session cannot claim kimi-code's refusal");
+        assert!(!forged.to_string().contains(canonical), "no cross-member act disclosure: {forged}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_binds_across_mcp_sessions_with_the_same_host_session() {
+        let (_dir, shared) = make_shared_state();
+        let hook_session = connect_as(&shared, "kimi-code").await;
+        let member_session = tool_connect(&shared, &json!({
+            "plugin_id": "kimi-code", "host_agent": "h", "host_session_id": "wake-1668",
+        }))
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(hook_session, member_session);
+        let marker = "pre_tool_use.py";
+        let canonical = "Bash: echo two-session binding";
+        let refused = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": hook_session,
+            "tool_name": "Bash", "marker": marker, "act": canonical,
+            "reason": canonical, "host_session_id": "wake-1668",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(refused["not_asked"], true, "{refused}");
+        let refusal_id = refused["refusal_id"].as_str().unwrap().to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared, &manual_open_args(&member_session, marker, canonical))
+            .await
+            .unwrap();
+        assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+        assert_eq!(opened["binding_verified"], true, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+
+        // The shipped member-mesh client connects without host_session_id. An exact act from
+        // another session must retain independent open/coalesce, not a false mismatch refusal.
+        let other_session = connect_as(&shared, "kimi-code").await;
+        let independent = tool_gate_escalation_open(
+            &shared, &manual_open_args(&other_session, marker, canonical))
+            .await
+            .unwrap();
+        assert!(independent.get("_hestia_error").is_none(), "the door stayed open: {independent}");
+        assert!(independent["escalation_id"].as_str().is_some(), "{independent}");
+        assert_eq!(independent["coalesced"], true, "the existing exact ask coalesced: {independent}");
+        assert!(independent.get("expected").is_none(), "no other session's act: {independent}");
+        assert!(independent.get("refusal_id").is_none(), "no other session's id: {independent}");
+        assert!(independent.get("alternatives").is_none(), "no refusal details: {independent}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_with_no_marker_evidence_is_explicitly_unverified() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let opened = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, "new.marker", "Edit -> new.marker"))
+            .await
+            .unwrap();
+        assert_eq!(opened["marker_recognised"], Value::Null, "{opened}");
+        assert!(opened["known_gate_markers"].as_array().unwrap().is_empty(), "{opened}");
+        assert_eq!(opened["binding_status"], "unverified", "{opened}");
+        assert_eq!(opened["binding_verified"], false, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], Value::Null, "{opened}");
+        assert!(opened["marker_note"].as_str().unwrap().contains("UNVERIFIED"), "{opened}");
+        let row = shared.lock().await.recent_chain(50).into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened"
+                && e.event_data["escalation_id"] == opened["escalation_id"])
+            .expect("the unverified open is witnessed");
+        assert!(row.event_data.get("escalated_from").is_none(), "{row:?}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_does_not_bind_spent_or_withdrawn_refusals() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let marker = "pre_tool_use.py";
+        let spent_act = "Bash: echo approval | sha256sum";
+        let spent_refusal = record_bash_refusal(&shared, &session, marker, spent_act).await;
+        let opened = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": spent_refusal,
+            "reason": "review and then spend this exact governance approval",
+        }))
+        .await
+        .unwrap();
+        let escalation_id = opened["escalation_id"].as_str().unwrap().to_string();
+        assert!(!shared.lock().await.governance_refusals.contains_key(&spent_refusal));
+        shared.lock().await.gate_escalations.decide(
+            &escalation_id,
+            true,
+            "operator",
+            "role:constellation:sovereign",
+            crate::server::gate_escalation::Channel::OperatorSession,
+            None,
+            Some("approved for this exact act"),
+            crate::server::gate_escalation::now_secs(),
+        )
+        .unwrap();
+        let claimed = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Bash", "marker": marker, "act": spent_act, "reason": spent_act,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+        let after_spend = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, marker, "Bash: echo after-spend"))
+            .await
+            .unwrap();
+
+        let withdrawn_act = "Bash: echo withdrawal | sha256sum";
+        let withdrawn_refusal = record_bash_refusal(&shared, &session, marker, withdrawn_act).await;
+        let opened = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": withdrawn_refusal,
+            "reason": "open this exact refusal before withdrawing it",
+        }))
+        .await
+        .unwrap();
+        assert!(!shared.lock().await.governance_refusals.contains_key(&withdrawn_refusal));
+        tool_gate_arbitrate_escalation(&shared, &json!({
+            "escalation_id": opened["escalation_id"], "approve": false,
+            "session_id": session, "reason": "self-withdraw: this independent ask is not needed",
+        }))
+        .await
+        .unwrap();
+        let after_withdraw = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, marker, "Bash: echo after-withdraw"))
+            .await
+            .unwrap();
+
+        for out in [after_spend, after_withdraw] {
+            assert_eq!(out["binding_status"], "marker_history_only", "{out}");
+            assert_eq!(out["binding_verified"], false, "{out}");
+            assert_eq!(out["bound_refusal_id"], Value::Null, "{out}");
+            assert!(out.get("expected").is_none(), "no stale refusal disclosure: {out}");
+            assert!(out["marker_note"].as_str().unwrap().contains("UNVERIFIED"), "{out}");
+        }
     }
 
     /// The claim alone ASKS NOTHING: no escalation, no opened row, nobody invited. It answers
@@ -19852,11 +21127,44 @@ mod tests {
         assert_eq!(refused.event_data["proven_host_session_id"], "host-wake-proven");
         assert_eq!(refused.event_data["spent"], false);
         assert_eq!(refused.event_data["request_key"], "b".repeat(64));
+        assert_eq!(refused.event_data["request_key_basis"], "caller_supplied");
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_claimed"),
             "a refused claim must mint NO claimed row — a spend recorded for a write that \
              never happened is the inverse of the defect this whole change fixes"
         );
+        drop(rows);
+
+        let err = gate_claim_and_escalate(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook>",
+                "host_session_id": "host-wake-asserted-elsewhere",
+            }),
+        )
+        .await
+        .expect_err("the derived-key arm must refuse the same mismatch");
+        assert!(err.to_string().contains("host session mismatch"), "{err}");
+        let rows = shared.lock().await.recent_chain(50);
+        let refused = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "host session mismatch"
+                    && e.event_data["request_key_basis"] == "derived_identity_mismatch"
+            })
+            .expect("a mismatch without a caller key must record its derived basis");
+        assert_eq!(
+            refused.event_data["request_key"],
+            crate::server::gate_escalation::request_key_for_act(
+                "kimi-code", "<gate-hook>", "Edit -> <gate-hook>", Some("host-wake-proven"),
+            )
+        );
+        assert_eq!(refused.event_data["spent"], false);
         drop(rows);
 
         // And the approval was not burned by the refusal: the corrected claim still works.
@@ -19977,11 +21285,32 @@ mod tests {
                 "codex", "pre_tool_use.py", "Edit -> pre_tool_use.py", None,
             )
         );
+        assert_eq!(row.event_data["request_key_basis"], "derived_identity_mismatch");
         // O: a denied act leaves state bit-identical — nothing was opened.
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_opened"),
             "a refused open must not also open: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn refusal_request_key_basis_is_explicit() {
+        let (_dir, shared) = make_shared_state();
+        let s = shared.lock().await;
+        for (act, mismatch, expected) in [
+            (Some("Edit -> pre_tool_use.py"), false, "derived"),
+            (Some(""), false, "derived_without_act"),
+            (Some("Edit -> pre_tool_use.py"), true, "derived_identity_mismatch"),
+        ] {
+            let (key, basis) = refusal_request_key(
+                &s, "kimi-code", "pre_tool_use.py", act, None, None, mismatch);
+            assert!(crate::server::gate_escalation::valid_request_key(&key));
+            assert_eq!(basis, expected);
+        }
+        let supplied = "a".repeat(64);
+        let (_, basis) = refusal_request_key(
+            &s, "kimi-code", "pre_tool_use.py", Some(""), None, Some(&supplied), true);
+        assert_eq!(basis, "caller_supplied", "a caller key keeps its basis even across a mismatch");
     }
 
     #[tokio::test]
@@ -20028,6 +21357,43 @@ mod tests {
         );
         assert!(keys.contains(&derived), "the open refusal derives the same hook rule: {keys:?}");
         assert!(keys.iter().all(|key| crate::server::gate_escalation::valid_request_key(key)));
+        let open_row = rows.iter().find(|e| e.event_type == "gate_escalation_refused").unwrap();
+        assert_eq!(open_row.event_data["request_key_basis"], "derived_without_act");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_claimed"),
+                "#540 chain invariant: claimed without decided is zero");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_decided"),
+                "the fixture has not decided an escalation yet");
+        drop(rows);
+
+        let opened = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap();
+        let peer = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h",
+        })).await.unwrap();
+        let decided = tool_gate_arbitrate_escalation(&shared, &json!({
+            "escalation_id": esc_id, "approve": true,
+            "session_id": peer["sessionId"], "reason": "cross-peer approval for the claim invariant",
+        })).await.unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+        let claimed = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+
+        let rows = shared.lock().await.recent_chain(50);
+        let approved = rows.iter().filter(|e| {
+            e.event_type == "gate_escalation_decided" && e.event_data["status"] == "approved"
+        }).count();
+        let claimed = rows.iter().filter(|e| e.event_type == "gate_escalation_claimed").count();
+        assert_eq!(approved, 1, "the invariant needs a real approved decision: {rows:?}");
+        assert!(claimed <= approved,
+                "#540 chain invariant: every claimed row needs an approved decision: {rows:?}");
     }
 
     /// Negative control for both tests above. A row that appears no matter what the guard
@@ -20178,6 +21544,396 @@ mod tests {
         assert!(err.to_string().contains("operator"), "{err}");
         assert!(err.to_string().contains("decided"), "{err}");
         assert!(!err.to_string().contains("unknown ids"), "{err}");
+    }
+
+    pub(crate) async fn reaped_poll_subject() -> (TempDir, SharedState, String, String, Value) {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": session.clone(),
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+                "reason": "private ask rationale",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.reap(
+                now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+            let rows = s.chain_store.escalation_rows(&id).unwrap();
+            let open = rows.iter().find(|e| e.event_type == "gate_escalation_opened").unwrap();
+            assert_eq!(open.event_data["session_id"], session);
+        }
+        (_dir, shared, session, id, opened)
+    }
+
+    async fn poll_reaped_ruling(approve: bool) -> Value {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": session,
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let reason = if approve { "approved after review" } else { "refused after review" };
+
+        let (expected_bar, expected_factors) = {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            let decided = s
+                .gate_escalations
+                .decide(
+                    &id,
+                    approve,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some(reason),
+                    now,
+                )
+                .unwrap();
+            let expected_bar = decided.bar;
+            let expected_factors = decided.factors.clone();
+            let bar_met = decided.bar_met();
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": id, "plugin_id": "codex",
+                    "status": decided.stored_status(),
+                    "decided_by": decided.decided_by,
+                    "decided_via": decided.decided_via,
+                    "reason": decided.reason,
+                    "bar": decided.bar,
+                    "bar_met": bar_met,
+                    "factors_present": decided.factors,
+                }),
+            )
+            .unwrap();
+            s.gate_escalations.reap(
+                now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+            let rows = s.chain_store.escalation_rows(&id).unwrap();
+            assert!(rows.iter().any(|e| e.event_type == "gate_escalation_opened"));
+            assert!(rows.iter().any(|e| e.event_type == "gate_escalation_decided"));
+            (expected_bar, expected_factors)
+        };
+
+        let polled = tool_gate_escalation_poll(
+            &shared,
+            &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["source"], "witness_chain", "{polled}");
+        assert_eq!(polled["history_lookup"], "terminal", "{polled}");
+        assert_eq!(polled["historical_details_proven"], true, "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["claim_window_secs_remaining"], 0, "{polled}");
+        assert_eq!(polled["observation_started_claim_window"], false, "{polled}");
+        assert_eq!(polled["decided_by"], "operator", "{polled}");
+        assert_eq!(polled["decided_via"], "operator_session", "{polled}");
+        assert_eq!(polled["reason"], reason, "{polled}");
+        assert_eq!(polled["bar"], json!(expected_bar), "{polled}");
+        assert_eq!(polled["bar_met"], true, "{polled}");
+        assert_eq!(polled["factors_present"], json!(expected_factors), "{polled}");
+        assert_eq!(polled["consumed_at"], Value::Null, "{polled}");
+        assert!(polled["note"].as_str().unwrap().contains("witness chain"), "{polled}");
+        polled
+    }
+
+    #[tokio::test]
+    async fn a_reaped_denial_polls_the_ruling_from_the_chain() {
+        let polled = poll_reaped_ruling(false).await;
+        assert_eq!(polled["status"], "denied", "{polled}");
+        assert_eq!(polled["reason"], "refused after review", "{polled}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_approval_polls_the_ruling_without_resurrecting_spend_authority() {
+        let polled = poll_reaped_ruling(true).await;
+        assert_eq!(polled["status"], "approved", "{polled}");
+        assert_eq!(polled["reason"], "approved after review", "{polled}");
+        assert_eq!(polled["bar_met"], true, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_poll_distinguishes_a_nonexistent_id_from_a_chain_outage() {
+        let (_dir, shared) = make_shared_state();
+        let args = json!({"escalation_id": "deadbeefdeadbeef"});
+        let missing = tool_gate_escalation_poll(&shared, &args).await.unwrap();
+        assert_eq!(missing["status"], "expired", "{missing}");
+        assert_eq!(missing["source"], "live_store", "{missing}");
+        assert_eq!(missing["history_lookup"], "not_found", "{missing}");
+        assert_eq!(missing["permits_write"], false, "{missing}");
+        assert_eq!(missing["granted"], false, "{missing}");
+        assert_eq!(missing["decided_by"], Value::Null, "{missing}");
+        assert_eq!(missing["reason"], Value::Null, "{missing}");
+        assert!(missing["note"].as_str().unwrap().contains("anywhere on the witness chain"));
+
+        let key = crate::storage::storage_key(_dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(_dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE chain_entries;").unwrap();
+        let outage = tool_gate_escalation_poll(&shared, &args).await.unwrap();
+        assert_eq!(outage["status"], "expired", "{outage}");
+        assert_eq!(outage["source"], "live_store", "{outage}");
+        assert_eq!(outage["history_lookup"], "error", "{outage}");
+        assert_eq!(outage["permits_write"], false, "{outage}");
+        assert_eq!(outage["granted"], false, "{outage}");
+        assert!(outage["note"].as_str().unwrap().contains("UNKNOWN, not absent"));
+    }
+
+    #[tokio::test]
+    async fn historical_poll_uses_the_latest_valid_terminal_row_without_leaking_superseded_fields() {
+        let (_dir, shared, session, id, opened) = reaped_poll_subject().await;
+        {
+            let s = shared.lock().await;
+            for (status, reason, by) in [
+                ("approved", "an earlier approval", "operator"),
+                ("denied", "the latest valid refusal", "peer:kimi-code"),
+            ] {
+                s.append_chain(
+                    "gate_escalation_decided",
+                    json!({
+                        "escalation_id": id, "plugin_id": "codex", "status": status,
+                        "decided_by": by, "decided_via": "operator_session", "reason": reason,
+                        "bar": "sovereign_plus_peer", "bar_met": status == "approved",
+                        "factors_present": [{"by": by, "argument": reason}],
+                    }),
+                )
+                .unwrap();
+            }
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({"escalation_id": id, "plugin_id": "kimi-code", "status": "approved",
+                       "decided_by": "operator", "reason": "another member cannot settle this"}),
+            )
+            .unwrap();
+        }
+        let denied = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied["history_lookup"], "terminal", "{denied}");
+        assert_eq!(denied["status"], "denied", "{denied}");
+        assert_eq!(denied["reason"], "the latest valid refusal", "{denied}");
+        assert_eq!(denied["factors_present"][0]["by"], "peer:kimi-code", "{denied}");
+        assert_eq!(denied["bar"], "sovereign_plus_peer", "{denied}");
+        assert_eq!(denied["bar_met"], false, "{denied}");
+        assert_eq!(denied["historical_details_proven"], true, "{denied}");
+        assert_eq!(denied["permits_write"], false, "{denied}");
+        assert_eq!(denied["granted"], false, "{denied}");
+
+        for extra in [
+            json!({"escalation_id": id, "plugin_id": "codex", "decided_by": "operator",
+                   "reason": "missing status must not become a denial"}),
+            json!({"escalation_id": id, "plugin_id": "codex", "status": "revoked",
+                   "decided_by": "operator", "reason": "not a supported terminal status"}),
+        ] {
+            shared.lock().await.append_chain("gate_escalation_decided", extra).unwrap();
+            let unknown = tool_gate_escalation_poll(
+                &shared, &json!({"escalation_id": id, "session_id": session}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unknown["status"], "unknown", "{unknown}");
+            assert_eq!(unknown["history_lookup"], "invalid", "{unknown}");
+            assert_eq!(unknown["reason"], Value::Null, "{unknown}");
+            assert_eq!(unknown["permits_write"], false, "{unknown}");
+            assert_eq!(unknown["granted"], false, "{unknown}");
+            let note = unknown["note"].as_str().unwrap();
+            assert!(note.contains("malformed or unrecognized"), "{note}");
+            assert!(!note.contains("treated as expired"), "malformed is not ordinary expiry: {note}");
+        }
+
+        shared.lock().await.append_chain(
+            "gate_escalation_withdrawn",
+            json!({"escalation_id": id, "plugin_id": "codex", "status": "denied",
+                   "decided_by": "codex", "decided_via": "self_withdrawn"}),
+        )
+        .unwrap();
+        let withdrawn = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(withdrawn["status"], "denied", "{withdrawn}");
+        assert_eq!(withdrawn["decided_via"], "self_withdrawn", "{withdrawn}");
+        assert_eq!(withdrawn["reason"], Value::Null, "{withdrawn}");
+        assert_eq!(withdrawn["factors_present"], Value::Null, "{withdrawn}");
+        assert_eq!(withdrawn["bar"], opened["bar"], "{withdrawn}");
+        assert_eq!(withdrawn["permits_write"], false, "{withdrawn}");
+        assert_eq!(withdrawn["granted"], false, "{withdrawn}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_open_ask_does_not_wait_as_live_pending() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        let polled = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["status"], "expired", "{polled}");
+        assert_eq!(polled["history_lookup"], "opened", "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["claim_window_secs_remaining"], 0, "{polled}");
+        assert!(polled["note"].as_str().unwrap().contains("no live ruling path"), "{polled}");
+    }
+
+    #[tokio::test]
+    async fn historical_poll_reason_and_factors_require_the_original_asking_session() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "approved",
+                "decided_by": "operator", "decided_via": "operator_session",
+                "reason": "private review rationale", "bar_met": true,
+                "factors_present": [{"by": "operator", "argument": "private peer argument"}],
+            }),
+        )
+        .unwrap();
+        let other = tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let sibling = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h", "host_session_id": "a-different-wake",
+        }))
+        .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(sibling, session);
+
+        for session_id in [None, Some(other.as_str()), Some(sibling.as_str())] {
+            let mut args = json!({"escalation_id": id});
+            if let Some(session_id) = session_id {
+                args["session_id"] = json!(session_id);
+            }
+            let polled = tool_gate_escalation_poll(&shared, &args).await.unwrap();
+            assert_eq!(polled["status"], "approved", "{polled}");
+            assert_eq!(polled["history_lookup"], "terminal", "{polled}");
+            assert_eq!(polled["historical_details_proven"], false, "{polled}");
+            assert_eq!(polled["reason"], Value::Null, "{polled}");
+            assert_eq!(polled["factors_present"], Value::Null, "{polled}");
+            assert_eq!(polled["permits_write"], false, "{polled}");
+            assert_eq!(polled["granted"], false, "{polled}");
+        }
+
+        let mine = tool_gate_escalation_poll(
+            &shared, &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mine["historical_details_proven"], true, "{mine}");
+        assert_eq!(mine["reason"], "private review rationale", "{mine}");
+        assert_eq!(mine["factors_present"][0]["argument"], "private peer argument", "{mine}");
+        assert_eq!(mine["permits_write"], false, "{mine}");
+        assert_eq!(mine["granted"], false, "{mine}");
+    }
+
+    #[tokio::test]
+    async fn historical_resource_details_require_the_same_original_asking_session() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "approved",
+                "decided_by": "operator", "decided_via": "operator_session",
+                "reason": "private review rationale", "bar_met": true,
+                "factors_present": [{"by": "operator", "argument": "private peer argument"}],
+            }),
+        )
+        .unwrap();
+        let other = tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let sibling = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h", "host_session_id": "another-wake",
+        }))
+        .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        for session_id in [None, Some(other.as_str()), Some(sibling.as_str())] {
+            let body = {
+                let s = shared.lock().await;
+                resolve_escalation_pointer_for_session(&s, &id, session_id)
+            };
+            assert_eq!(body["source"], "witness_chain", "{body}");
+            assert_eq!(body["status"], "approved", "{body}");
+            assert_eq!(body["decided_by"], "operator", "{body}");
+            assert_eq!(body["historical_details_proven"], false, "{body}");
+            for key in ["stated_reason", "stated_detail", "reason", "factors_present", "settled_entry"] {
+                assert_eq!(body[key], Value::Null, "{key} leaked to an unproven reader: {body}");
+            }
+        }
+
+        let mine = {
+            let s = shared.lock().await;
+            resolve_escalation_pointer_for_session(&s, &id, Some(&session))
+        };
+        assert_eq!(mine["historical_details_proven"], true, "{mine}");
+        assert_eq!(mine["stated_reason"], "private ask rationale", "{mine}");
+        assert_eq!(mine["reason"], "private review rationale", "{mine}");
+        assert_eq!(mine["factors_present"][0]["argument"], "private peer argument", "{mine}");
+        assert_eq!(mine["settled_entry"]["eventData"]["reason"], "private review rationale", "{mine}");
+
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "revoked",
+                "decided_by": "operator", "reason": "malformed private rationale",
+                "factors_present": [{"by": "operator", "argument": "malformed private factor"}],
+            }),
+        )
+        .unwrap();
+        let invalid = {
+            let s = shared.lock().await;
+            resolve_escalation_pointer(&s, &id)
+        };
+        assert_eq!(invalid["status"], "unknown", "{invalid}");
+        assert_eq!(invalid["terminal"], true, "{invalid}");
+        assert_eq!(invalid["historical_details_proven"], false, "{invalid}");
+        assert_eq!(invalid["terminal_entry"], Value::Null, "anonymous raw invalid row: {invalid}");
+        assert_eq!(invalid["_hestia_error"]["data"]["terminal_entry"], Value::Null,
+            "invalid error details cannot smuggle the raw row: {invalid}");
+        assert_eq!(invalid["terminal_event_type"], "gate_escalation_decided", "{invalid}");
+
+        let proven_invalid = {
+            let s = shared.lock().await;
+            resolve_escalation_pointer_for_session(&s, &id, Some(&session))
+        };
+        assert_eq!(proven_invalid["historical_details_proven"], true, "{proven_invalid}");
+        assert_eq!(proven_invalid["terminal_entry"]["eventData"]["reason"],
+            "malformed private rationale", "{proven_invalid}");
     }
 
     /// The positive control for the binding above, and the more important half of it: the fix
@@ -20792,6 +22548,165 @@ mod tests {
                 && !render.contains("RE-ISSUE THE SAME WRITE"),
             "the asker must not be told to spend a grant that authorises nothing: {render}"
         );
+    }
+
+    #[tokio::test]
+    async fn same_name_evidence_is_preserved_without_counting_toward_any_bar() {
+        let (_dir, shared) = make_shared_state();
+        let asker = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "self-wake"
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let opened = tool_gate_escalation_open(&shared, &json!({
+            "plugin_id": "claude-code", "session_id": asker,
+            "tool_name": "Edit", "marker": "law_inject.py", "act": "Edit -> law_inject.py",
+        })).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        for stance in ["concur", "dissent"] {
+            let argument = format!("same-name {stance}: the complete reasoning, verbatim");
+            let response = tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": id,
+                "session_id": asker,
+                "stance": stance,
+                "argument": argument,
+            })).await.expect("same-name evidence remains recordable");
+            assert_eq!(response["recorded"], true, "{response}");
+            assert_eq!(response["self_evidence"], true, "{response}");
+            assert_eq!(response["corroborated"], false, "{response}");
+            assert_eq!(response["bar_met_if_decided_now"], false, "{response}");
+            let factor = response["factors_present"].as_array().unwrap().last().unwrap();
+            assert_eq!(factor["channel"], "self_evidence");
+            assert_eq!(factor["argument"], argument);
+            assert!(factor["independence"].is_null(), "{factor}");
+        }
+
+        let s = shared.lock().await;
+        let esc = s.gate_escalations.get(&id).unwrap();
+        assert_eq!(esc.factors.len(), 2);
+        assert!(!esc.bar_met(), "self evidence must not clear SingleApprover");
+        let participation = esc.peer_participation();
+        assert_eq!(participation.self_evidence, 2);
+        assert_eq!((participation.concurred, participation.dissented), (0, 0));
+        let rows: Vec<_> = s.chain_store.read_recent(30).unwrap().into_iter()
+            .filter(|e| e.event_type == "gate_escalation_corroborated")
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.event_data["channel"], "self_evidence");
+            assert_eq!(row.event_data["self_declared"], true);
+            assert_eq!(row.event_data["counts_toward_bar"], false);
+            assert!(row.event_data["argument"].as_str().unwrap().contains("complete reasoning"));
+        }
+        let mut entries = s.chain_store.read_recent(200).unwrap();
+        entries.reverse();
+        drop(s);
+
+        let mut replayed = crate::server::gate_escalation::EscalationStore::default();
+        replayed.rehydrate(&entries, crate::server::gate_escalation::now_secs());
+        let restored = replayed.get(&id).unwrap();
+        assert_eq!(restored.factors.len(), 2);
+        assert!(restored.factors.iter().all(|f| {
+            f.channel == crate::server::gate_escalation::Channel::SelfEvidence
+        }));
+        assert!(!restored.bar_met());
+        assert_eq!(restored.peer_participation().self_evidence, 2);
+    }
+
+    /// NOVA's three questions on PR #1658, each as a control that can fail.
+    #[tokio::test]
+    async fn self_evidence_is_bounded_deduplicated_and_never_a_peer_answer() {
+        use crate::server::gate_escalation::{Channel, SELF_EVIDENCE_MAX};
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex", "kimi-code"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await.unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        let opened = tool_gate_escalation_open(&shared, &json!({
+            "plugin_id": "claude-code", "session_id": session_of["claude-code"],
+            "tool_name": "Edit", "marker": "law_inject.py", "act": "Edit -> law_inject.py",
+        })).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let say = |who: &'static str, stance: &'static str, argument: String| {
+            let (shared, id, sid) = (shared.clone(), id.clone(), session_of[who].clone());
+            async move {
+                tool_gate_escalation_corroborate(&shared, &json!({
+                    "escalation_id": id, "session_id": sid, "stance": stance, "argument": argument,
+                })).await
+            }
+        };
+        let corroborated_rows = |s: &crate::server::state::ServerState| s.chain_store.read_recent(200).unwrap()
+            .into_iter().filter(|e| e.event_type == "gate_escalation_corroborated").count();
+
+        // (3) REPEATS. The same statement twice adds nothing: no factor, no chain row.
+        say("claude-code", "concur", "statement 0".into()).await.unwrap();
+        let err = say("claude-code", "concur", "  statement 0  ".into()).await
+            .expect_err("an identical self statement must not be recorded twice");
+        assert!(format!("{err}").contains("already on the record"), "{err}");
+        {
+            let s = shared.lock().await;
+            assert_eq!(s.gate_escalations.get(&id).unwrap().factors.len(), 1);
+            assert_eq!(corroborated_rows(&s), 1, "a refused repeat writes no chain row");
+        }
+        // The same words under the other stance are a different statement.
+        say("claude-code", "dissent", "statement 0".into()).await.unwrap();
+
+        // (2) MIXED. A genuine peer dissents; the two kinds are counted apart, and the peer's
+        // absence bookkeeping is not touched by the asker's statements.
+        assert!(
+            !shared.lock().await.gate_escalations.get(&id).unwrap().bar_met(),
+            "a concur and a dissent from the asker itself meet no bar"
+        );
+        let before = shared.lock().await.gate_escalations.get(&id).unwrap().peer_participation();
+        assert_eq!((before.concurred, before.dissented, before.self_evidence), (0, 0, 2));
+        say("codex", "dissent", "a peer's reason".into()).await.unwrap();
+        {
+            let s = shared.lock().await;
+            let esc = s.gate_escalations.get(&id).unwrap();
+            let after = esc.peer_participation();
+            assert_eq!((after.concurred, after.dissented, after.self_evidence), (0, 1, 2));
+            assert_eq!(after.absent, before.absent, "self evidence must not move peer absence");
+            // What a peer factor does to `bar_met` is unchanged by this PR and not asserted
+            // here; the self statements' share of it is pinned below, after the bound.
+        }
+
+        // (3) THE BOUND. Distinct statements stop at the limit, and the refusal says so.
+        for n in 2..SELF_EVIDENCE_MAX {
+            say("claude-code", "concur", format!("statement {n}")).await.unwrap();
+        }
+        let err = say("claude-code", "concur", "one too many".into()).await
+            .expect_err("self evidence is bounded per escalation");
+        assert!(format!("{err}").contains("limit"), "{err}");
+        {
+            let s = shared.lock().await;
+            let esc = s.gate_escalations.get(&id).unwrap();
+            let own = esc.factors.iter().filter(|f| f.channel == Channel::SelfEvidence).count();
+            assert_eq!(own, SELF_EVIDENCE_MAX);
+            assert_eq!(esc.factors.len(), SELF_EVIDENCE_MAX + 1, "the peer's factor is still there");
+            assert_eq!(corroborated_rows(&s), SELF_EVIDENCE_MAX + 1);
+        }
+        // The bound is the asker's alone: a peer may still answer after it is reached.
+        say("kimi-code", "concur", "a second peer".into()).await
+            .expect("the self-evidence limit must not close the door on peers");
+
+        // (1) AN ASSERTED ASK. The named member, with a real live session, gets no
+        // self-evidence path on an ask nobody proved it opened, and neither does a peer.
+        let asserted = tool_gate_escalation_open(&shared, &json!({
+            "plugin_id": "codex", "tool_name": "Edit",
+            "marker": "pre_tool_use.py", "act": "Edit -> pre_tool_use.py",
+        })).await.unwrap();
+        assert_eq!(asserted["asker_basis"], "asserted", "{asserted}");
+        let asserted_id = asserted["escalation_id"].as_str().unwrap().to_string();
+        for who in ["codex", "kimi-code"] {
+            let err = tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": asserted_id, "session_id": session_of[who],
+                "stance": "concur", "argument": "evidence against a name nobody proved",
+            })).await.expect_err("an asserted ask collects no factor of any channel");
+            assert!(format!("{err}").contains("you may not corroborate"), "{who}: {err}");
+        }
+        let s = shared.lock().await;
+        assert!(s.gate_escalations.get(&asserted_id).unwrap().factors.is_empty());
     }
 
     /// Two members with live sessions and one escalation opened by the first — the fixture
@@ -21603,6 +23518,8 @@ mod open_appeals_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: format!("lct:{m}"),
                     connected_at: Utc::now(),
                     host_session_id: None,
@@ -22686,6 +24603,8 @@ mod appeal_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: APPELLANT_ROLE.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -23813,6 +25732,126 @@ mod appeal_tests {
         );
     }
 
+    /// The dashboard escalation feed (#869) is tested in JS against
+    /// `tools/dashboard_escalation_feed_fixture.json`. That fixture is only worth what its
+    /// shapes are worth: the first version of the feed read a `granted` key no ruling row
+    /// has, and an `escalation_id` key no pending item has, and its hand-written fixtures
+    /// had both. This drives the REAL writers (open, peer approve, peer deny, self-withdraw,
+    /// one left pending), takes the snapshot `/api/dashboard` serves, and holds the
+    /// fixture to it: same rows, same keys, same dispositions. Regenerate with
+    /// `HESTIA_WRITE_FEED_FIXTURE=1` after a deliberate writer change.
+    #[tokio::test]
+    async fn the_dashboard_feed_fixture_matches_what_the_daemon_writes() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker = seat(&state, "claude-code").await;
+        let peer = seat(&state, "codex").await;
+        let open = |marker: &'static str| {
+            let state = state.clone();
+            async move {
+                let o = tool_gate_escalation_open(&state, &json!({
+                    "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": marker,
+                    "act": format!("policy_edit -> {marker}"),
+                    "reason": "the deny blocks a legitimate rule addition",
+                    "session_id": asker.to_string(),
+                })).await.unwrap();
+                o["escalation_id"].as_str().unwrap().to_string()
+            }
+        };
+        let rule = |id: String, approve: bool, sid: Uuid| {
+            let state = state.clone();
+            async move {
+                let r = tool_gate_arbitrate_escalation(&state, &json!({
+                    "escalation_id": id, "approve": approve, "session_id": sid.to_string(),
+                    "reason": "reviewed",
+                })).await.unwrap();
+                assert!(r.get("_hestia_error").is_none(), "{r}");
+            }
+        };
+        let approved = open("policy.json").await;
+        rule(approved.clone(), true, peer).await;
+        let denied = open("law.json").await;
+        rule(denied.clone(), false, peer).await;
+        let withdrawn = open("witness.py").await;
+        rule(withdrawn.clone(), false, asker).await;
+        let pending = open("pending.json").await;
+
+        let snap = serde_json::to_value(state.lock().await.dashboard_snapshot(200)).unwrap();
+        // Stable labels for the per-run ids, so the fixture is readable and diffable.
+        let ids = [
+            (&approved, "a0a0a0a0approved"),
+            (&denied, "d0d0d0d0denied00"),
+            (&withdrawn, "w0w0w0w0withdrwn"),
+            (&pending, "p0p0p0p0pending0"),
+        ];
+        let relabel = |v: &Value| -> Value {
+            let mut t = v.to_string();
+            for (real, label) in &ids {
+                t = t.replace(real.as_str(), label);
+            }
+            serde_json::from_str(&t).unwrap()
+        };
+        let mut recent: Vec<Value> = snap["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"].as_str().unwrap().starts_with("gate_escalation_"))
+            .map(|e| {
+                let mut e = relabel(e);
+                let pos = e["chain_position"].clone();
+                e["hash"] = json!(format!("hash-{pos}"));
+                e["prev_hash"] = json!("prev");
+                e["timestamp"] = json!("2026-11-23T00:00:00Z");
+                e
+            })
+            .collect();
+        recent.retain(|e| e.get("escalation_id").is_some());
+        let pending_items: Vec<Value> =
+            snap["pending_escalations"].as_array().unwrap().iter().map(relabel).collect();
+        let real = json!({"recent": recent, "pending_escalations": pending_items});
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tools/dashboard_escalation_feed_fixture.json");
+        if std::env::var_os("HESTIA_WRITE_FEED_FIXTURE").is_some() {
+            std::fs::write(&path, serde_json::to_string_pretty(&real).unwrap() + "\n").unwrap();
+        }
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let (want, got) = (fixture["recent"].as_array().unwrap(), real["recent"].as_array().unwrap());
+        assert_eq!(want.len(), got.len(), "fixture rows vs real rows: {got:#?}");
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!(keys(w), keys(g), "a feed row's keys drifted from the writer: {g:#}");
+            for k in ["event_type", "escalation_id", "plugin_id", "marker", "status",
+                      "decided_by", "decided_via", "bar", "bar_met"] {
+                assert_eq!(w.get(k), g.get(k), "{k} drifted from the writer: {g:#}");
+            }
+        }
+        // The two dispositions the feed must tell apart are on the ruling rows, as `status`.
+        let ruling = |id: &str| got.iter()
+            .find(|e| e["escalation_id"] == id && e["event_type"] == "gate_escalation_decided")
+            .unwrap_or_else(|| panic!("no ruling row for {id}: {got:#?}"));
+        assert_eq!(ruling("a0a0a0a0approved")["status"], "approved");
+        assert_eq!(ruling("d0d0d0d0denied00")["status"], "denied");
+        assert!(got.iter().all(|e| e.get("granted").is_none()), "no feed row carries `granted`");
+
+        let (want, got) = (
+            fixture["pending_escalations"].as_array().unwrap(),
+            real["pending_escalations"].as_array().unwrap(),
+        );
+        assert_eq!(want.len(), got.len(), "{got:#?}");
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!(keys(w), keys(g), "a pending item's keys drifted: {g:#}");
+            assert_eq!(w["id"], g["id"]);
+        }
+        assert_eq!(got[0]["id"], "p0p0p0p0pending0", "a pending item names its escalation `id`");
+    }
+
     /// Minting site C, the peer-ruling path (#459): a member ruling on an escalation
     /// tells the ASKER. Minted at the tool handler, the layer that holds
     /// `SharedState` — the store's `decide` has no inbox access.
@@ -24481,6 +26520,75 @@ mod appeal_tests {
         );
     }
 
+    /// #823: a factor whose own evidence append fails must not remain visible to the
+    /// decider. The retry writes one attributable event, and replay reconstructs that
+    /// same factor without manufacturing events for historical snapshot-only factors.
+    #[tokio::test]
+    async fn an_unwitnessed_corroboration_leaves_no_decision_relevant_factor() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let args = json!({
+            "escalation_id": esc_id, "session_id": peer_sid.to_string(),
+            "stance": "dissent", "argument": "the proposed rule is broader than its evidence",
+        });
+
+        // Let factor validation and state mutation succeed while the witness write fails.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let failed = tool_gate_escalation_corroborate(&state, &args).await;
+        assert!(failed.is_err(), "an unwitnessed factor cannot report success: {failed:?}");
+        {
+            let s = state.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).expect("the prior escalation remains");
+            assert!(esc.factors.is_empty(), "the failed factor never became live: {esc:?}");
+            // NOVA (#1650): the bar this factor WOULD meet (asserted after the retry) is not
+            // met by the transient one — an evidence append failure has no approval effect.
+            assert!(!esc.bar_met(), "an unwitnessed factor does not meet the bar: {esc:?}");
+            assert!(s.chain_store.read_recent(500).unwrap().iter()
+                .all(|e| e.event_type != "gate_escalation_corroborated"),
+                "the failed append left no canonical factor event");
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let recorded = tool_gate_escalation_corroborate(&state, &args).await.unwrap();
+        assert!(recorded["witnessEntryHash"].is_string(), "the retry is durable: {recorded}");
+        assert_eq!(recorded["factors_present"].as_array().unwrap().len(), 1);
+        let s = state.lock().await;
+        assert!(s.gate_escalations.get(&esc_id).unwrap().bar_met(),
+                "the same factor, once witnessed, meets the bar the failed attempt did not");
+        let mut chain = s.chain_store.read_recent(500).unwrap();
+        chain.reverse();
+        let events: Vec<_> = chain.iter()
+            .filter(|e| e.event_type == "gate_escalation_corroborated")
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one canonical factor record");
+        assert_eq!(events[0].event_data["corroborated_by"], "codex");
+        assert_eq!(events[0].event_data["stance"], "dissent");
+        assert_eq!(events[0].event_data["argument"], "the proposed rule is broader than its evidence");
+
+        let mut replayed = crate::server::gate_escalation::EscalationStore::default();
+        replayed.rehydrate(&chain, crate::server::gate_escalation::now_secs());
+        let replayed_esc = replayed.get(&esc_id).expect("the committed factor replays");
+        assert_eq!(replayed_esc.factors.len(), 1);
+        assert_eq!(replayed_esc.factors[0].by, "codex");
+        assert!(replayed_esc.factors[0].dissent);
+        assert_eq!(replayed_esc.factors[0].argument.as_deref(),
+                   Some("the proposed rule is broader than its evidence"));
+        assert_eq!(serde_json::to_value(&replayed_esc.factors).unwrap(),
+                   recorded["factors_present"]);
+    }
+
     /// Revised #480 review, defect 2: WITNESS IS FINALITY. If the
     /// `gate_escalation_decided` append fails, the decision must not stand — the
     /// store is rolled back to Pending, nothing is claimable, and the caller gets
@@ -24562,6 +26670,8 @@ mod vault_hst001_tests {
             assigned_role: "citizen".into(),
             constellation_role: "role:constellation:member".into(),
             role_basis: None,
+            identity_basis: crate::server::state::IdentityBasis::Asserted,
+            canonical_principal: None,
             soft_lct: format!("lct:test:{plugin_id}"),
             connected_at: chrono::Utc::now(),
             host_session_id: None,
@@ -24840,6 +26950,34 @@ mod authority_attribution_tests {
             format!("{r}").contains("pair_inbox_unattributed"),
             "an unattributed paired-channel drain must be refused: {r}"
         );
+    }
+
+    #[tokio::test]
+    async fn pair_inbox_rejects_a_cross_origin_stored_endpoint_before_dialing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat_session(&state, "bystander-member").await;
+        {
+            let mut s = state.lock().await;
+            let mut store = crate::hub::HubStore::default();
+            store.connections.push(crate::hub::HubConnection {
+                id: Uuid::new_v4(),
+                url: "https://hub.example".into(),
+                hub_lct_id: Uuid::new_v4(),
+                our_lct_id: Uuid::new_v4(),
+                connected_at: Utc::now(),
+                last_seen: None,
+                api_version: "v1".into(),
+                rest_endpoint: "https://evil.example/v1".into(),
+                hubs_joined: vec![],
+                member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            });
+            store.save(&mut s.vault).unwrap();
+        }
+        let err = tool_pair_inbox(&state, &json!({"session_id": sid.to_string()}))
+            .await
+            .expect_err("a stored cross-origin endpoint must be refused before dialing");
+        assert!(err.to_string().contains("cross-origin discovery endpoint refused"), "{err}");
     }
 
     /// The fifth site, caught in review of this PR's own "zero call sites" claim:
@@ -25829,6 +27967,104 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     }
     let asker_is_proven = proven_asker.is_some();
     let proven_session_uuid = proven_asker.as_ref().and_then(|who| who.session_uuid);
+
+    // An approval is claimable only against the gate's exact act and marker. A warning after the
+    // mint is too late: peers may already have ruled on a permit no re-issue can spend. Refuse a
+    // mismatch against a live refusal BEFORE anything is opened, and name the refusal-linked door
+    // that copies both fields instead of asking the member to retype them. Ownership may be
+    // established by the daemon MCP session or asserted by the stable host session (A1). When
+    // neither matches, retain the pre-existing independent-open door without disclosing the act.
+    let asking_session_id = proven_session_uuid.map(|uuid| uuid.to_string());
+    let asking_host_session_id = proven_session_uuid
+        .and_then(|uuid| s.sessions.get(&uuid))
+        .and_then(|session| session.host_session_id.as_deref());
+    let mut bound_refusal_id = None;
+    if let Some(presented_act) = act.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        let candidates: Vec<(String, String, String, u64, bool)> = s
+            .governance_refusals
+            .values()
+            .filter(|r| r.plugin_id == plugin_id && r.expires_at > now)
+            .filter_map(|r| {
+                let a = r
+                    .claim_args
+                    .get("act")
+                    .and_then(Value::as_str)
+                    .or_else(|| r.claim_args.get("reason").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())?;
+                let mcp_match = asking_session_id.is_some()
+                    && r.asker_session_id.as_deref() == asking_session_id.as_deref();
+                let host_match = asking_host_session_id.is_some()
+                    && r.claim_args.get("host_session_id").and_then(Value::as_str)
+                        == asking_host_session_id;
+                Some((r.id.clone(), a.to_string(), r.marker.clone(), r.refused_at,
+                      mcp_match || host_match))
+            })
+            .collect();
+        let exact = candidates
+            .iter()
+            .find(|(_, a, m, _, owned)| a.as_str() == presented_act && m == &marker && *owned);
+        if exact.is_none() {
+            let mut mismatch: Vec<_> = candidates
+                .iter()
+                .filter(|(_, a, _, _, owned)| *owned && a.as_str() == presented_act)
+                .collect();
+            if mismatch.is_empty() {
+                mismatch = candidates
+                    .iter()
+                    .filter(|(_, _, m, _, owned)| *owned && m == &marker)
+                    .collect();
+            }
+            if !mismatch.is_empty() {
+                mismatch.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+                let expected = (mismatch.len() == 1).then(|| mismatch[0]);
+                let alternatives: Vec<Value> = mismatch
+                    .iter()
+                    .map(|(id, a, m, at, _)| {
+                        json!({"refusal_id": id, "act": a, "marker": m, "refused_at": at})
+                    })
+                    .collect();
+                return Ok(hestia_error_envelope(
+                    "hestia.escalation_open_binding_mismatch",
+                    "the act or marker does not match the gate's recorded refusal, so an approval \
+                     would be unclaimable. Escalate the refusal by id to copy its exact act and \
+                     marker; nothing was opened",
+                    Some(json!({
+                        "refusal_id": expected.map(|(id, _, _, _, _)| id.clone()),
+                        "presented": {"act": presented_act, "marker": marker},
+                        "expected": expected
+                            .map(|(_, a, m, _, _)| json!({"act": a, "marker": m}))
+                            .unwrap_or(Value::Null),
+                        "alternatives": alternatives,
+                        "escalate": {
+                            "tool": "hestia_gate_escalation_escalate",
+                            "refusal_id": expected.map(|(id, _, _, _, _)| id.clone()),
+                        },
+                    })),
+                ));
+            }
+        }
+        bound_refusal_id = exact.map(|(id, _, _, _, _)| id.clone());
+    }
+    let marker_recognised = s.gate_escalations.marker_is_recognised(&plugin_id, &marker);
+    let known_markers = s.gate_escalations.known_gate_markers(&plugin_id);
+    if marker_recognised == Some(false) {
+        return Ok(hestia_error_envelope(
+            "hestia.escalation_open_marker_mismatch",
+            "this marker is not one the gate has presented, so an approval would be unclaimable. \
+             Use a known gate marker or escalate a recorded refusal by id; nothing was opened",
+            Some(json!({"marker": marker, "known_gate_markers": known_markers.clone()})),
+        ));
+    }
+    let binding_verified = bound_refusal_id.is_some();
+    let binding_status = if binding_verified {
+        "exact_refusal"
+    } else if marker_recognised == Some(true) {
+        "marker_history_only"
+    } else {
+        "unverified"
+    };
+
     let opened = match s
         .gate_escalations
         .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
@@ -25844,8 +28080,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
         // returned as a bare error the caller might log and forget.
         Err(e) => {
-            let attempt_key = refusal_request_key(
-                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None,
+            let (attempt_key, basis) = refusal_request_key(
+                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None, false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
@@ -25853,7 +28089,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
                     "plugin_id": plugin_id,
                     "tool_name": tool_name,
                     "marker": marker,
-                    "request_key": attempt_key,
+                    "request_key": attempt_key, "request_key_basis": basis,
                     "why": e.to_string(),
                 }),
             );
@@ -25925,42 +28161,42 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // entry point and the hook calls the other one.
     let inv = resolve_invitation(&mut s, &esc, asker_is_proven);
 
-    let entry = s.append_chain(
-        "gate_escalation_opened",
-        opened_payload(
-            &s,
-            &esc,
-            &inv,
-            asker_is_proven,
-            answers_deny.as_deref(),
-            DEFAULT_TTL_SECS,
-        ),
-    )?;
+    let mut payload = opened_payload(
+        &s,
+        &esc,
+        &inv,
+        asker_is_proven,
+        answers_deny.as_deref(),
+        DEFAULT_TTL_SECS,
+    );
+    if let Some(refusal_id) = &bound_refusal_id {
+        payload["escalated_from"] = json!(refusal_id);
+    }
+    let entry = s.append_chain("gate_escalation_opened", payload)?;
     shadow_adjudicate(&mut s, &esc.id);
 
     let invited = inv.invited;
     let invitations = deliver_invitations(&mut s, &esc, &invited, &entry.hash);
-
-    // WILL AN APPROVAL AGAINST THIS MARKER EVER BE CLAIMABLE? (dp, 2026-08-04: "yes, that's a
-    // problem - fix it".) `claim()` joins on (plugin_id, marker) and a member filing here picks
-    // that string itself, with no way to learn what its gate presents. One was filed with a
-    // human-readable marker, approved by dp, and was permanently unclaimable — indistinguishable
-    // from "not approved yet". Answered at OPEN, when it is still free to fix.
-    let marker_recognised = s.gate_escalations.marker_is_recognised(&plugin_id, &marker);
-    let known_markers = s.gate_escalations.known_gate_markers(&plugin_id);
 
     Ok(json!({
         "escalation_id": esc.id,
         "status": esc.stored_status(),
         "bar": esc.bar,
         // null = nothing known yet (say so, do not reassure); false = gates have used OTHER
-        // spellings for this member and not this one.
+        // spellings for this member and not this one. Marker history alone is not refusal proof.
         "marker_recognised": marker_recognised,
         "known_gate_markers": known_markers,
-        "marker_note": match marker_recognised {
-            Some(true) => "this marker matches one your gate has presented; an approval will be claimable",
-            Some(false) => "WARNING: your gate has never presented this marker. An approval against it                             will very likely be UNCLAIMABLE — the marker is a join key, not a label.                             Re-file using one of known_gate_markers.",
-            None => "no gate has claimed for this member yet, so nothing is known about this marker                      — this is 'unknown', not 'fine'",
+        "binding_verified": binding_verified,
+        "binding_status": binding_status,
+        "bound_refusal_id": bound_refusal_id,
+        "marker_note": if binding_verified {
+            "the exact act and marker match a live refusal recorded for this session; the approval binds to that refusal"
+        } else {
+            match marker_recognised {
+                Some(true) => "UNVERIFIED: this marker appears in gate history, but no live refusal for this session verifies this exact act; this is a new ask, not an exact-refusal binding",
+                Some(false) => "WARNING: your gate has never presented this marker. An approval against it                                 will very likely be UNCLAIMABLE — the marker is a join key, not a label.                                 Re-file using one of known_gate_markers.",
+                None => "UNVERIFIED: no gate has claimed for this member yet and no live refusal verifies this exact act — this is 'unknown', not 'fine'",
+            }
         },
         "expires_at": esc.expires_at,
         "ttl_secs": DEFAULT_TTL_SECS,
@@ -26061,6 +28297,34 @@ pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
     "Glob", "Grep", "LS", "NotebookRead", "Read", "git_read", "glob", "list_directory",
     "read_file", "read_many_files", "search", "search_file_content",
 ];
+
+/// The decider's reason belongs to the original act; this guidance belongs to the current one.
+/// Paged directory `memory_read` is SAGE's affordance (#1667; SAGE #707 landed it in SAGE's
+/// shared dispatcher), so every SAGE being has it and no other host does. A SAGE being is
+/// recognised by the fleet's `<machine>-being` member-id convention. No concrete alternative
+/// path is invented from the display act: the member chooses a target its effective grants
+/// actually admit.
+fn standing_refusal_next(plugin_id: &str, tool: &str) -> &'static str {
+    let sage_being = plugin_id.strip_suffix("-being").is_some_and(|machine| !machine.is_empty());
+    if sage_being {
+        if tool == "search" {
+            "use hestia_scope_status to choose a narrower directory whose effective grants include \
+             read, then memory_read path=<held-directory> with start_line paging instead of \
+             repeating this search at the refused path"
+        } else {
+            "use an existing route whose target your effective grants admit for this act; for a \
+             directory listing, memory_read path=<held-directory> with start_line paging. \
+             Re-issuing this path ask will not reopen it"
+        }
+    } else if tool == "search" {
+        "use hestia_scope_status to choose a narrower directory whose effective grants include \
+         read, then narrow the search to that directory instead of repeating it at the refused path"
+    } else {
+        "use an existing in-scope route for this act; for a directory listing, use your host's \
+         supported listing operation on a directory you already hold. Re-issuing this path ask \
+         will not reopen it"
+    }
+}
 
 /// The roots this member's grants and the society floor name: every live and standing grant
 /// root plus every floor root. Where a member's asks are judged to be "about its own space"
@@ -26404,6 +28668,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
             "refused_by": r.refused_by,
             "refused_at": r.refused_at,
             "reason": r.reason,
+            "next": standing_refusal_next(&plugin_id, ""),
             "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
                      the operator's queue. It stands until the operator lifts it; the reason is \
                      the one recorded when it was refused",
@@ -26498,6 +28763,72 @@ fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value
 /// machine's count stays at zero: that is when every caller (the gate's snapshot fetch above all) sends
 /// its session. Served in every response as `unbound_reads_since_start`, a bare number.
 static UNBOUND_SCOPE_STATUS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most floor entries one status read will stat. The rest are reported as `unchecked`.
+const FLOOR_RESOLUTION_MAX: usize = 256;
+/// How long one status read waits for the filesystem pass. `hestia_scope_status` is what every
+/// gate fetches before it rules, so a floor path on a dead network mount must cost it this much
+/// and no more.
+const FLOOR_RESOLUTION_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// One pass at a time. A `stat` that never returns keeps its blocking thread; without this, each
+/// later status read would park another one behind it. The pass owns the permit, so a pass that
+/// outlives its caller still holds the slot.
+fn floor_resolution_slot() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone()
+}
+
+/// Why one floor path does not resolve, or `None` when it does. Runs on a blocking thread.
+fn floor_path_defect(path: &str) -> Option<Value> {
+    let e = std::fs::metadata(path).err()?;
+    // `metadata` follows links. A link that is itself present but points nowhere is a different
+    // repair (fix the link) from a path that was never there (fix the floor entry).
+    let kind = if e.kind() == std::io::ErrorKind::NotFound {
+        if std::fs::symlink_metadata(path).is_ok() { "dangling_link" } else { "missing" }
+    } else {
+        "unreadable"
+    };
+    Some(json!({ "path": path, "kind": kind, "error": e.to_string() }))
+}
+
+/// #940: which society-floor paths fail to resolve. EVIDENCE about the paths, never a filter on
+/// them. Bounded three ways (NOVA's hold on #1659): at most [`FLOOR_RESOLUTION_MAX`] entries, at
+/// most [`FLOOR_RESOLUTION_BUDGET`] of waiting, and one pass in flight ([`floor_resolution_slot`]). A pass that did not finish
+/// reports `count: null` -- "not established" must not read as "nothing unresolvable".
+async fn floor_resolution_report(paths: Vec<String>) -> Value {
+    floor_resolution_report_with(paths, FLOOR_RESOLUTION_BUDGET, floor_resolution_slot(), floor_path_defect).await
+}
+
+async fn floor_resolution_report_with(
+    paths: Vec<String>,
+    budget: std::time::Duration,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
+    defect: fn(&str) -> Option<Value>,
+) -> Value {
+    let total = paths.len();
+    let checked = total.min(FLOOR_RESOLUTION_MAX);
+    // The budget covers the wait for the slot AND the pass: behind a stuck pass, a read waits
+    // the budget once and answers "not established".
+    let pass = async move {
+        let permit = slot.acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            paths.iter().take(FLOOR_RESOLUTION_MAX).filter_map(|p| defect(p)).collect::<Vec<Value>>()
+        }).await.ok()
+    };
+    match tokio::time::timeout(budget, pass).await {
+        Ok(Some(rows)) => json!({
+            "status": if checked < total { "truncated" } else { "complete" },
+            "count": rows.len(), "entries": rows,
+            "checked": checked, "unchecked": total - checked,
+        }),
+        other => json!({
+            "status": if other.is_err() { "timed_out" } else { "failed" },
+            "count": Value::Null, "entries": [],
+            "checked": 0, "unchecked": total,
+        }),
+    }
+}
 
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     tool_scope_status_with_counter(state, args, &UNBOUND_SCOPE_STATUS_READS).await
@@ -26658,6 +28989,11 @@ async fn tool_scope_status_with_counter(
         "added_by": f.added_by,
         "reason": f.reason,
     });
+    // #940: delivery and digest say the floor arrived intact, not that it points anywhere.
+    // Report resolution failures without changing the additive grant set or its digest.
+    let floor_resolution = floor_resolution_report(
+        s.standing_scope.floor.iter().map(|f| f.path.clone()).collect(),
+    ).await;
 
     Ok(json!({
         "plugin_id": plugin_id,
@@ -26746,6 +29082,10 @@ async fn tool_scope_status_with_counter(
             "added_by": f.added_by,
             "reason": f.reason,
         })).collect::<Vec<_>>(),
+        // Resolution is EVIDENCE ABOUT THE PATHS, never a filter on them (#940). An empty
+        // `society_floor` and a floor whose entries all fail to resolve must not look alike.
+        // `status` says whether the pass finished: `count` is null, never 0, when it did not.
+        "society_floor_unresolvable": floor_resolution,
         // Canonical over the path set, not presentation order or provenance. Combined with
         // `generation`, this lets two members prove they received the same society baseline
         // without learning anything about one another's personal expansions.
@@ -27062,11 +29402,14 @@ async fn scope_claim_inner(state: &SharedState, args: &Value,
     // refusal lasted one window and the next act minted a fresh request and a fresh card.
     if unpriceable.is_none() {
         if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+            let next = standing_refusal_next(&plugin_id, &tool);
             return Ok(json!({
                 "verdict": "refused", "permits": false, "path": path, "request_key": key,
                 "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
+                "reason": r.reason,
+                "next": next,
                 "detail": format!("refused, standing (by {}): {}. Re-issuing opens no request; \
-                                   only the operator can lift this",
+                                   only the operator can lift this. For this act: {next}",
                                   r.refused_by, if r.reason.is_empty() { "no reason given" } else { &r.reason }),
             }));
         }
@@ -28086,21 +30429,75 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     // inside it while a member working asynchronously watched grants die unspent. Reading
     // your own decision is how you learn it landed, so that is where the clock should start.
     //
-    // The READ stays open to anyone — poll has never required a session and a status query is
-    // not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here would
-    // let any caller extend (or, by racing, fix) another member's deadline. Unproven callers
-    // get exactly the answer they got before; nothing regresses for them.
+    // The status READ stays open to anyone — poll has never required a session and a status
+    // query is not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here
+    // would let any caller extend (or, by racing, fix) another member's deadline. Recovered
+    // rationale and factors also require the original asking session: knowing an escalation id
+    // is not evidence that a caller may read another member's review details.
     let observed = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
         Some(c) => s.gate_escalations.mark_observed(&id, &c.plugin_id, now),
         None => false,
     };
 
-    let status = s.gate_escalations.status_of(&id, now);
+    let live_status = s.gate_escalations.status_of(&id, now);
     let esc = s.gate_escalations.get(&id);
+    let chain_answer = if esc.is_none() {
+        Some(resolve_escalation_pointer_for_session(&s, &id, session_id_arg.as_deref()))
+    } else {
+        None
+    };
+    let history_lookup = match chain_answer.as_ref() {
+        None => "not_queried",
+        Some(answer) if answer["_hestia_error"]["code"] == "hestia.escalation_history_invalid" => {
+            "invalid"
+        }
+        Some(answer) if answer["source"] == "witness_chain" && answer["terminal"] == true => {
+            "terminal"
+        }
+        Some(answer) if answer["source"] == "witness_chain" => "opened",
+        Some(answer) if answer["_hestia_error"]["code"] == "hestia.escalation_pointer_not_found" => {
+            "not_found"
+        }
+        Some(_) => "error",
+    };
+    let historical = chain_answer.filter(|answer| answer["source"] == "witness_chain");
+    let historical_details_proven = historical
+        .as_ref()
+        .is_some_and(|answer| answer["asking_session_proven"] == true);
+    let historical_field = |key: &str| {
+        historical
+            .as_ref()
+            .and_then(|h| {
+                h["settled_entry"]["eventData"]
+                    .get(key)
+                    .or_else(|| h.get(key))
+            })
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let reply_status = historical
+        .as_ref()
+        .map(|h| h["status"].clone())
+        .unwrap_or_else(|| json!(live_status));
+    let reply_status = if esc.is_none() && history_lookup == "opened" && reply_status == "pending" {
+        // A recovered open record has no live ruling path. Do not keep `await_escalation`
+        // waiting as though this were a live pending row (#1661 review).
+        json!("expired")
+    } else {
+        reply_status
+    };
+    let granted = live_status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false);
 
     Ok(json!({
         "escalation_id": id,
-        "status": status,
+        "source": if historical.is_some() { "witness_chain" } else { "live_store" },
+        "history_lookup": history_lookup,
+        "historical_details_proven": if historical.is_some() {
+            json!(historical_details_proven)
+        } else {
+            Value::Null
+        },
+        "status": reply_status,
         // Told, not inferred: if this poll is what started the claim fuse, the member should
         // know its window is now measured from THIS moment and not from the ruling.
         "observation_started_claim_window": observed,
@@ -28121,18 +30518,17 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // existing somewhere does not put it on the path anyone takes. It goes HERE, where
         // the wrong field already was.
         "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
-        "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        "granted": granted,
         // THREE causes for `0`, one shape (#651) — and the fix is NOT to collapse all three
         // to `null`, because the two causes are not the same kind of thing.
         //
-        // UNKNOWN ID stays `0`. That is the deliberate policy stated on `note` below: an id
-        // this daemon has never seen is treated as EXPIRED, and the caller's only safe
-        // reading of "I do not know" is "no". An `and_then` here would have quietly widened
-        // the #651 repair into that contract and turned a fail-closed answer into `null`.
+        // NO LIVE ROW stays `0`, including a ruling recovered from the chain or a failed chain
+        // lookup. Recovery is history, not renewed spend authority; an `and_then` here would
+        // turn that fail-closed answer into `null`.
         //
-        // PENDING becomes `null`, because it is the opposite situation: a KNOWN record whose
-        // claim clock has not started. `0` there is not a safe "no", it is a false "your
-        // window shut" published against a petition the operator can still approve — measured
+        // A LIVE PENDING row becomes `null`, because it is a KNOWN record whose claim clock has
+        // not started. `0` there is not a safe "no", it is a false "your window shut"
+        // published against a petition the operator can still approve — measured
         // live 2026-08-26 22:18:45Z on `a0dc8225` (1203s of decision life) and `bc37287c`
         // (2460s). The safe-downgrade argument does not reach it: nothing is being permitted
         // by saying "not decided yet", so there is no failure to close toward.
@@ -28153,16 +30549,44 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // zero call sites, and the note stated the two-conjunct rule for six days after the
         // field it explains was moved to four. A peer auditing "which of these N approvals on
         // a shared marker was the one actually spent?" must not have to substring-match prose.
-        "consumed_at": esc.and_then(|e| e.consumed_at),
-        "bar": esc.map(|e| e.bar),
-        "bar_met": esc.map(|e| e.bar_met()),
-        "factors_present": esc.map(|e| e.factors.clone()),
+        "consumed_at": if esc.is_some() {
+            json!(esc.and_then(|e| e.consumed_at))
+        } else {
+            historical_field("consumed_at")
+        },
+        "bar": if esc.is_some() { json!(esc.map(|e| e.bar)) } else { historical_field("bar") },
+        "bar_met": if esc.is_some() {
+            json!(esc.map(|e| e.bar_met()))
+        } else {
+            historical_field("bar_met")
+        },
+        "factors_present": if esc.is_some() {
+            json!(esc.map(|e| e.factors.clone()))
+        } else if historical_details_proven {
+            historical_field("factors_present")
+        } else {
+            Value::Null
+        },
         "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
-        "decided_by": esc.and_then(|e| e.decided_by.clone()),
-        "decided_via": esc.and_then(|e| e.decided_via),
-        "reason": esc.and_then(|e| e.reason.clone()),
-        // An id this daemon has never seen and an id whose window closed are the SAME answer on
-        // purpose. The caller's only safe reading of "I do not know" is "no".
+        "decided_by": if esc.is_some() {
+            json!(esc.and_then(|e| e.decided_by.clone()))
+        } else {
+            historical_field("decided_by")
+        },
+        "decided_via": if esc.is_some() {
+            json!(esc.and_then(|e| e.decided_via))
+        } else {
+            historical_field("decided_via")
+        },
+        "reason": if esc.is_some() {
+            json!(esc.and_then(|e| e.reason.clone()))
+        } else if historical_details_proven {
+            historical_field("reason")
+        } else {
+            Value::Null
+        },
+        // No chain-recovered state restores spend authority. An unknown id and an expired id
+        // both fail closed even though `history_lookup` distinguishes their evidence.
         //
         // THE NOTE IS THE FIELD'S PROSE AND MUST TRACK THE SAME FOUR CONJUNCTS. It used to
         // read "authoritative as of now; only `approved` WITH the stated bar met permits the
@@ -28173,9 +30597,30 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // value was not, because nothing compiles a string. It now comes from
         // `Escalation::claim_note`, the single answer `decision_reply` already reads.
         "note": match esc {
-            None => "unknown escalation_id — treated as expired (a restart drops the store, and \
-                     an in-flight escalation must then read as denied)",
             Some(e) => e.claim_note(now),
+            None if history_lookup == "terminal" => "terminal record recovered from the witness \
+                                                     chain; permits_write stays false because no \
+                                                     spend authority is restored. To act on it, \
+                                                     open a new escalation for the act and cite \
+                                                     this id: the recovered ruling is evidence \
+                                                     for the decider, not a claim",
+            None if history_lookup == "invalid" => "the newest terminal history is malformed or \
+                                                   unrecognized: status is UNKNOWN, not an ordinary \
+                                                   expiry, and permits_write stays false",
+            None if history_lookup == "opened" => "the recovered open record has no live ruling \
+                                                   path: treated as expired and permits_write stays \
+                                                   false",
+            None if history_lookup == "not_found" => "no escalation with this id exists in the \
+                                                      live store or anywhere on the witness chain; \
+                                                      treated as expired and permits_write stays \
+                                                      false",
+            None if history_lookup == "error" => "the live row is absent and the chain lookup \
+                                                  failed: any historical ruling is UNKNOWN, not \
+                                                  absent; treated as expired and permits_write \
+                                                  stays false",
+            None => "unknown to the live store: reaped (decided rows are kept about two hours \
+                     after open) or lost to a restart; this is NOT evidence that no one ruled — \
+                     check the chain before re-escalating.",
         },
     }))
 }
@@ -28772,6 +31217,10 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             act_digest: attempted_act_digest.as_deref().unwrap_or(""),
             payload_sha256: attempted_payload.as_deref(),
             claim_args: args,
+            asker_session_id: proven_asker
+                .as_ref()
+                .and_then(|who| who.session_uuid)
+                .map(|uuid| uuid.to_string()),
             request_key: request_key.as_deref(),
             reclaim_refused,
             bar_shortfall,
@@ -29004,15 +31453,15 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             }))
         }
         Err(e) => {
-            let attempt_key = refusal_request_key(
+            let (attempt_key, basis) = refusal_request_key(
                 &s, &plugin_id, &marker, attempted_act.as_deref(), session_id_arg.as_deref(),
-                request_key.as_deref(),
+                request_key.as_deref(), false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
                 json!({
                     "plugin_id": plugin_id, "tool_name": tool_name,
-                    "marker": marker, "request_key": attempt_key, "why": e.to_string(),
+                    "marker": marker, "request_key": attempt_key, "request_key_basis": basis, "why": e.to_string(),
                 }),
             );
             // Still a refusal of the write — reported as one rather than as a tool error the
@@ -29036,6 +31485,7 @@ struct GovernanceRefusalDraft<'a> {
     act_digest: &'a str,
     payload_sha256: Option<&'a str>,
     claim_args: &'a Value,
+    asker_session_id: Option<String>,
     request_key: Option<&'a str>,
     reclaim_refused: Option<&'static str>,
     bar_shortfall: Option<Value>,
@@ -29078,6 +31528,7 @@ fn record_governance_refusal(s: &mut super::state::ServerState, now: u64, d: Gov
         plugin_id: d.plugin_id.to_string(),
         marker: d.marker.to_string(),
         claim_args,
+        asker_session_id: d.asker_session_id,
         reissues,
         refused_at: now,
         expires_at,
@@ -29941,23 +32392,30 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
     };
 
-    // NOT-SAME, same arbiter rules: a member may not corroborate its own ask, and the
-    // independence tier is recorded with the factor so a reader can weight it. Clause 0
-    // (#128): an asserted asker collects NO peer factor at all — corroborating an ask
-    // nobody proved would mint cross-vendor evidence against a forgeable name.
-    let independence = match eligibility(&AppealParties {
-        appellant: &esc.plugin_id,
-        appellant_basis: esc.asker_basis,
-        deny_adjudicator: None,
-        arbiter: &arb.plugin_id,
-    }) {
-        Eligibility::Eligible { independence } => independence,
-        other => {
-            return Err(anyhow::anyhow!(
-                "you may not corroborate this: {other:?}. Evidence about your own gate write \
-                 is not a second factor — it is the first one wearing a hat."
-            ));
-        }
+    // A session-proven asker may leave SELF-DECLARED evidence (#935), never a peer factor:
+    // the channel counts toward no bar. Other callers follow NOT-SAME arbiter rules, with the
+    // independence tier recorded so a reader can weight it. Clause 0 (#128): an asserted asker
+    // collects NO peer factor at all — corroborating an ask nobody proved would mint evidence
+    // against a forgeable name.
+    let self_evidence = esc.asker_basis != crate::arbiter::AskerBasis::Asserted
+        && arb.plugin_id == esc.plugin_id;
+    let independence = if self_evidence {
+        None
+    } else {
+        Some(match eligibility(&AppealParties {
+            appellant: &esc.plugin_id,
+            appellant_basis: esc.asker_basis,
+            deny_adjudicator: None,
+            arbiter: &arb.plugin_id,
+        }) {
+            Eligibility::Eligible { independence } => independence,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "you may not corroborate this: {other:?}. Evidence about your own gate write \
+                     is not a second factor — it is the first one wearing a hat."
+                ));
+            }
+        })
     };
 
     // The stance is the CALLER'S, verbatim — this used to be a hardcoded `false` ("this MCP
@@ -29982,15 +32440,27 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         .and_then(|sess| sess.host_session_id.clone())
         .filter(|v| !v.trim().is_empty());
 
-    match s.gate_escalations.corroborate(
-        &escalation_id,
-        &arb.plugin_id,
-        &arb.role_lct,
-        Some(independence),
-        dissent,
-        argument.as_deref(),
-        now,
-    ) {
+    let updated = if self_evidence {
+        s.gate_escalations.corroborate_self(
+            &escalation_id,
+            &arb.plugin_id,
+            &arb.role_lct,
+            dissent,
+            argument.as_deref(),
+            now,
+        )
+    } else {
+        s.gate_escalations.corroborate(
+            &escalation_id,
+            &arb.plugin_id,
+            &arb.role_lct,
+            independence,
+            dissent,
+            argument.as_deref(),
+            now,
+        )
+    };
+    match updated {
         Ok(updated) => {
             let stance = if dissent { "dissent" } else { "concur" };
             let entry = s.append_chain(
@@ -30002,6 +32472,9 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "corroborated_role": arb.role_lct,
                     "corroborator_host_session_id": corroborator_host_session_id,
                     "independence": independence,
+                    "channel": if self_evidence { "self_evidence" } else { "peer_member" },
+                    "self_declared": self_evidence,
+                    "counts_toward_bar": !self_evidence,
                     // The peer's stance and argument, first-class on the event — a chain
                     // reader must never have to dig the only dissent out of a factor list
                     // to learn this entry was a disagreement.
@@ -30016,13 +32489,24 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "bar_met_if_decided_now": updated.bar_met(),
                 }),
             );
+            let witness_hash = match entry {
+                Ok(e) => e.hash,
+                Err(append_err) => {
+                    s.gate_escalations.undo_corroborate(esc);
+                    return Err(anyhow::anyhow!(
+                        "corroboration NOT recorded — its witness append failed ({append_err}); \
+                         the escalation is unchanged and no factor was added"
+                    ));
+                }
+            };
             Ok(json!({
                 "escalation_id": updated.id,
                 // `corroborated` keeps its original meaning — "your CONCURRENCE landed" —
-                // so existing concur callers read exactly what they always read. A dissent
-                // is recorded, not corroborated.
-                "corroborated": !dissent,
+                // so existing concur callers read exactly what they always read. A dissent or
+                // self-declared statement is evidence, not a peer corroboration (#935).
+                "corroborated": !dissent && !self_evidence,
                 "recorded": true,
+                "self_evidence": self_evidence,
                 "stance": stance,
                 "dissent": dissent,
                 "argument": argument,
@@ -30030,8 +32514,11 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "post_claim": updated.consumed_at.is_some(),
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
-                "witnessEntryHash": entry.ok().map(|e| e.hash),
-                "note": if dissent {
+                "witnessEntryHash": witness_hash,
+                "note": if self_evidence {
+                    "your statement is ON THE RECORD as SELF-DECLARED evidence, not a peer \
+                     corroboration: it counts toward no approval bar"
+                } else if dissent {
                     "your dissent is ON THE RECORD as evidence for review — never a veto: \
                      the sovereign decision stands or lands regardless, with your argument \
                      visible to the decider"
@@ -30042,6 +32529,120 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod gate_evaluate_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState) -> String {
+        tool_connect(state, &json!({"plugin_id": "codex", "host_agent": "test"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn society_deny_matches_live_and_has_no_decision_side_effects() {
+        let (_dir, state) = test_state().await;
+        let session = connect(&state).await;
+        let command = "rm -rf /home/user/data";
+        let expected = {
+            let published = state.published();
+            let who = published.resolve(Some(&session)).unwrap();
+            published.evaluate(&who.plugin_id, &who.role_lct, &crate::policy::PolicyAction {
+                tool_name: "Bash", category: "command", target: Some(command), full_command: Some(command),
+            })
+        };
+        assert_eq!(expected.decision, crate::policy::PolicyDecision::Deny);
+        let before = {
+            let s = state.lock().await;
+            (s.chain_store.len().unwrap(), s.actions.len(), s.scope_requests.len(),
+             s.gate_escalations.len(), format!("{:?}", s.scope_tally), s.trust_count(), s.trust("codex").action_count,
+             s.trust("codex").success_count, s.trust("codex").witness_count)
+        };
+        for _ in 0..2 {
+            let out = tool_gate_evaluate(&state, &json!({
+                "tool_name": "Bash", "command": command, "session_id": session,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(out["decision"], false, "{out}");
+            assert_eq!(out["society_law_allows"], false, "{out}");
+            assert_eq!(out["context"]["complete"], false, "{out}");
+            assert_eq!(out["context"]["verdict"], expected.decision.as_str(), "{out}");
+            assert_eq!(out["context"]["rule"], json!(expected.rule_id), "{out}");
+            assert_eq!(out["subject"]["id"], "codex", "{out}");
+            assert_eq!(out["context"]["stage"], "society_law", "{out}");
+            assert_eq!(out["context"]["not_evaluated"], json!(["local_mrh_scope", "governance_closure", "egress"]));
+            assert!(out["context"]["side_effects"].as_object().unwrap().values().all(|v| *v == false));
+            assert_eq!(out["permits"], false, "{out}");
+            assert!(out["r6"]["rules"]["law_generation"].as_str().unwrap().starts_with("policy:sha256:"));
+        }
+        let after = {
+            let s = state.lock().await;
+            (s.chain_store.len().unwrap(), s.actions.len(), s.scope_requests.len(),
+             s.gate_escalations.len(), format!("{:?}", s.scope_tally), s.trust_count(), s.trust("codex").action_count,
+             s.trust("codex").success_count, s.trust("codex").witness_count)
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn bad_inputs_and_local_scope_are_named_without_opening_anything() {
+        let (_dir, state) = test_state().await;
+        let session = connect(&state).await;
+        let before = state.lock().await.chain_store.len().unwrap();
+        let unattributed = tool_gate_evaluate(&state, &json!({"tool_name": "Read", "target": "/x"}))
+            .await
+            .unwrap();
+        assert_eq!(unattributed["_hestia_error"]["code"], "hestia.gate_evaluate_unattributed");
+        let unknown = tool_gate_evaluate(&state, &json!({
+            "tool_name": "Read", "target": "/x", "session_id": session, "plugin_id": "someone-else",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.gate_evaluate_unknown_arg");
+        assert_eq!(unknown["_hestia_error"]["data"]["unknownKeys"], json!(["plugin_id"]));
+        let unevaluable = tool_gate_evaluate(&state, &json!({"tool_name": "Bash", "session_id": session}))
+            .await
+            .unwrap();
+        assert_eq!(unevaluable["context"]["unevaluable"], true, "{unevaluable}");
+        assert_eq!(unevaluable["context"]["evaluated"], false, "{unevaluable}");
+        assert_eq!(unevaluable["context"]["complete"], false, "{unevaluable}");
+        assert_eq!(unevaluable["decision"], false, "{unevaluable}");
+        assert_eq!(unevaluable["society_law_allows"], false, "{unevaluable}");
+        assert_eq!(unevaluable["permits"], false, "{unevaluable}");
+        let outside = tool_gate_evaluate(&state, &json!({
+            "tool_name": "Read", "target": "/outside", "session_id": session,
+        }))
+        .await
+        .unwrap();
+        assert!(outside["context"]["not_evaluated"].as_array().unwrap().contains(&json!("local_mrh_scope")));
+        assert_eq!(outside["context"]["complete"], false, "{outside}");
+        assert_eq!(outside["society_law_allows"], true, "{outside}");
+        assert_eq!(outside["decision"], false, "{outside}");
+        assert_eq!(outside["permits"], false);
+        {
+            let s = state.lock().await;
+            assert!(matches!(space_of(&s, "codex", "/outside"), SpaceAnswer::Outside));
+        }
+        let s = state.lock().await;
+        assert_eq!(s.chain_store.len().unwrap(), before);
+        assert!(s.actions.is_empty() && s.scope_requests.is_empty() && s.gate_escalations.is_empty());
+        assert!(s.scope_tally.is_empty());
     }
 }
 
@@ -30180,6 +32781,213 @@ mod standing_scope_surface_tests {
         let s = state.lock().await;
         assert_eq!(s.scope_requests[&late].granted, None, "a refused decide must not mark the ask");
         assert_eq!(s.scope_requests[&late].expires_at, before - 1);
+    }
+
+    const ORIGINAL_REFUSAL_REASON: &str = "the original act concerned a different file";
+
+    async fn standing_refusal_fixture() -> (TempDir, SharedState, String) {
+        let (dir, shared) = test_state().await;
+        let target = dir.path().join("visible.txt");
+        std::fs::write(&target, "visible").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        shared.lock().await.standing_scope.refusals.push(
+            crate::server::standing_scope::StandingRefusal {
+                member: "cbp-being".into(),
+                path: path.clone(),
+                recursive: false,
+                refused_at: 1,
+                refused_by: "peer:claude-code".into(),
+                reason: ORIGINAL_REFUSAL_REASON.into(),
+                request_id: None,
+                modes: Some(crate::server::grant_modes::Modes::READ),
+            },
+        );
+        (dir, shared, path)
+    }
+
+    #[tokio::test]
+    async fn a_standing_scope_refusal_separates_the_frozen_reason_from_the_next_step() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        let chain_before = shared.lock().await.chain_len();
+        let out = tool_request_scope(
+            &shared,
+            &json!({
+                "plugin_id": "cbp-being", "path": path,
+                "reason": "find the notes directory for this task",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["status"], "refused_standing", "{out}");
+        assert_eq!(out["reason"], ORIGINAL_REFUSAL_REASON, "{out}");
+        let next = out["next"].as_str().unwrap();
+        assert!(next.contains("memory_read path=<held-directory>"), "{out}");
+        assert!(next.contains("start_line"), "{out}");
+        assert_eq!(shared.lock().await.chain_len(), chain_before);
+    }
+
+    #[tokio::test]
+    async fn a_standing_gate_refusal_computes_next_from_the_current_act() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        let chain_before = shared.lock().await.chain_len();
+        let claim = |tool: &str, act: &str| {
+            json!({
+                "plugin_id": "cbp-being", "path": path, "rule": "mrh.path",
+                "tool_name": tool, "act": act, "act_digest": "a".repeat(64),
+                "spend": false,
+            })
+        };
+        let search = tool_scope_claim(&shared, &claim("search", "search -> visible.txt"))
+            .await
+            .unwrap();
+        assert_eq!(search["verdict"], "refused", "{search}");
+        assert_eq!(search["standing"], true, "{search}");
+        assert_eq!(search["reason"], ORIGINAL_REFUSAL_REASON, "{search}");
+        assert!(search["next"].as_str().unwrap().contains("repeating this search"), "{search}");
+        let detail = search["detail"].as_str().unwrap();
+        assert!(detail.contains(ORIGINAL_REFUSAL_REASON), "{search}");
+        assert!(detail.contains("memory_read path=<held-directory>"), "{search}");
+        assert!(detail.contains("start_line"), "{search}");
+
+        let read = tool_scope_claim(&shared, &claim("Read", "Read -> visible.txt"))
+            .await
+            .unwrap();
+        assert_eq!(read["reason"], search["reason"], "{read}");
+        assert_ne!(read["next"], search["next"], "{read}");
+        assert!(read["next"].as_str().unwrap().contains("for a directory listing"), "{read}");
+        assert_eq!(shared.lock().await.chain_len(), chain_before);
+    }
+
+    #[tokio::test]
+    async fn standing_guidance_does_not_offer_sage_verbs_to_other_hosts() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        shared.lock().await.standing_scope.refusals.push(
+            crate::server::standing_scope::StandingRefusal {
+                member: "kimi-code".into(),
+                path: path.clone(),
+                recursive: false,
+                refused_at: 1,
+                refused_by: "operator".into(),
+                reason: ORIGINAL_REFUSAL_REASON.into(),
+                request_id: None,
+                modes: Some(crate::server::grant_modes::Modes::READ),
+            },
+        );
+        for tool in ["search", "Read"] {
+            let out = tool_scope_claim(&shared, &json!({
+                "plugin_id": "kimi-code", "path": path, "rule": "mrh.path",
+                "tool_name": tool, "act": format!("{tool} -> visible.txt"),
+                "act_digest": "a".repeat(64), "spend": false,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(out["standing"], true, "{out}");
+            let next = out["next"].as_str().unwrap();
+            assert!(!next.contains("memory_read") && !next.contains("start_line"), "{out}");
+            assert!(!next.contains(&path), "the refused target is not the recovery target: {out}");
+            if tool == "search" {
+                assert!(next.contains("hestia_scope_status") && next.contains("narrower"), "{out}");
+            } else {
+                assert!(next.contains("your host's supported listing operation"), "{out}");
+            }
+        }
+    }
+
+    /// SAGE #707 landed in SAGE's shared dispatcher, so the paged directory verb belongs to
+    /// every SAGE being, not to one member id. The negative controls are ids that merely
+    /// resemble the `<machine>-being` convention.
+    #[tokio::test]
+    async fn standing_guidance_offers_the_sage_verb_to_every_sage_being() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        let members = [
+            ("mcnugget-being", true), ("hub-being", true), ("cbp-being", true),
+            ("-being", false), ("being", false), ("cbp-being-helper", false),
+            ("kimi-code", false),
+        ];
+        for (member, sage) in members {
+            if member != "cbp-being" {
+                shared.lock().await.standing_scope.refusals.push(
+                    crate::server::standing_scope::StandingRefusal {
+                        member: member.into(),
+                        path: path.clone(),
+                        recursive: false,
+                        refused_at: 1,
+                        refused_by: "operator".into(),
+                        reason: ORIGINAL_REFUSAL_REASON.into(),
+                        request_id: None,
+                        modes: Some(crate::server::grant_modes::Modes::READ),
+                    },
+                );
+            }
+            for tool in ["search", "Read"] {
+                let out = tool_scope_claim(&shared, &json!({
+                    "plugin_id": member, "path": path, "rule": "mrh.path",
+                    "tool_name": tool, "act": format!("{tool} -> visible.txt"),
+                    "act_digest": "a".repeat(64), "spend": false,
+                }))
+                .await
+                .unwrap();
+                assert_eq!(out["standing"], true, "{member} {tool}: {out}");
+                let next = out["next"].as_str().unwrap();
+                let detail = out["detail"].as_str().unwrap();
+                let offered = next.contains("memory_read path=<held-directory>")
+                    && next.contains("start_line");
+                assert_eq!(offered, sage, "{member} {tool}: {out}");
+                assert_eq!(detail.contains("memory_read"), sage, "{member} {tool}: {out}");
+                assert!(!next.contains(&path), "{member} {tool}: {out}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_search_guidance_uses_held_targets_without_listing_secret_parents() {
+        let (_dir, shared) = test_state().await;
+        let parent = _dir.path().join("private-parent");
+        let held = parent.join("held");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("notes.txt"), "held").unwrap();
+        std::fs::write(parent.join("sibling-secret.txt"), "not for the next hint").unwrap();
+        let parent = parent.to_string_lossy().into_owned();
+        let held = held.to_string_lossy().into_owned();
+        {
+            let mut s = shared.lock().await;
+            s.standing_scope.refusals.push(crate::server::standing_scope::StandingRefusal {
+                member: "cbp-being".into(),
+                path: parent.clone(),
+                recursive: true,
+                refused_at: 1,
+                refused_by: "operator".into(),
+                reason: "the parent is not a member's search root".into(),
+                request_id: None,
+                modes: Some(crate::server::grant_modes::Modes::READ),
+            });
+            let mut grant = standing(
+                "cbp-being", &held, crate::server::gate_escalation::now_secs(), None);
+            grant.recursive = true;
+            s.standing_scope.add(grant);
+            assert!(s.has_scope_grant("cbp-being", &held));
+            assert!(!s.has_scope_grant("cbp-being", &parent));
+        }
+        let status = tool_scope_status(&shared, &json!({"plugin_id": "cbp-being"}))
+            .await
+            .unwrap();
+        assert!(status["grants_by_mode"].as_array().unwrap().iter().any(|g| {
+            g["path"] == held && g["modes"].as_str().is_some_and(|m| m.contains('r'))
+        }), "the hinted discovery route must expose the narrower held target: {status}");
+
+        let out = tool_scope_claim(&shared, &json!({
+            "plugin_id": "cbp-being", "path": parent, "rule": "mrh.path",
+            "tool_name": "search", "act": "search -> private-parent",
+            "act_digest": "a".repeat(64), "spend": false,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(out["standing"], true, "{out}");
+        let next = out["next"].as_str().unwrap();
+        assert!(next.contains("effective grants") && next.contains("<held-directory>"), "{out}");
+        assert!(!next.contains(&parent) && !next.contains(&held), "{out}");
+        assert!(!next.contains("private-parent") && !next.contains("sibling-secret.txt"), "{out}");
+        assert!(!out["detail"].as_str().unwrap().contains("sibling-secret.txt"), "{out}");
     }
 
     /// (e) `hestia_scope_status` carries BOTH lists, additively: `live_grants` keeps its
@@ -30374,6 +33182,117 @@ mod standing_scope_surface_tests {
         assert!(by_mode.iter().any(|f| f["path"] == "/w/governance/hestia" && f["modes"] == "r"));
         assert!(by_mode.iter().any(|f| f["path"] == "/w/shared" && f["modes"] == "rwed"));
         assert_eq!(out["society_floor_withheld"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn scope_status_reports_unresolvable_floor_entries_without_filtering_them() {
+        let (dir, state) = test_state().await;
+        let live = dir.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let missing = dir.path().join("missing");
+        let live = live.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: live.clone(), recursive: true, ..Default::default()
+            });
+            s.standing_scope.floor_add(FloorEntry {
+                path: missing.clone(), recursive: true, ..Default::default()
+            });
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        assert_eq!(out["society_floor"].as_array().map(Vec::len), Some(2),
+                   "reporting does not remove an entry from the additive floor");
+        let unresolved = &out["society_floor_unresolvable"];
+        assert_eq!(unresolved["count"], 1);
+        let rows = unresolved["entries"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], missing);
+        assert_eq!(rows[0]["kind"], "missing");
+        assert!(!rows[0]["error"].as_str().unwrap().is_empty());
+        assert_eq!(unresolved["status"], "complete");
+        assert_eq!(unresolved["checked"], 2);
+        assert_eq!(unresolved["unchecked"], 0);
+        assert_eq!(out["society_floor_digest"], state.lock().await.standing_scope.floor_digest());
+    }
+
+    /// Classification, then the three bounds. The bound cases use a private slot, so a pass they
+    /// leave running cannot make another test's status read wait.
+    #[tokio::test]
+    async fn floor_resolution_classifies_and_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let live = dir.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let dangling = dir.path().join("dangling");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        let good_link = dir.path().join("good-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&live, &good_link).unwrap();
+        // A file where a directory component is expected: ENOTDIR, neither missing nor a link.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+
+        let out = floor_resolution_report(vec![
+            s(live.clone()), s(dir.path().join("missing")), s(dangling.clone()),
+            s(good_link.clone()), s(file.join("below")),
+        ]).await;
+        assert_eq!(out["status"], "complete", "{out}");
+        let kind = |p: &std::path::Path| out["entries"].as_array().unwrap().iter()
+            .find(|r| r["path"] == s(p.to_path_buf())).map(|r| r["kind"].as_str().unwrap().to_string());
+        assert_eq!(kind(&live), None, "a live path is not reported");
+        assert_eq!(kind(&dir.path().join("missing")).as_deref(), Some("missing"));
+        #[cfg(unix)]
+        {
+            assert_eq!(kind(&dangling).as_deref(), Some("dangling_link"));
+            assert_eq!(kind(&good_link), None, "a link that resolves is not reported");
+            assert_eq!(kind(&file.join("below")).as_deref(), Some("unreadable"));
+            assert_eq!(out["count"], 3);
+        }
+        // The error text is the OS's, which does not repeat the path: nothing beyond what
+        // `society_floor` already tells this caller.
+        for r in out["entries"].as_array().unwrap() {
+            assert!(!r["error"].as_str().unwrap().contains(dir.path().to_str().unwrap()), "{r}");
+        }
+
+        // Bound 1: the entry cap. Unchecked entries are counted, never dropped silently.
+        let many: Vec<String> = (0..FLOOR_RESOLUTION_MAX + 3)
+            .map(|i| s(dir.path().join(format!("m{i}")))).collect();
+        let out = floor_resolution_report(many).await;
+        assert_eq!(out["status"], "truncated");
+        assert_eq!(out["checked"], FLOOR_RESOLUTION_MAX);
+        assert_eq!(out["unchecked"], 3);
+        assert_eq!(out["count"], FLOOR_RESOLUTION_MAX);
+
+        // Bound 2: a lookup that does not return costs the caller the budget, and the answer is
+        // UNKNOWN (count null), not "nothing unresolvable".
+        fn slow(_: &str) -> Option<Value> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            None
+        }
+        let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let short = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let out = floor_resolution_report_with(vec![s(live.clone())], short, slot.clone(), slow).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(300), "{:?}", started.elapsed());
+        assert_eq!(out["status"], "timed_out");
+        assert!(out["count"].is_null(), "an unfinished pass must not report a count: {out}");
+        assert_eq!(out["unchecked"], 1);
+
+        // Bound 3: while that pass is still out it holds the slot, so the next read does not
+        // start a second blocking pass. It waits its budget and is also UNKNOWN.
+        assert_eq!(slot.available_permits(), 0, "the abandoned pass still owns the slot");
+        let out = floor_resolution_report_with(vec![s(live.clone())], short, slot.clone(), floor_path_defect).await;
+        assert_eq!(out["status"], "timed_out");
+        assert!(out["count"].is_null());
+
+        // And the slot comes back when the slow pass ends.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let out = floor_resolution_report_with(vec![s(live)], short, slot, floor_path_defect).await;
+        assert_eq!(out["status"], "complete");
+        assert_eq!(out["count"], 0);
     }
 
     /// dp, 2026-10-23: "'floor' should not override the actual grants." A member whose own
@@ -31300,9 +34219,9 @@ mod disposition_durability_tests {
     }
 
     /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never
-    /// change an answer" — was only ever asserted over `status_of`. The resolver is
-    /// the new reader: the SAME escalation must read the same before the reap (live
-    /// store) and after it (witness chain).
+    /// change an answer" — was only ever asserted over `status_of`. Status and answer
+    /// guidance survive the move to chain history; detailed rationale follows the
+    /// original-asking-session rule rather than becoming anonymous when the row is reaped.
     #[tokio::test]
     async fn a_reaped_escalation_reads_the_same_from_the_chain() {
         let (_dir, state) = test_state().await;
@@ -31338,14 +34257,16 @@ mod disposition_durability_tests {
             "reaping can never change an answer — now pinned over the resolver, not \
              only over status_of"
         );
-        assert_eq!(after["stated_reason"], "needed the governance file");
+        assert_eq!(after["stated_reason"], Value::Null,
+            "an anonymous resource read does not reveal historical rationale");
+        assert_eq!(after["historical_details_proven"], false);
         assert_eq!(after["plugin_id"], "kimi-code");
         assert_eq!(after["how_to_answer"], before["how_to_answer"]);
     }
 
     /// Change 1, the decided case: the disposition notice outlives the store row by
-    /// days, so the pointer it carries must still resolve — verdict, decider and
-    /// rationale served from the chain entries.
+    /// days, so the pointer still resolves its verdict and decider. Detailed rationale
+    /// and factors require the original asking session on this path too (#1725).
     #[tokio::test]
     async fn a_decided_escalation_resolves_from_the_chain_after_the_reap() {
         let (_dir, state) = test_state().await;
@@ -31378,7 +34299,11 @@ mod disposition_durability_tests {
         assert_eq!(body["source"], "witness_chain");
         assert_eq!(body["status"], "denied");
         assert_eq!(body["decided_by"], "operator");
-        assert_eq!(body["reason"], "the diff widens more than the ask stated");
+        assert_eq!(body["reason"], Value::Null,
+            "verdict metadata remains public without the private rationale");
+        assert_eq!(body["factors_present"], Value::Null);
+        assert_eq!(body["settled_entry"], Value::Null,
+            "the raw terminal row cannot bypass the visibility rule");
     }
 
     /// Change 1, scope arm: same fallback, and the not-found arm must stop saying
@@ -31680,6 +34605,71 @@ mod disposition_durability_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_failed_moot_update_rolls_back_and_rebuilds_after_restart() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, ruling_hash, ruling_pos) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            assert_eq!(project_dispositions(&handles.0, &handles.1).unwrap().projected, 0);
+            s.inbox_store.enqueue_member(
+                "kimi-code", "claude-code", "role:constellation:interactive-dev",
+                "review_request", Some("hestia://escalation/esc-rollback#corroborate-or-dissent"),
+                "ask-rollback", None,
+            ).unwrap();
+            let e = s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": "esc-rollback", "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit", "status": "approved", "decided_by": "operator",
+                }),
+            ).unwrap();
+            (handles.0, handles.1, e.hash, e.chain_position)
+        };
+
+        let injected = raw_inbox_conn(&dir);
+        injected.execute_batch(
+            "CREATE TRIGGER fail_moot_update BEFORE UPDATE OF mooted_at, moot_reason ON member_notices
+             BEGIN SELECT RAISE(FAIL, 'injected moot update'); END;",
+        ).unwrap();
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                ensure_disposition(&s, "kimi-code", "hestia://escalation/esc-rollback#decided", &ruling_hash),
+                None,
+            );
+        }
+        assert_eq!(count_dispositions(&injected, false), 0, "the disposition insert rolled back");
+        let mooted_at: Option<String> = injected.query_row(
+            "SELECT mooted_at FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(mooted_at.is_none(), "the failed moot update rolled back too");
+        injected.execute_batch("DROP TRIGGER fail_moot_update").unwrap();
+        assert_eq!(inbox.projection_cursor("disposition").unwrap(), Some(ruling_pos));
+
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1);
+        assert_eq!(pass.advanced_to, ruling_pos + 1);
+        drop(injected);
+        drop(state);
+
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.inbox_store.clone())
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 0);
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(count_dispositions(&conn, false), 1);
+        let moot_reason: String = conn.query_row(
+            "SELECT moot_reason FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(moot_reason.contains(&ruling_hash), "the rebuilt moot evidence lost its ruling: {moot_reason}");
+    }
+
     /// Reviewer test 2: a restart between the ruling and the projection — the
     /// cursor lives in inbox.db, so the new daemon resumes it and inserts exactly
     /// one disposition.
@@ -31979,6 +34969,45 @@ mod disposition_durability_tests {
     /// one that matters: "the deadline passed with no decision" is TRUE over a
     /// petition a peer looked at, argued against, and left short of its bar, and a
     /// reader that cannot see the factor scores that as society-wide silence.
+    /// #935: an ask that only its own asker spoke on must not lapse looking like an ask a
+    /// peer answered. Control arm: the same statement from a peer DOES count.
+    #[tokio::test]
+    async fn the_expiry_row_counts_self_evidence_apart_from_peer_answers() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+
+        let own = witness_open(&mut s, "kimi-code", None, real_now - 100, 200);
+        s.gate_escalations
+            .corroborate_self(&own, "kimi-code", "role:constellation:member", false,
+                Some("I think this is fine"), real_now - 50)
+            .expect("the asker may state its case");
+        let peer = witness_open(&mut s, "claude-code", None, real_now - 100, 200);
+        s.gate_escalations
+            .corroborate(&peer, "codex", "role:constellation:member", None, false,
+                Some("I think this is fine"), real_now - 50)
+            .expect("a peer may answer");
+
+        assert_eq!(record_newly_lapsed(&mut s, real_now + 300), 2);
+        let rows: Vec<_> = s.recent_chain(40).into_iter()
+            .filter(|e| e.event_type == "gate_escalation_expired").collect();
+        let row = |id: &str| rows.iter()
+            .find(|e| e.event_data.get("escalation_id").and_then(Value::as_str) == Some(id))
+            .unwrap_or_else(|| panic!("no expiry row for {id}")).event_data.clone();
+        let count = |r: &Value, k: &str| r.get(k).and_then(Value::as_u64);
+
+        let a = row(&own);
+        assert_eq!(count(&a, "factors_present"), Some(1), "the statement is on the record: {a}");
+        assert_eq!(count(&a, "factors_self_evidence"), Some(1), "{a}");
+        assert_eq!(count(&a, "factors_concurring"), Some(0), "nobody else concurred: {a}");
+        assert_eq!(count(&a, "factors_dissenting"), Some(0), "{a}");
+
+        let b = row(&peer);
+        assert_eq!(count(&b, "factors_self_evidence"), Some(0), "{b}");
+        assert_eq!(count(&b, "factors_concurring"), Some(1), "{b}");
+    }
+
     #[tokio::test]
     async fn the_expiry_row_records_the_bar_and_the_evidence_that_was_present() {
         let (dir, _) = super::inbox_tests::seeded_home();
@@ -32208,7 +35237,10 @@ mod disposition_durability_tests {
         assert_eq!(body["status"], "approved", "the settlement is found, however deep: {body}");
         assert_eq!(body["decided_by"], "operator");
         assert_eq!(body["claimed"], true, "and the spend: {body}");
-        assert_eq!(body["stated_reason"], "deep record");
+        assert_eq!(body["stated_reason"], Value::Null,
+            "deep recovery does not disclose rationale to an anonymous reader");
+        assert_eq!(body["settled_entry"], Value::Null);
+        assert_eq!(body["historical_details_proven"], false);
         assert_eq!(body["complete"], true);
 
         // An id nobody ever opened: absent over the whole chain, and the envelope says so.
@@ -32414,42 +35446,40 @@ mod disposition_durability_tests {
     }
 
     /// Item 4 (revised review): the chain fallback carries the SAME decided-record
-    /// fields the live arm does — `factors_present` and `decided_at` included.
+    /// fields the live arm does for the original asking session, while an anonymous
+    /// read gets terminal truth without the private evidence.
     #[tokio::test]
     async fn the_chain_fallback_carries_the_decided_record_fields() {
-        let (_dir, state) = test_state().await;
-        let real_now = now_secs();
-        let id = {
-            let mut s = state.lock().await;
-            let id = witness_open(&mut s, "kimi-code", None, real_now - 3 * 3600, 3600);
-            s.append_chain(
-                "gate_escalation_decided",
-                json!({
-                    "escalation_id": id, "plugin_id": "kimi-code", "tool_name": "policy_edit",
-                    "marker": "policy.json", "status": "approved", "decided_by": "operator",
-                    "decided_at": real_now - 2 * 3600,
-                    "factors_present": [{"channel": "operator_session", "by": "operator",
-                                         "dissent": false, "at": real_now - 2 * 3600}],
-                    "reason": "reviewed the diff",
-                }),
-            )
-            .unwrap();
-            id
-        };
+        let (_dir, shared, session, id, _opened) = super::tests::reaped_poll_subject().await;
+        let decided_at = now_secs();
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "tool_name": "policy_edit",
+                "marker": "policy.json", "status": "approved", "decided_by": "operator",
+                "decided_at": decided_at,
+                "factors_present": [{"channel": "operator_session", "by": "operator",
+                                     "dissent": false, "at": decided_at}],
+                "reason": "reviewed the diff",
+            }),
+        )
+        .unwrap();
 
-        let mut s = state.lock().await;
-        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
-        assert!(s.gate_escalations.get(&id).is_none());
-
-        let body = resolve_escalation_pointer(&s, &id);
+        let s = shared.lock().await;
+        let body = resolve_escalation_pointer_for_session(&s, &id, Some(&session));
         assert_eq!(body["source"], "witness_chain");
         assert_eq!(body["status"], "approved");
-        assert_eq!(body["decided_at"], json!(real_now - 2 * 3600), "{body}");
+        assert_eq!(body["decided_at"], json!(decided_at), "{body}");
         let factors = body["factors_present"]
             .as_array()
-            .expect("the evidence comes along, shape-parity with the live arm: {body}");
+            .unwrap_or_else(|| panic!("the evidence comes along, shape-parity with the live arm: {body}"));
         assert_eq!(factors[0]["by"], "operator");
         assert_eq!(factors[0]["dissent"], json!(false));
+
+        let anonymous = resolve_escalation_pointer(&s, &id);
+        assert_eq!(anonymous["source"], "witness_chain");
+        assert_eq!(anonymous["terminal"], true, "{anonymous}");
+        assert_eq!(anonymous["factors_present"], Value::Null, "{anonymous}");
     }
 
     /// #545: the covered set of `disposition_obligation`, pinned in BOTH directions —
@@ -34128,6 +37158,7 @@ mod decision_witness_tests {
             "target": "/tmp/x",
             "verdict_available": true,
             "attempted": "Write -> /tmp/x",
+            "attempted_exact": true,
         })
     }
 
@@ -36535,7 +39566,7 @@ mod verdict_feedback_tests {
         json!({
             "plugin_id": "codex", "decision": "deny", "adjudicator": "plugin-gate:codex",
             "reason": "r", "rule_id": rule_id, "tool_name": "Read", "target": "/home/x/.ssh/id",
-            "attempted": "Read -> /home/x/.ssh/id", "serves": "q7",
+            "attempted": "Read -> /home/x/.ssh/id", "attempted_exact": true, "serves": "q7",
         })
     }
 
@@ -36609,6 +39640,107 @@ mod verdict_feedback_tests {
             "different long attempts must not share a digest");
         assert_eq!(second["feedback"]["repeat_of"], Value::Null,
             "a shared capped prefix is not a repeated act: {second}");
+    }
+
+    #[tokio::test]
+    async fn sender_whitespace_normalisation_is_not_exact_on_the_witness_route() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut hashes = Vec::new();
+        for _ in 0..2 {
+            let mut args = witnessed("mrh.path");
+            args["tool_name"] = json!("Bash");
+            args["attempted"] = json!("Bash: printf 'alpha beta'");
+            args["attempted_exact"] = json!(false);
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            let got = tool_witness_decision(&state, &args).await.unwrap();
+            hashes.push(got["witnessEntryHash"].as_str().unwrap().to_string());
+        }
+        let (a, b) = (row(&state, &hashes[0]).await, row(&state, &hashes[1]).await);
+        assert_eq!(a["feedback"]["act"], b["feedback"]["act"],
+            "precondition: whitespace-distinct raw acts have one normalized digest");
+        for r in [&a, &b] {
+            assert_eq!(r["act_exact"], json!(false), "sender normalization was lost: {r}");
+        }
+
+        let mut exact = witnessed("mrh.path");
+        exact["attempted_exact"] = json!(true);
+        let got = tool_witness_decision(&state, &exact).await.unwrap();
+        assert_eq!(row(&state, got["witnessEntryHash"].as_str().unwrap()).await["act_exact"],
+            json!(true), "an explicit lossless sender remains exact");
+
+        let mut legacy = witnessed("mrh.path");
+        legacy.as_object_mut().unwrap().remove("attempted_exact");
+        let got = tool_witness_decision(&state, &legacy).await.unwrap();
+        assert_eq!(row(&state, got["witnessEntryHash"].as_str().unwrap()).await["act_exact"],
+            json!(false), "an older sender without the field is conservatively inexact");
+    }
+
+    /// NOVA's re-review of 7c73d48c9: a mask PAST the 400-char display cut. Two acts that differ
+    /// only in a credential value there share `feedback.act` (the digest is over the redacted
+    /// whole) while both rows' `attempted` prefixes are clean, so no reader of the row can see the
+    /// mask. The producer, which still holds the whole input, says so in `act_exact`, and the
+    /// retry predicate then refuses the digest as identity.
+    #[tokio::test]
+    async fn a_mask_past_the_display_cut_is_recorded_and_defeats_digest_identity() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let pad = "x".repeat(ATTEMPTED_MAX + 20);
+        let mut hashes = Vec::new();
+        for value in ["AAAA", "BBBB"] {
+            let mut args = witnessed("mrh.path");
+            args["tool_name"] = json!("Bash");
+            args["target"] = json!("curl");
+            args["session_id"] = json!("s-mask");
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            args["attempted"] = json!(format!("curl {pad} --token {value}"));
+            let got = tool_witness_decision(&state, &args).await.unwrap();
+            assert_eq!(got["recorded"], json!("appended"), "{got}");
+            hashes.push(got["witnessEntryHash"].as_str().unwrap().to_string());
+        }
+        let (a, b) = (row(&state, &hashes[0]).await, row(&state, &hashes[1]).await);
+        assert_eq!(a["feedback"]["act"], b["feedback"]["act"],
+            "precondition: the two tokens collapse to one redacted digest");
+        for r in [&a, &b] {
+            let shown = r["attempted"].as_str().unwrap();
+            assert!(!shown.contains("***") && !shown.contains("[REDACTED"),
+                "precondition: the mask is past the display cut: {shown}");
+            assert_eq!(r["act_exact"], json!(false), "the producer saw the mask: {r}");
+        }
+        let entries: Vec<_> = {
+            let s = state.lock().await;
+            s.recent_chain(500).into_iter().filter(|e| hashes.contains(&e.hash)).collect()
+        };
+        let role = a["role_lct"].as_str().unwrap_or_default().to_string();
+        let d = crate::derivation::derive_evidence("codex", &role, &entries);
+        assert!(!d.temperament.evidence.is_empty()
+                && d.temperament.evidence.iter().all(|e| e.contribution.starts_with("comply-after-deny")),
+            "two acts that share only a masked digest are not a retry: {d:?}");
+
+        // The same long attempt unmasked: the digest IS the act, and says so.
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["attempted"] = json!(format!("curl {pad} --verbose"));
+        let got = tool_witness_decision(&state, &args).await.unwrap();
+        let r = row(&state, got["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(true), "{r}");
+        // A gate summary bounded at its own cut is a digest of a summary, not of the act.
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["attempted"] = json!(format!("Bash: {} …", "x".repeat(214)));
+        let got = tool_witness_decision(&state, &args).await.unwrap();
+        let r = row(&state, got["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(false), "{r}");
+
+        // The daemon's own ruling path records the same provenance.
+        let sid = session(&state, "kimi-code").await;
+        let q = rule(&state, &sid, &format!("{DENY_CMD} {pad} --token CCCC"), None).await;
+        assert_eq!(q["decision"], json!("deny"), "precondition: {q}");
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert!(!r["attempted"].as_str().unwrap().contains("***"), "precondition: {r}");
+        assert_eq!(r["act_exact"], json!(false), "{r}");
+        let q = rule(&state, &sid, &format!("{DENY_CMD} {pad}"), None).await;
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["act_exact"], json!(true), "{r}");
     }
 
     #[tokio::test]

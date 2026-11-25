@@ -76,6 +76,40 @@ describe("Agents", () => {
     expect(screen.getByText(/--member hub-being/)).toBeTruthy();
   });
 
+  it("shows two beings independently, keyed by member identity", async () => {
+    const second: AgentRow = {
+      ...being,
+      plugin: "eps-ablated",
+      member: "eps-ablated",
+      governed: false,
+      findings: ["LAW-SOURCE: the second unit sets no HESTIA_HOME"],
+      launchers: [{
+        unit: "/home/dp/.config/systemd/user/eps-ablated.service", member: "eps-ablated",
+        members_in_unit: ["eps-ablated"], sets_hestia_env: false, enabled_on_disk: true,
+      }],
+    };
+    operatorStatus.mockResolvedValue(signedIn);
+    agentsInventory.mockResolvedValue(inventory([being, second]));
+    getDashboard.mockResolvedValue({ retired: [] });
+    render(<Agents />);
+    expect(await screen.findByText("eps-ablated")).toBeTruthy();
+    expect(screen.getByText("hub-being")).toBeTruthy();
+    expect(screen.getByText("UNGOVERNED")).toBeTruthy();
+    expect(document.querySelectorAll("tbody tr").length).toBe(2);
+    expect(document.querySelector('[data-agent="eps-ablated"]')).not.toBeNull();
+    expect(document.querySelector('[data-agent="hub-being"]')).not.toBeNull();
+  });
+
+  it("keeps the agent-name key on an ambiguous multi-member row", async () => {
+    const ambiguous: AgentRow = { ...being, agent: "multi", plugin: "", member: undefined };
+    operatorStatus.mockResolvedValue(signedIn);
+    agentsInventory.mockResolvedValue(inventory([ambiguous]));
+    getDashboard.mockResolvedValue({ retired: [] });
+    render(<Agents />);
+    expect(await screen.findByText("multi")).toBeTruthy();
+    expect(document.querySelector('[data-agent="multi"]')).not.toBeNull();
+  });
+
   it("flags an ungoverned agent with the inventory's findings in full", async () => {
     operatorStatus.mockResolvedValue(signedIn);
     agentsInventory.mockResolvedValue(inventory([claude, codex]));
