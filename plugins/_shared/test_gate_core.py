@@ -315,6 +315,250 @@ def test_path_and_command_scope():
     check("tmp_allows", G.evaluate(ev, prof, ws).decision == "allow")
 
 
+def test_bare_name_file_operands_in_an_ungranted_cwd():
+    """#1609: a slashless name reaches the same file as its `./` spelling.
+
+    The event cwd is outside every grant and is not a scratch root. Only the workspace is
+    granted recursively. Read operands are judged when they name an existing file; write
+    operands are judged even when the file does not exist yet.
+    """
+    ws = _workspace()
+    outside = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    scopes = ["path:" + ws + G.RECURSIVE_SUFFIX]
+    for name in ("notes.txt", "a.txt", "remove.txt"):
+        open(os.path.join(outside, name), "w").close()
+    open(os.path.join(outside, "{notes"), "w").close()
+    open(os.path.join(ws, "source.txt"), "w").close()
+    other = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    for name in ("secret.txt", "chdir-shared.txt"):
+        open(os.path.join(other, name), "w").close()
+    open(os.path.join(ws, "chdir-shared.txt"), "w").close()
+
+    def reach(command):
+        return G.command_scope_reach(command, scopes, ws, outside)
+
+    cases = (
+        ("bare_read", "cat notes.txt", "notes.txt"),
+        ("slashed_read_control", "cat ./notes.txt", "notes.txt"),
+        ("bare_redirect_to_a_new_file", "echo hi > out.txt", "out.txt"),
+        ("bare_tee_to_a_new_file", "tee tee-out.txt", "tee-out.txt"),
+        ("bare_copy_source", "cp a.txt b.txt", "a.txt"),
+        ("bare_copy_destination", f"cp {ws}/source.txt copy-out.txt", "copy-out.txt"),
+        ("bare_remove", "rm -f remove.txt", "remove.txt"),
+        ("literal_open_brace_read", "cat {notes", "{notes"),
+        ("literal_open_brace_write", "echo hi > {out", "{out"),
+        ("cp_backup_optional_argument_does_not_swallow_source",
+         f"cp --backup a.txt {ws}/copy-out.txt", "a.txt"),
+    )
+    for name, command, target in cases:
+        ok, offending, refused = reach(command)
+        expected = os.path.normpath(os.path.join(outside, target)).replace("\\", "/")
+        check(name, not ok and refused == expected,
+              f"{command!r}: ok={ok}, offending={offending!r}, refused={refused!r}; "
+              f"wanted {expected!r}")
+
+    grouped_cases = (
+        ("grouped_read", "{ cat notes.txt; }", "notes.txt"),
+        ("grouped_write", "{ rm -f remove.txt; }", "remove.txt"),
+        ("grouped_read_after_and", "true && { cat notes.txt; }", "notes.txt"),
+        ("grouped_tee_write", "{ tee tee-out.txt; }", "tee-out.txt"),
+        ("nested_grouped_read", "{ { cat notes.txt; }; }", "notes.txt"),
+        ("nested_grouped_write", "{ { rm -f remove.txt; }; }", "remove.txt"),
+        ("function_grouped_read", "f() { cat notes.txt; }; f", "notes.txt"),
+        ("function_grouped_write", "f() { rm -f remove.txt; }; f", "remove.txt"),
+        ("negated_grouped_read", "! { cat notes.txt; }", "notes.txt"),
+        ("timed_grouped_read", "time { cat notes.txt; }", "notes.txt"),
+        ("grouped_copy_write", f"{{ cp {ws}/source.txt copy-out.txt; }}", "copy-out.txt"),
+    )
+    wrapped_cases = (
+        ("exec_read", "exec cat notes.txt", "notes.txt"),
+        ("exec_write", "exec rm -f remove.txt", "remove.txt"),
+        ("command_read", "command cat notes.txt", "notes.txt"),
+        ("command_write", "command rm -f remove.txt", "remove.txt"),
+        ("nice_read", "nice cat notes.txt", "notes.txt"),
+        ("nice_write", "nice rm -f remove.txt", "remove.txt"),
+        ("env_read", "env cat notes.txt", "notes.txt"),
+        ("env_write", "env rm -f remove.txt", "remove.txt"),
+        ("timeout_read", "timeout 5 cat notes.txt", "notes.txt"),
+        ("timeout_write", "timeout 5 rm -f remove.txt", "remove.txt"),
+        ("nohup_write", "nohup rm -f remove.txt", "remove.txt"),
+        ("sudo_read", "sudo -n cat notes.txt", "notes.txt"),
+        ("timeout_signal_name_write", "timeout -s KILL 5 rm -f remove.txt", "remove.txt"),
+        ("env_unset_write", "env -u FOO rm -f remove.txt", "remove.txt"),
+        ("sudo_user_write", "sudo -u root rm -f remove.txt", "remove.txt"),
+        ("sudo_group_write", "sudo -g wheel rm -f remove.txt", "remove.txt"),
+        ("grouped_env_unset_write", "{ env -u FOO rm -f remove.txt; }", "remove.txt"),
+        ("stdbuf_output_write", "stdbuf -o L rm -f remove.txt", "remove.txt"),
+        ("env_split_write", "env -S 'rm -f remove.txt'", "remove.txt"),
+        ("sudo_user_read", "sudo -u root cat notes.txt", "notes.txt"),
+        ("env_unset_read", "env -u FOO cat notes.txt", "notes.txt"),
+        ("nice_non_numeric_write", "nice -n x rm -f remove.txt", "remove.txt"),
+        ("doas_user_write", "doas -u root rm -f remove.txt", "remove.txt"),
+        ("exec_name_write", "exec -a name cat notes.txt", "notes.txt"),
+        ("ionice_class_write", "ionice -c best-effort cat notes.txt", "notes.txt"),
+        ("env_chdir_does_not_leak_into_next_command", "env -C /tmp true; rm -f remove.txt", "remove.txt"),
+        ("env_chdir_does_not_leak_into_and_branch", "env -C /tmp true && cat notes.txt", "notes.txt"),
+        ("env_chdir_does_not_leak_into_pipe", "env -C /tmp true | tee leak-new.txt", "leak-new.txt"),
+        ("env_chdir_does_not_leak_into_group", "env -C /tmp true; { rm -f remove.txt; }", "remove.txt"),
+        ("later_env_chdir_does_not_relocate_earlier_write", "rm -f remove.txt; env -C /tmp true", "remove.txt"),
+        ("later_env_chdir_does_not_relocate_earlier_read", f"env -C {other} cat secret.txt; env -C /tmp true", f"{other}/secret.txt"),
+        ("env_unset_argument_is_not_the_command", "env -u cat tee wr-new.txt", "wr-new.txt"),
+        ("exec_name_argument_is_not_the_command", "exec -a cat tee wr-new.txt", "wr-new.txt"),
+        ("sudo_user_argument_is_not_the_command", "sudo -u cat tee wr-new.txt", "wr-new.txt"),
+        ("env_unset_argument_is_not_copy_source", f"env -u cat cp {ws}/source.txt cp-new.txt", "cp-new.txt"),
+        ("env_attached_split_write", "env -S'rm -f remove.txt'", "remove.txt"),
+        ("env_long_split_write", "env --split-string='rm -f remove.txt'", "remove.txt"),
+        ("env_combined_i_split_write", "env -iS 'rm -f remove.txt'", "remove.txt"),
+        ("env_combined_v_split_write", "env -vS 'rm -f remove.txt'", "remove.txt"),
+        ("env_long_attached_chdir_read", f"env --chdir={other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_short_attached_chdir_read", f"env -C{other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_combined_attached_chdir_read", f"env -iC{other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_quoted_attached_chdir_read", f"env -C'{other}' cat secret.txt", f"{other}/secret.txt"),
+        ("env_relative_attached_chdir_read", f"env --chdir=../{os.path.basename(other)} cat secret.txt", f"{other}/secret.txt"),
+        ("env_repeated_chdir_write", f"env -C /tmp -C{other} rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_attached_split_with_slash_write", "env -S'rm -f remove.txt sub/x'", "remove.txt"),
+        ("env_attached_split_with_absolute_path_write", "env -S'rm -f remove.txt /tmp/x'", "remove.txt"),
+        ("env_combined_iv_split_write", "env -ivS 'rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_split_write", "env --spl='rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_split_long_write", "env --split='rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_chdir_read", f"env --chd={other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_unset_long_write", "env --unset cat tee unset-new.txt", "unset-new.txt"),
+        ("env_unset_abbreviated_write", "env --uns cat tee unset-abbreviated-new.txt", "unset-abbreviated-new.txt"),
+        ("env_unset_shortest_unique_prefix_write", "env --u cat tee unset-prefix-new.txt", "unset-prefix-new.txt"),
+        ("env_attached_chdir_trailing_i_write", f"env -C{other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_long_chdir_trailing_i_write", f"env --chdir={other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_combined_chdir_trailing_i_write", f"env -iC{other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_long_chdir_double_dash_write", f"env --chdir={other} -- rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_attached_chdir_trailing_v_write", f"env -C{other} -v tee trailing-new.txt", f"{other}/trailing-new.txt"),
+        ("env_attached_chdir_trailing_unset_write", f"env -C{other} -u cat tee trailing-unset-new.txt", f"{other}/trailing-unset-new.txt"),
+        ("env_attached_chdir_trailing_i_read", f"env --chdir={other} -i cat secret.txt", f"{other}/secret.txt"),
+        ("env_attached_split_option_write", "env -S'-u cat tee split-option-new.txt'", "split-option-new.txt"),
+        ("env_long_split_option_write", "env --split-string='-i rm -f remove.txt'", "remove.txt"),
+        ("env_attached_split_chdir_read", f"env -S'-C {other} cat secret.txt'", f"{other}/secret.txt"),
+        ("env_attached_split_i_write", "env -S'-i rm -f remove.txt'", "remove.txt"),
+        ("env_i_cluster_unset_write", "env -iu cat tee cluster-unset-new.txt", "cluster-unset-new.txt"),
+        ("env_v_cluster_unset_write", "env -vu cat tee cluster-v-unset-new.txt", "cluster-v-unset-new.txt"),
+    )
+    for name, command, target in grouped_cases + wrapped_cases:
+        ok, offending, refused = reach(command)
+        expected = os.path.normpath(os.path.join(outside, target)).replace("\\", "/")
+        check(name, not ok and refused == expected,
+              f"{command!r}: ok={ok}, offending={offending!r}, refused={refused!r}; "
+              f"wanted {expected!r}")
+
+    # The event cwd is only a POSSIBLE working directory. An existing in-scope interpretation
+    # still wins, and a missing bare read target is not a new scope request (#1404).
+    for base in (ws, outside):
+        open(os.path.join(base, "shared.txt"), "w").close()
+    ok, offending, refused = reach("rm -f shared.txt")
+    expected = os.path.normpath(os.path.join(outside, "shared.txt")).replace("\\", "/")
+    check("bare_remove_does_not_use_an_in_scope_namesake",
+          not ok and refused == expected)
+    check("existing_in_scope_interpretation_still_allows", reach("cat shared.txt")[0])
+    check("missing_bare_read_target_is_not_a_new_ask", reach("cat absent.txt")[0])
+    check("echo_operands_remain_strings", reach("echo notes.txt")[0])
+    check("printf_operands_remain_strings", reach("printf '%s' notes.txt")[0])
+
+    check("sudo_echo_does_not_treat_rm_as_its_command", reach("sudo echo rm remove.txt")[0])
+    check("env_printf_does_not_treat_cat_as_its_command", reach("env printf '%s' cat notes.txt")[0])
+    check("timeout_echo_does_not_treat_tee_as_its_command", reach("timeout 5 echo tee new.txt")[0])
+    check("nice_true_does_not_treat_rm_as_its_command", reach("nice -n 5 true rm remove.txt")[0])
+    check("env_split_true_ends_option_parsing_at_the_command", reach("env -S'true' -i rm -f remove.txt")[0])
+    check("env_long_split_true_ends_option_parsing_at_the_command", reach("env --split-string=true -i rm -f remove.txt")[0])
+    unenumerated = scopes + ["path:" + G.UNENUMERATED_TARGET]
+    for name, command in (
+        ("env_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -S "rm -f $X remove.txt"'),
+        ("env_attached_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -S"rm -f $X remove.txt"'),
+        ("env_long_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env --split-string="rm -f $X remove.txt"'),
+        ("env_chdir_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -C "$D" rm -f remove.txt'),
+    ):
+        ok, offending, refused = reach(command)
+        check(name, not ok and refused == G.UNENUMERATED_TARGET
+              and offending.startswith(G._UNMODELLED_PREFIX), repr((ok, offending, refused)))
+        check(name + "_one_time_approval_can_be_spent",
+              G.command_scope_reach(command, unenumerated, ws, outside)[0])
+    check("lifted_unknown_chdir_still_judges_literal_paths",
+          not G.command_scope_reach(f'env -C "$D" cat {other}/secret.txt',
+                                    unenumerated, ws, outside)[0])
+    check("env_split_unterminated_quote_is_an_ordinary_unenumerated_refusal",
+          reach("env -S \"rm -f 'x\"")[2] == G.UNENUMERATED_TARGET)
+    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX,
+                          "path:" + other + G.RECURSIVE_SUFFIX]
+    check("an_explicit_cwd_grant_admits_the_same_read",
+          G.command_scope_reach("cat notes.txt", permitted, ws, outside)[0])
+    check("env_chdir_uses_its_actual_working_directory",
+          G.command_scope_reach("env -C /tmp rm -f remove.txt", scopes, ws, outside)[0])
+    check("env_attached_chdir_uses_its_actual_working_directory",
+          reach("env -C/tmp rm -f remove.txt")[0])
+    check("env_chdir_missing_read_target_is_not_a_new_ask",
+          reach(f"env --chdir={other} cat absent.txt")[0])
+    ok, offending, refused = reach(f"env --chdir={other} cat chdir-shared.txt")
+    expected = os.path.normpath(os.path.join(other, "chdir-shared.txt")).replace("\\", "/")
+    check("env_chdir_read_does_not_use_an_in_scope_namesake",
+          not ok and refused == expected, repr((ok, offending, refused, expected)))
+    check("an_explicit_cwd_grant_admits_the_same_new_write",
+          G.command_scope_reach("echo hi > permitted.txt", permitted, ws, outside)[0])
+    for name, command, _target in grouped_cases + wrapped_cases:
+        check(name + "_allowed_by_explicit_cwd_grant",
+              G.command_scope_reach(command, permitted, ws, outside)[0])
+
+    prof = _profile(ws, scopes)
+    v = G.evaluate(G.NormalizedEvent(tool="Bash", command="echo hi > evaluated.txt",
+                                    cwd=outside), prof, ws)
+    expected = os.path.normpath(os.path.join(outside, "evaluated.txt")).replace("\\", "/")
+    check("the_real_evaluate_path_refuses_and_names_the_bare_write_target",
+          v.blocks and v.rule == "mrh.command" and v.target == expected, repr(v))
+
+    repo = os.path.join(ws, "repo")
+    os.mkdir(repo)
+    open(os.path.join(ws, "outside"), "w").close()
+    repo_scopes = ["path:" + repo + G.RECURSIVE_SUFFIX]
+    check("quoted_commit_message_dotdot_is_data",
+          G.command_scope_reach('git commit -m "explain ../ word"', repo_scopes, ws, repo)[0])
+    check("git_pathspec_after_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m plain -- ../outside", repo_scopes, ws, repo)[0])
+
+    glob_dir = os.path.join(ws, "glob-outside")
+    os.mkdir(glob_dir)
+    for name in ("a.txt", "b.txt"):
+        open(os.path.join(glob_dir, name), "w").close()
+    check("quoted_glob_in_commit_message_is_data",
+          G.command_scope_reach('git commit -m "../glob-outside/*"', repo_scopes, ws, repo)[0])
+    check("unquoted_glob_in_commit_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/*", repo_scopes, ws, repo)[0])
+
+    check("unquoted_brace_list_in_commit_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a,b}.txt", repo_scopes, ws, repo)[0])
+    check("unquoted_brace_range_in_commit_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a..b}.txt", repo_scopes, ws, repo)[0])
+
+    check("quoted_brace_list_in_commit_message_is_data",
+          G.command_scope_reach('git commit -m "../glob-outside/{a,b}.txt"', repo_scopes, ws, repo)[0])
+    check("quoted_brace_range_in_commit_message_is_data",
+          G.command_scope_reach('git commit -m "../glob-outside/{a..b}.txt"', repo_scopes, ws, repo)[0])
+    check("partially_double_quoted_brace_expansion_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{a,"b"}.txt', repo_scopes, ws, repo)[0])
+    check("partially_single_quoted_brace_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a,'b'}.txt", repo_scopes, ws, repo)[0])
+
+    check("quoted_first_brace_item_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{"a",b}.txt', repo_scopes, ws, repo)[0])
+    check("escaped_space_brace_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a.txt,b\\ }", repo_scopes, ws, repo)[0])
+    check("double_quoted_open_brace_inside_expansion_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{a,"{"}.txt', repo_scopes, ws, repo)[0])
+    check("single_quoted_open_brace_inside_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a,'{'}.txt", repo_scopes, ws, repo)[0])
+    check("escaped_open_brace_inside_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a.txt,\\{}", repo_scopes, ws, repo)[0])
+    check("quoted_open_brace_inside_second_item_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{a,"b{"}.txt', repo_scopes, ws, repo)[0])
+
+
 def test_path_grant_reaches_a_sibling_of_the_repos():
     """`.git-inbox` is a sibling of the repos, so a repo: grant never reaches it — the exact
     refusal kimi hit on 2026-08-02 while reading the directory the push guard names."""
@@ -1311,6 +1555,7 @@ ALL_TESTS = [
     "test_egress_offers_no_door",
     "test_scope_remedy_distinguishes_itself_from_appeal",
     "test_path_and_command_scope",
+    "test_bare_name_file_operands_in_an_ungranted_cwd",
     "test_path_grant_reaches_a_sibling_of_the_repos",
     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
     "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
@@ -1390,6 +1635,7 @@ if __name__ == "__main__":
     test_egress_offers_no_door()
     test_scope_remedy_distinguishes_itself_from_appeal()
     test_path_and_command_scope()
+    test_bare_name_file_operands_in_an_ungranted_cwd()
     test_path_grant_reaches_a_sibling_of_the_repos()
     test_path_grants_keep_their_type_and_match_resolved_boundaries()
     test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()

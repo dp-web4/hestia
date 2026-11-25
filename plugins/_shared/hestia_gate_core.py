@@ -2053,12 +2053,14 @@ _LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
 #: quotes (no field splitting, no globbing at that use) — evidence the literal rule needs before a
 #: whitespace value may bind, and that a data position needs before an expansion is one argument.
 _DQ_REF = "\x04"
+#: An UNQUOTED opening brace in a word: prose-filter evidence only, not an enumeration claim.
+_BRACE_OPEN = "\x05"
 #: `$'…'` (ANSI-C) and `$"…"` (locale) quoting rewrite their content; never modelled. The word
 #: carries this unbound parameter reference, so wherever it is judged as a path it is
 #: unenumerated (`ANSI-C` is not an identifier: no assignment can ever bind it).
 _ANSI_C_MARK = "${ANSI-C}"
 #: Every byte the lexer uses as an IN-BAND marker (`_LIT_DOLLAR`, `\x01` in `_path_shaped`,
-#: `_LIT_TICK`, `_BRACE`, `_DQ_REF`) plus one spare. A command that already contains one could
+#: `_LIT_TICK`, `_BRACE`, `_DQ_REF`, `_BRACE_OPEN`). A command that already contains one could
 #: forge quote / literal evidence (Codex 20554: `cat \x04$S` read as a quoted use), so such a
 #: command is UNENUMERATED before any marker is inserted. (`_ANSI_C_MARK` is spelled in shell
 #: syntax; forging it only makes a word unenumerated, the strict direction.)
@@ -2198,8 +2200,10 @@ def _tokenize(text: str) -> list:
             continue
         if c in "*?[":
             uglob = True
-        if c == "{" and _BRACE_EXPANSION.match(text, i):
-            buf.append(_BRACE)                   # brace expansion: never modelled (dp, 2026-10-10)
+        if c == "{":
+            buf.append(_BRACE_OPEN)               # any unquoted open: prose filter stays conservative
+            if _BRACE_EXPANSION.match(text, i):
+                buf.append(_BRACE)               # brace expansion: never modelled (dp, 2026-10-10)
         buf.append(c)
         in_word = True
         i += 1
@@ -2534,7 +2538,8 @@ def _word_value(value: str, known=None) -> str:
             raise _Unenumerated(_expansion_kind(ref))
         last = b
     out.append(value[last:])
-    return ("".join(out).replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"))
+    return ("".join(out).replace(_DQ_REF, "").replace(_BRACE_OPEN, "")
+            .replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"))
 
 
 def _path_shaped(value: str, uglob: bool) -> bool:
@@ -3469,19 +3474,253 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 continue
             return (False,) + refused
 
+    cwd = (cwd or os.getcwd()).replace("\\", "/")
+    bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+    cwd_path = os.path.normpath(cwd).replace("\\", "/")
+    event_cwd = cwd_path
+    event_cwd_explicit = False
+    wrapper, wrapper_option = None, None
+    wrapper_option_error = False
+
+    # #1609: outside the workspace and every path grant, a slashless file operand resolves in
+    # this cwd just as its `./` spelling does. Existing read operands retain the existence vote:
+    # an existing in-scope interpretation wins, and a missing name is not a new scope request.
+    # A write names its destination even before that file exists, so judge it in the event cwd
+    # rather than inventing an in-scope destination under another plausible base.
+    if not (cwd_path == ws or cwd_path.startswith(ws + "/")
+            or _within_path_grant(cwd_path, scopes, workspace)):
+        bare = []
+
+        def add_bare(word, uglob, write):
+            if not word or word == "-" or _path_shaped(word, uglob):
+                return
+            try:
+                value = _word_value(word)
+            except _Unenumerated:
+                return
+            if value and value != "-" and not _path_shaped(value, False):
+                bare.append((value, write, event_cwd, event_cwd_explicit))
+
+        def finish_bare_command():
+            if head == "cp":
+                for i, (word, uglob) in enumerate(operands):
+                    add_bare(word, uglob, not cp_target and i == len(operands) - 1)
+            elif head == "tee":
+                for word, uglob in operands:
+                    add_bare(word, uglob, True)
+            elif head == "cat":
+                for word, uglob in operands:
+                    add_bare(word, uglob, False)
+            elif head == "rm":
+                for word, uglob in operands:
+                    add_bare(word, uglob, True)
+
+        head, operands, cp_target = None, [], False
+        redirect, pending, opts_done = None, None, False
+        try:
+            bare_tokens = _shell_words(scan)
+        except _Unmodelled:
+            bare_tokens = []                     # pass 3 returns the ordinary unenumerated refusal
+        def apply_wrapper_option(kind, value):
+            nonlocal event_cwd, event_cwd_explicit, bare_tokens, wrapper_option_error
+            try:
+                value = _word_value(value)
+                if kind == "split":
+                    bare_tokens[i + 1:i + 1] = _shell_words(value)
+                elif kind == "chdir":
+                    if event_cwd is not None or os.path.isabs(value):
+                        event_cwd = os.path.normpath(os.path.join(
+                            event_cwd or "", value)).replace("\\", "/")
+                    event_cwd_explicit = True
+            except (_Unmodelled, _Unenumerated):
+                wrapper_option_error = True
+                if kind == "chdir":
+                    event_cwd = None
+                    event_cwd_explicit = True
+
+        wrapper_value_options = {
+            "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "doas": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "env": {"-u"},
+            "exec": {"-a"},
+            "timeout": {"-s", "-k", "--signal", "--kill-after"},
+            "stdbuf": {"-i", "-o", "-e"},
+            "nice": {"-n", "--adjustment"},
+            "ionice": {"-c", "-n", "-p"},
+        }
+        env_long_options = ("--split-string", "--chdir", "--unset")
+        for i, (kind, word, uglob) in enumerate(bare_tokens):
+            if kind == "sep" or (kind == "word" and head is None
+                                 and word.replace(_BRACE_OPEN, "") in _SHELL_KEYWORDS):
+                finish_bare_command()
+                head, operands, cp_target = None, [], False
+                redirect, pending, opts_done = None, None, False
+                wrapper, wrapper_option = None, None
+                event_cwd = cwd_path
+                event_cwd_explicit = False
+                continue
+            if kind == "mark":
+                continue
+            if redirect is not None:
+                if redirect != "skip":
+                    add_bare(word, uglob, redirect == "write")
+                redirect = None
+                continue
+            if kind == "op":
+                if word.startswith(("<<", "<&", ">&")):
+                    redirect = "skip"
+                else:
+                    redirect = "read" if word == "<" else "write"
+                continue
+            if kind != "word":
+                continue
+            if head is None:
+                if wrapper_option is not None:
+                    kind = wrapper_option
+                    wrapper_option = None
+                    apply_wrapper_option(kind, word)
+                    continue
+                name, eq, value = word.partition("=")
+                base = os.path.basename(word)
+                if wrapper == "env":
+                    if name.startswith("--") and len(name) > 2:
+                        hits = [option for option in env_long_options if option.startswith(name)]
+                        if len(hits) == 1:
+                            name = hits[0]
+                    if re.fullmatch(r"-[iv0]+u", word):
+                        wrapper_option = "skip"
+                        continue
+                    attached = re.fullmatch(r"-[iv0]*([SC])(.*)", word, re.S)
+                    if attached:
+                        kind = "split" if attached.group(1) == "S" else "chdir"
+                        if attached.group(2):
+                            apply_wrapper_option(kind, attached.group(2))
+                        else:
+                            wrapper_option = kind
+                        continue
+                    if name == "--unset":
+                        if not eq:
+                            wrapper_option = "skip"
+                        continue
+                    if name == "--split-string":
+                        if eq:
+                            apply_wrapper_option("split", value)
+                        else:
+                            wrapper_option = "split"
+                        continue
+                    if name == "--chdir":
+                        if eq:
+                            apply_wrapper_option("chdir", value)
+                        else:
+                            wrapper_option = "chdir"
+                        continue
+                if wrapper in wrapper_value_options and base in wrapper_value_options[wrapper]:
+                    wrapper_option = "skip"
+                    continue
+                if eq and name.isidentifier():
+                    continue
+                if base in _HEREDOC_WRAPPERS:
+                    wrapper = base
+                    continue
+                if base in _CMD_SPECS or base in ("cat", "rm", "cp", "tee", "true", "false"):
+                    head = base
+                    wrapper = None
+                    continue
+                if wrapper is None:
+                    head = base
+                    continue
+                if word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
+                        or (word.startswith("-") and len(word) > 1):
+                    continue
+            if pending is not None:
+                if pending == "target":
+                    add_bare(word, uglob, True)
+                pending = None
+                continue
+            if word == "--" and not opts_done:
+                opts_done = True
+                continue
+            if word.startswith("-") and len(word) > 1 and not opts_done:
+                name, eq, value = word.partition("=")
+                if head == "cp":
+                    if name in ("-t", "--target-directory"):
+                        cp_target = True
+                        if eq:
+                            add_bare(value, uglob, True)
+                        else:
+                            pending = "target"
+                    elif name in ("-S", "--suffix") and not eq:
+                        pending = "data"
+                    elif name.startswith("-t") and not name.startswith("--") and len(name) > 2:
+                        cp_target = True
+                        add_bare(name[2:], uglob, True)
+                continue
+            if head in ("cat", "cp", "rm", "tee"):
+                operands.append((word, uglob))
+        finish_bare_command()
+
+        if wrapper_option_error and not lift_unenum:
+            return False, f"{_UNMODELLED_PREFIX}an env -S/-C value the gate cannot read>", UNENUMERATED_TARGET
+        seen_bare = set()
+        for value, write, operand_cwd, operand_cwd_explicit in bare:
+            if (value, write, operand_cwd, operand_cwd_explicit) in seen_bare:
+                continue
+            if len(seen_bare) >= SCOPE_JUDGE_BUDGET:
+                if lift_overflow:
+                    break
+                return False, _INCOMPLETE, OVERFLOW_TARGET
+            seen_bare.add((value, write, operand_cwd, operand_cwd_explicit))
+            if operand_cwd is None:
+                continue
+            event_candidate = os.path.normpath(os.path.join(operand_cwd, value)).replace("\\", "/")
+            if write:
+                refused = _outside_reach_refused(event_candidate, scopes, workspace, cwd,
+                                                 egress, home_markers)
+                if refused is not None:
+                    return (False,) + refused
+                continue
+            if not os.path.lexists(event_candidate):
+                continue
+            refused = None
+            if operand_cwd_explicit:
+                read_bases = [operand_cwd]
+            else:
+                read_bases = bases + [root for root, _recursive in
+                                      _scope_roots_with_reach(scopes, workspace)]
+            for base in dict.fromkeys(read_bases):
+                cand = os.path.normpath(os.path.join(base, value)).replace("\\", "/")
+                if not os.path.lexists(cand):
+                    continue
+                r = _outside_reach_refused(cand, scopes, workspace, cwd, egress, home_markers)
+                if r is None:
+                    refused = None
+                    break
+                refused = refused or r
+            if refused is not None:
+                return (False,) + refused
+
     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
     # with a per-command workdir the event does not carry (observed live via the Codex gate —
     # event cwd = session launch dir while the command ran inside a granted repo). So a token
     # is judged by its PLAUSIBLE interpretations — the event cwd plus every granted repo root —
     # voting by what EXISTS: an existing in-scope interpretation passes; an existing
     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
-    # a reach.
-    cwd = (cwd or os.getcwd()).replace("\\", "/")
-    bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+    # a reach. The bare file operands above are the outside-cwd exception to the skip below.
     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
     probes = 0
     seen2 = set()
-    for raw in re.split(r"""[\s;|&<>()'"`]+""", scan):
+    # Filter literal prose only when no unquoted glob or opening brace exists anywhere:
+    # shlex loses quoting provenance, and filtering such a command could hide shell expansion.
+    # Any unquoted `{` gets a separate marker; the enumeration regex remains unchanged.
+    # Unparseable shell retains the original scan and is refused by pass 3 as before.
+    prose_scan = scan
+    try:
+        if not any(uglob or _BRACE_OPEN in word for kind, word, uglob in _shell_words(scan)
+                   if kind == "word"):
+            prose_scan = egress_command_text(scan)
+    except _Unmodelled:
+        pass
+    for raw in re.split(r"""[\s;|&<>()'"`]+""", prose_scan):
         for tok in raw.split("="):
             tok = tok.strip()
             if not tok or tok.startswith(("-", "/")) or ":" in tok or tok.strip(".") == "":
