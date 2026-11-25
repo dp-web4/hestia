@@ -28,20 +28,27 @@ def patch_core(src):
     src = once(src, '''    cwd_path = os.path.normpath(cwd).replace("\\\\", "/")
 ''', '''    cwd_path = os.path.normpath(cwd).replace("\\\\", "/")
     event_cwd = cwd_path
+    event_cwd_explicit = False
     wrapper, wrapper_option = None, None
     wrapper_option_error = False
 ''')
     src = once(src, '''        for kind, word, uglob in bare_tokens:
 ''', '''        def apply_wrapper_option(kind, value):
-            nonlocal event_cwd, bare_tokens, wrapper_option_error
-            if kind == "split":
-                try:
+            nonlocal event_cwd, event_cwd_explicit, bare_tokens, wrapper_option_error
+            try:
+                value = _word_value(value)
+                if kind == "split":
                     bare_tokens[i + 1:i + 1] = _shell_words(value)
-                except (_Unmodelled, _Unenumerated):
-                    wrapper_option_error = True
-            elif kind == "chdir":
-                event_cwd = os.path.normpath(os.path.join(
-                    event_cwd, value)).replace("\\\\", "/")
+                elif kind == "chdir":
+                    if event_cwd is not None or os.path.isabs(value):
+                        event_cwd = os.path.normpath(os.path.join(
+                            event_cwd or "", value)).replace("\\\\", "/")
+                    event_cwd_explicit = True
+            except (_Unmodelled, _Unenumerated):
+                wrapper_option_error = True
+                if kind == "chdir":
+                    event_cwd = None
+                    event_cwd_explicit = True
 
         wrapper_value_options = {
             "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
@@ -53,6 +60,7 @@ def patch_core(src):
             "nice": {"-n", "--adjustment"},
             "ionice": {"-c", "-n", "-p"},
         }
+        env_long_options = ("--split-string", "--chdir", "--unset")
         for i, (kind, word, uglob) in enumerate(bare_tokens):
 ''')
     src = once(src, '''                redirect, pending, opts_done = None, None, False
@@ -60,6 +68,7 @@ def patch_core(src):
 ''', '''                redirect, pending, opts_done = None, None, False
                 wrapper, wrapper_option = None, None
                 event_cwd = cwd_path
+                event_cwd_explicit = False
                 continue
 ''')
     src = once(src, '''            if head is None:
@@ -67,7 +76,7 @@ def patch_core(src):
                 if eq and name.isidentifier():
                     continue
                 base = os.path.basename(word)
-                if base in _HEREDOC_WRAPPERS or word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \\
+                if base in _HEREDOC_WRAPPERS or word.isdigit() or re.fullmatch(r"\\d+[smhd]?", word) \\
                         or (word.startswith("-") and len(word) > 1):
                     continue
                 head = base
@@ -76,38 +85,41 @@ def patch_core(src):
                 if wrapper_option is not None:
                     kind = wrapper_option
                     wrapper_option = None
-                    try:
-                        apply_wrapper_option(kind, _word_value(word))
-                    except (_Unmodelled, _Unenumerated):
-                        wrapper_option_error = True
+                    apply_wrapper_option(kind, word)
                     continue
                 name, eq, value = word.partition("=")
                 base = os.path.basename(word)
                 if wrapper == "env":
-                    if base in ("-iS", "-vS"):
-                        wrapper_option = "split"
+                    if name.startswith("--") and len(name) > 2:
+                        hits = [option for option in env_long_options if option.startswith(name)]
+                        if len(hits) == 1:
+                            name = hits[0]
+                    attached = re.fullmatch(r"-[iv0]*([SC])(.*)", word, re.S)
+                    if attached:
+                        kind = "split" if attached.group(1) == "S" else "chdir"
+                        if attached.group(2):
+                            apply_wrapper_option(kind, attached.group(2))
+                            wrapper = None
+                        else:
+                            wrapper_option = kind
                         continue
-                    if base.startswith("-S") and len(base) > 2:
-                        apply_wrapper_option("split", base[2:])
-                        wrapper = None
+                    if name == "--unset":
+                        if not eq:
+                            wrapper_option = "skip"
                         continue
-                    if base.startswith("-C") and len(base) > 2:
-                        apply_wrapper_option("chdir", base[2:])
-                        wrapper = None
+                    if name == "--split-string":
+                        if eq:
+                            apply_wrapper_option("split", value)
+                            wrapper = None
+                        else:
+                            wrapper_option = "split"
                         continue
-                    if name == "--split-string" and eq:
-                        apply_wrapper_option("split", value)
-                        wrapper = None
-                        continue
-                    if name == "--chdir" and eq:
-                        apply_wrapper_option("chdir", value)
-                        wrapper = None
-                        continue
-                    if name in ("-S", "--split-string"):
-                        wrapper_option = "split"
-                        continue
-                    if name in ("-C", "--chdir"):
-                        wrapper_option = "chdir"
+                    if name == "--chdir":
+                        if eq:
+                            apply_wrapper_option("chdir", value)
+                            wrapper = None
+                        else:
+                            wrapper_option = "chdir"
                         continue
                 if wrapper in wrapper_value_options and base in wrapper_value_options[wrapper]:
                     wrapper_option = "skip"
@@ -124,15 +136,44 @@ def patch_core(src):
                 if wrapper is None:
                     head = base
                     continue
-                if word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
+                if word.isdigit() or re.fullmatch(r"\\d+[smhd]?", word) \\
                         or (word.startswith("-") and len(word) > 1):
                     continue
 ''')
-    src = once(src, "        seen_bare = set()", "        if wrapper_option_error:\n            return False, _INCOMPLETE, OVERFLOW_TARGET\n        seen_bare = set()")
-    return once(src, "os.path.join(cwd_path, value)", "os.path.join(event_cwd, value)")
+    src = once(src, "bare.append((value, write))",
+               "bare.append((value, write, event_cwd, event_cwd_explicit))")
+    src = once(src, "for value, write in bare:",
+               "for value, write, operand_cwd, operand_cwd_explicit in bare:")
+    src = once(src, "if (value, write) in seen_bare:",
+               "if (value, write, operand_cwd, operand_cwd_explicit) in seen_bare:")
+    src = once(src, "seen_bare.add((value, write))",
+               "seen_bare.add((value, write, operand_cwd, operand_cwd_explicit))")
+    src = once(src, "        seen_bare = set()", '''        if wrapper_option_error and not lift_unenum:
+            return False, f"{_UNMODELLED_PREFIX}an env -S/-C value the gate cannot read>", UNENUMERATED_TARGET
+        seen_bare = set()''')
+    src = once(src, '''            event_candidate = os.path.normpath(os.path.join(cwd_path, value)).replace("\\\\", "/")
+''', '''            if operand_cwd is None:
+                continue
+            event_candidate = os.path.normpath(os.path.join(operand_cwd, value)).replace("\\\\", "/")
+''')
+    return once(src, '''            read_bases = bases + [root for root, _recursive in
+                                  _scope_roots_with_reach(scopes, workspace)]
+''', '''            if operand_cwd_explicit:
+                read_bases = [operand_cwd]
+            else:
+                read_bases = bases + [root for root, _recursive in
+                                      _scope_roots_with_reach(scopes, workspace)]
+''')
 
 
 def patch_test(src):
+    src = once(src, '''    open(os.path.join(ws, "source.txt"), "w").close()
+''', '''    open(os.path.join(ws, "source.txt"), "w").close()
+    other = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    for name in ("secret.txt", "chdir-shared.txt"):
+        open(os.path.join(other, name), "w").close()
+    open(os.path.join(ws, "chdir-shared.txt"), "w").close()
+''')
     src = once(src, '''        ("sudo_read", "sudo -n cat notes.txt", "notes.txt"),
 ''', '''        ("sudo_read", "sudo -n cat notes.txt", "notes.txt"),
         ("timeout_signal_name_write", "timeout -s KILL 5 rm -f remove.txt", "remove.txt"),
@@ -152,6 +193,8 @@ def patch_test(src):
         ("env_chdir_does_not_leak_into_and_branch", "env -C /tmp true && cat notes.txt", "notes.txt"),
         ("env_chdir_does_not_leak_into_pipe", "env -C /tmp true | tee leak-new.txt", "leak-new.txt"),
         ("env_chdir_does_not_leak_into_group", "env -C /tmp true; { rm -f remove.txt; }", "remove.txt"),
+        ("later_env_chdir_does_not_relocate_earlier_write", "rm -f remove.txt; env -C /tmp true", "remove.txt"),
+        ("later_env_chdir_does_not_relocate_earlier_read", f"env -C {other} cat secret.txt; env -C /tmp true", f"{other}/secret.txt"),
         ("env_unset_argument_is_not_the_command", "env -u cat tee wr-new.txt", "wr-new.txt"),
         ("exec_name_argument_is_not_the_command", "exec -a cat tee wr-new.txt", "wr-new.txt"),
         ("sudo_user_argument_is_not_the_command", "sudo -u cat tee wr-new.txt", "wr-new.txt"),
@@ -160,23 +203,62 @@ def patch_test(src):
         ("env_long_split_write", "env --split-string='rm -f remove.txt'", "remove.txt"),
         ("env_combined_i_split_write", "env -iS 'rm -f remove.txt'", "remove.txt"),
         ("env_combined_v_split_write", "env -vS 'rm -f remove.txt'", "remove.txt"),
-        ("env_long_attached_chdir_read", f"env --chdir={outside} cat notes.txt", "notes.txt"),
-        ("env_short_attached_chdir_read", f"env -C{outside} cat notes.txt", "notes.txt"),
+        ("env_long_attached_chdir_read", f"env --chdir={other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_short_attached_chdir_read", f"env -C{other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_combined_attached_chdir_read", f"env -iC{other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_quoted_attached_chdir_read", f"env -C'{other}' cat secret.txt", f"{other}/secret.txt"),
+        ("env_relative_attached_chdir_read", f"env --chdir=../{os.path.basename(other)} cat secret.txt", f"{other}/secret.txt"),
+        ("env_repeated_chdir_write", f"env -C /tmp -C{other} rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_attached_split_with_slash_write", "env -S'rm -f remove.txt sub/x'", "remove.txt"),
+        ("env_attached_split_with_absolute_path_write", "env -S'rm -f remove.txt /tmp/x'", "remove.txt"),
+        ("env_combined_iv_split_write", "env -ivS 'rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_split_write", "env --spl='rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_split_long_write", "env --split='rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_chdir_read", f"env --chd={other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_unset_long_write", "env --unset cat tee unset-new.txt", "unset-new.txt"),
+        ("env_unset_abbreviated_write", "env --uns cat tee unset-abbreviated-new.txt", "unset-abbreviated-new.txt"),
+        ("env_unset_shortest_unique_prefix_write", "env --u cat tee unset-prefix-new.txt", "unset-prefix-new.txt"),
 ''')
     src = once(src, '''    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
 ''', '''    check("sudo_echo_does_not_treat_rm_as_its_command", reach("sudo echo rm remove.txt")[0])
     check("env_printf_does_not_treat_cat_as_its_command", reach("env printf '%s' cat notes.txt")[0])
     check("timeout_echo_does_not_treat_tee_as_its_command", reach("timeout 5 echo tee new.txt")[0])
     check("nice_true_does_not_treat_rm_as_its_command", reach("nice -n 5 true rm remove.txt")[0])
-    check("env_split_expansion_is_an_ordinary_unenumerated_refusal",
-          not reach('env -S "rm -f $X remove.txt"')[0])
+    unenumerated = scopes + ["path:" + G.UNENUMERATED_TARGET]
+    for name, command in (
+        ("env_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -S "rm -f $X remove.txt"'),
+        ("env_attached_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -S"rm -f $X remove.txt"'),
+        ("env_long_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env --split-string="rm -f $X remove.txt"'),
+        ("env_chdir_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -C "$D" rm -f remove.txt'),
+    ):
+        ok, offending, refused = reach(command)
+        check(name, not ok and refused == G.UNENUMERATED_TARGET
+              and offending.startswith(G._UNMODELLED_PREFIX), repr((ok, offending, refused)))
+        check(name + "_one_time_approval_can_be_spent",
+              G.command_scope_reach(command, unenumerated, ws, outside)[0])
+    check("lifted_unknown_chdir_still_judges_literal_paths",
+          not G.command_scope_reach(f'env -C "$D" cat {other}/secret.txt',
+                                    unenumerated, ws, outside)[0])
     check("env_split_unterminated_quote_is_an_ordinary_unenumerated_refusal",
-          not reach("env -S \\\"rm -f 'x\\\"")[0])
-    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
+          reach("env -S \\\"rm -f 'x\\\"")[2] == G.UNENUMERATED_TARGET)
+    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX,
+                          "path:" + other + G.RECURSIVE_SUFFIX]
 ''')
     return once(src, '''    check("an_explicit_cwd_grant_admits_the_same_new_write",
 ''', '''    check("env_chdir_uses_its_actual_working_directory",
           G.command_scope_reach("env -C /tmp rm -f remove.txt", scopes, ws, outside)[0])
+    check("env_attached_chdir_uses_its_actual_working_directory",
+          reach("env -C/tmp rm -f remove.txt")[0])
+    check("env_chdir_missing_read_target_is_not_a_new_ask",
+          reach(f"env --chdir={other} cat absent.txt")[0])
+    ok, offending, refused = reach(f"env --chdir={other} cat chdir-shared.txt")
+    expected = os.path.normpath(os.path.join(other, "chdir-shared.txt")).replace("\\\\", "/")
+    check("env_chdir_read_does_not_use_an_in_scope_namesake",
+          not ok and refused == expected, repr((ok, offending, refused, expected)))
     check("an_explicit_cwd_grant_admits_the_same_new_write",
 ''')
 
@@ -255,7 +337,7 @@ def main():
         print(after.stderr[-2000:], file=sys.stderr)
         copy_location_failures = {"shims_present", "scope_rule_duplication_matches_inventory"}
         unexpected = [line for line in after.stdout.splitlines()
-                      if line.startswith("FAIL ") and line.split()[1] not in copy_location_failures]
+                      if line.strip().startswith("FAIL ") and line.split()[1] not in copy_location_failures]
         assert not unexpected, ("unexpected full-suite failures", unexpected)
     finally:
         shutil.rmtree(work)
