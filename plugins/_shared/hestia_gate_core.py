@@ -3543,7 +3543,11 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 name, eq, _value = word.partition("=")
                 if eq and name.isidentifier():
                     continue
-                head = os.path.basename(word)
+                base = os.path.basename(word)
+                if base in _HEREDOC_WRAPPERS or word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
+                        or (word.startswith("-") and len(word) > 1):
+                    continue
+                head = base
                 continue
             if pending is not None:
                 if pending == "target":

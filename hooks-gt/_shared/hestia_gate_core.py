@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 929afd79093deb8c20b99a4455e5e50419ad1c27ac2bac2d753f2084c6d24af4  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 0da58f059db02656840460b99c160603dd23e2a7b0172c7e0f6d4fbeaecd0cb7  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -3519,7 +3519,8 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
         except _Unmodelled:
             bare_tokens = []                     # pass 3 returns the ordinary unenumerated refusal
         for kind, word, uglob in bare_tokens:
-            if kind == "sep" or (kind == "word" and head is None and word in _SHELL_KEYWORDS):
+            if kind == "sep" or (kind == "word" and head is None
+                                 and word.replace(_BRACE_OPEN, "") in _SHELL_KEYWORDS):
                 finish_bare_command()
                 head, operands, cp_target = None, [], False
                 redirect, pending, opts_done = None, None, False
@@ -3543,7 +3544,11 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 name, eq, _value = word.partition("=")
                 if eq and name.isidentifier():
                     continue
-                head = os.path.basename(word)
+                base = os.path.basename(word)
+                if base in _HEREDOC_WRAPPERS or word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
+                        or (word.startswith("-") and len(word) > 1):
+                    continue
+                head = base
                 continue
             if pending is not None:
                 if pending == "target":

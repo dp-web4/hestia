@@ -366,7 +366,21 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
         ("timed_grouped_read", "time { cat notes.txt; }", "notes.txt"),
         ("grouped_copy_write", f"{{ cp {ws}/source.txt copy-out.txt; }}", "copy-out.txt"),
     )
-    for name, command, target in grouped_cases:
+    wrapped_cases = (
+        ("exec_read", "exec cat notes.txt", "notes.txt"),
+        ("exec_write", "exec rm -f remove.txt", "remove.txt"),
+        ("command_read", "command cat notes.txt", "notes.txt"),
+        ("command_write", "command rm -f remove.txt", "remove.txt"),
+        ("nice_read", "nice cat notes.txt", "notes.txt"),
+        ("nice_write", "nice rm -f remove.txt", "remove.txt"),
+        ("env_read", "env cat notes.txt", "notes.txt"),
+        ("env_write", "env rm -f remove.txt", "remove.txt"),
+        ("timeout_read", "timeout 5 cat notes.txt", "notes.txt"),
+        ("timeout_write", "timeout 5 rm -f remove.txt", "remove.txt"),
+        ("nohup_write", "nohup rm -f remove.txt", "remove.txt"),
+        ("sudo_read", "sudo -n cat notes.txt", "notes.txt"),
+    )
+    for name, command, target in grouped_cases + wrapped_cases:
         ok, offending, refused = reach(command)
         expected = os.path.normpath(os.path.join(outside, target)).replace("\\", "/")
         check(name, not ok and refused == expected,
@@ -391,7 +405,7 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
           G.command_scope_reach("cat notes.txt", permitted, ws, outside)[0])
     check("an_explicit_cwd_grant_admits_the_same_new_write",
           G.command_scope_reach("echo hi > permitted.txt", permitted, ws, outside)[0])
-    for name, command, _target in grouped_cases:
+    for name, command, _target in grouped_cases + wrapped_cases:
         check(name + "_allowed_by_explicit_cwd_grant",
               G.command_scope_reach(command, permitted, ws, outside)[0])
 
@@ -400,7 +414,7 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
                                     cwd=outside), prof, ws)
     expected = os.path.normpath(os.path.join(outside, "evaluated.txt")).replace("\\", "/")
     check("the_real_evaluate_path_refuses_and_names_the_bare_write_target",
-          v.blocks and v.rule == "mrh.command" and expected in v.reason, repr(v))
+          v.blocks and v.rule == "mrh.command" and v.target == expected, repr(v))
 
     repo = os.path.join(ws, "repo")
     os.mkdir(repo)
