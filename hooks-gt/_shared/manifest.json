@@ -32,11 +32,11 @@
     },
     {
       "path": "hestia_witness_core.py",
-      "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777",
+      "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1",
       "source": "plugins/_shared/hestia_witness_core.py"
     }
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
+  "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61"
 }

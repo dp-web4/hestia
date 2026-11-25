@@ -163,7 +163,36 @@ fn repo_hook(orch: &str) -> Result<PathBuf> {
         .with_context(|| format!("locating {p}"))
 }
 
-/// Merge hestia's PostToolUse witness hook into `~/.claude/settings.json`,
+fn ensure_claude_outcome_hooks(json: &mut serde_json::Value, command: &str) -> Result<bool> {
+    let obj = json
+        .as_object_mut()
+        .context("~/.claude/settings.json is not a JSON object")?;
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let hooks = hooks
+        .as_object_mut()
+        .context("settings.hooks is not an object")?;
+    let mut changed = false;
+    for event in ["PostToolUse", "PostToolUseFailure"] {
+        let arr = hooks
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .with_context(|| format!("settings.hooks.{event} is not an array"))?;
+        let already = arr
+            .iter()
+            .any(|e| e.to_string().contains("hestia") || e.to_string().contains("witness.py"));
+        if !already {
+            arr.push(serde_json::json!({
+                "matcher": "*",
+                "hooks": [{ "type": "command", "command": command, "timeout": 3 }],
+            }));
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Merge hestia's success and failure witness hooks into `~/.claude/settings.json`,
 /// idempotently. Needs write access to `~/.claude` (the daemon sandbox must
 /// allow it — see deploy notes).
 fn install_claude_code() -> Result<String> {
@@ -178,32 +207,9 @@ fn install_claude_code() -> Result<String> {
     } else {
         serde_json::json!({})
     };
-
-    let obj = json
-        .as_object_mut()
-        .context("~/.claude/settings.json is not a JSON object")?;
-    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    let post = hooks
-        .as_object_mut()
-        .context("settings.hooks is not an object")?
-        .entry("PostToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-    let arr = post
-        .as_array_mut()
-        .context("settings.hooks.PostToolUse is not an array")?;
-
-    // Idempotent: bail out (success) if a hestia witness hook is already present.
-    let already = arr
-        .iter()
-        .any(|e| e.to_string().contains("hestia") || e.to_string().contains("witness.py"));
-    if already {
-        return Ok("already connected (hestia hook present)".into());
+    if !ensure_claude_outcome_hooks(&mut json, &command)? {
+        return Ok("already connected (hestia success and failure hooks present)".into());
     }
-
-    arr.push(serde_json::json!({
-        "matcher": "*",
-        "hooks": [{ "type": "command", "command": command, "timeout": 3 }],
-    }));
 
     std::fs::create_dir_all(&claude_dir).context("creating ~/.claude")?;
     std::fs::write(&settings_path, serde_json::to_string_pretty(&json)?).with_context(|| {
@@ -214,7 +220,7 @@ fn install_claude_code() -> Result<String> {
     })?;
 
     Ok(format!(
-        "connected — added hestia PostToolUse hook to {}; restart Claude Code",
+        "connected — hestia success and failure hooks are registered in {}; restart Claude Code",
         settings_path.display()
     ))
 }
@@ -330,5 +336,34 @@ mod tests {
         // config file (absent → false) without panicking on this host.
         assert!(!is_installed("nope-xyz"));
         let _ = is_installed("claude-code");
+    }
+
+    #[test]
+    fn claude_success_registration_does_not_hide_missing_failure_coverage() {
+        let mut json = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": "python3 /repo/witness.py"}]
+                }]
+            }
+        });
+        assert!(ensure_claude_outcome_hooks(&mut json, "python3 /repo/witness.py").unwrap());
+        assert_eq!(json["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["hooks"]["PostToolUseFailure"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!ensure_claude_outcome_hooks(&mut json, "python3 /repo/witness.py").unwrap());
+        assert_eq!(
+            json["hooks"]["PostToolUseFailure"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
