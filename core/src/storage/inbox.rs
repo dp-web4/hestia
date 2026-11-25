@@ -1545,7 +1545,7 @@ impl SqliteInboxStore {
                             claim_expires_at: raw_expiry.clone(),
                         },
                     };
-                    tx.execute(
+                    let changed = tx.execute(
                         "UPDATE member_notices
                          SET lease_intent_json = ?2, claimed_by_session = ?3, claim_expires_at = ?4
                          WHERE id = ?1 AND to_plugin = ?5 AND drained_at IS NULL
@@ -1559,6 +1559,10 @@ impl SqliteInboxStore {
                         ],
                     )
                     .context("claiming member notice")?;
+                    anyhow::ensure!(
+                        changed == 1,
+                        "member notice {id} changed while it was being claimed"
+                    );
                     MemberNoticeClaimOutcome::Claimed {
                         claim_expires_at: expires_at,
                         renewed,
@@ -1625,14 +1629,18 @@ impl SqliteInboxStore {
                                 claim_expires_at: raw_expiry.clone(),
                             },
                         };
-                        tx.execute(
+                        let changed = tx.execute(
                             "UPDATE member_notices
                              SET lease_intent_json = ?2, claimed_by_session = NULL, claim_expires_at = NULL
                              WHERE id = ?1 AND to_plugin = ?3 AND claimed_by_session = ?4
                                AND drained_at IS NULL AND dest_peer IS NULL",
-                            params![serde_json::to_string(&intent)?, id as i64, to_plugin, session],
+                            params![id as i64, serde_json::to_string(&intent)?, to_plugin, session],
                         )
                         .context("releasing member notice claim")?;
+                        anyhow::ensure!(
+                            changed == 1,
+                            "member notice {id} changed while its claim was being released"
+                        );
                         MemberNoticeClaimOutcome::Released {
                             was_claimed: true,
                             lease_operation_id: Some(intent.operation_id),
