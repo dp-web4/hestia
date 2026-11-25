@@ -4235,7 +4235,9 @@ mod tests {
         let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
         store.reconcile_member_notice_lease_intents(&[]).unwrap();
         assert_eq!(store.member_notice_lease_intents().unwrap().len(), 0);
-        assert_eq!(store.member_notice_lease(id, "kimi-code").unwrap(), None);
+        let restored = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+        assert_eq!(restored.claimed_by_session, None);
+        assert_eq!(restored.claim_expires_at, None);
         assert!(matches!(
             store.claim_member_notice(id, "kimi-code", owner, 60),
             Ok(MemberNoticeClaimOutcome::Claimed { .. })
