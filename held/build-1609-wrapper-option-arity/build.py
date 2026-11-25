@@ -29,14 +29,37 @@ def patch_core(src):
 ''', '''    cwd_path = os.path.normpath(cwd).replace("\\\\", "/")
     event_cwd = cwd_path
     wrapper, wrapper_option = None, None
+    wrapper_option_error = False
 ''')
     src = once(src, '''        for kind, word, uglob in bare_tokens:
-''', '''        for i, (kind, word, uglob) in enumerate(bare_tokens):
+''', '''        def apply_wrapper_option(kind, value):
+            nonlocal event_cwd, bare_tokens, wrapper_option_error
+            if kind == "split":
+                try:
+                    bare_tokens[i + 1:i + 1] = _shell_words(value)
+                except (_Unmodelled, _Unenumerated):
+                    wrapper_option_error = True
+            elif kind == "chdir":
+                event_cwd = os.path.normpath(os.path.join(
+                    event_cwd, value)).replace("\\\\", "/")
+
+        wrapper_value_options = {
+            "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "doas": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "env": {"-u"},
+            "exec": {"-a"},
+            "timeout": {"-s", "-k", "--signal", "--kill-after"},
+            "stdbuf": {"-i", "-o", "-e"},
+            "nice": {"-n", "--adjustment"},
+            "ionice": {"-c", "-n", "-p"},
+        }
+        for i, (kind, word, uglob) in enumerate(bare_tokens):
 ''')
     src = once(src, '''                redirect, pending, opts_done = None, None, False
                 continue
 ''', '''                redirect, pending, opts_done = None, None, False
                 wrapper, wrapper_option = None, None
+                event_cwd = cwd_path
                 continue
 ''')
     src = once(src, '''            if head is None:
@@ -51,37 +74,61 @@ def patch_core(src):
                 continue
 ''', '''            if head is None:
                 if wrapper_option is not None:
-                    if wrapper_option == "split":
-                        nested = _shell_words(_word_value(word))
-                        bare_tokens[i + 1:i + 1] = nested
-                    elif wrapper_option == "chdir":
-                        event_cwd = os.path.normpath(os.path.join(
-                            event_cwd, _word_value(word))).replace("\\\\", "/")
+                    kind = wrapper_option
                     wrapper_option = None
+                    try:
+                        apply_wrapper_option(kind, _word_value(word))
+                    except (_Unmodelled, _Unenumerated):
+                        wrapper_option_error = True
                     continue
-                name, eq, _value = word.partition("=")
+                name, eq, value = word.partition("=")
+                base = os.path.basename(word)
+                if wrapper == "env":
+                    if base in ("-iS", "-vS"):
+                        wrapper_option = "split"
+                        continue
+                    if base.startswith("-S") and len(base) > 2:
+                        apply_wrapper_option("split", base[2:])
+                        wrapper = None
+                        continue
+                    if base.startswith("-C") and len(base) > 2:
+                        apply_wrapper_option("chdir", base[2:])
+                        wrapper = None
+                        continue
+                    if name == "--split-string" and eq:
+                        apply_wrapper_option("split", value)
+                        wrapper = None
+                        continue
+                    if name == "--chdir" and eq:
+                        apply_wrapper_option("chdir", value)
+                        wrapper = None
+                        continue
+                    if name in ("-S", "--split-string"):
+                        wrapper_option = "split"
+                        continue
+                    if name in ("-C", "--chdir"):
+                        wrapper_option = "chdir"
+                        continue
+                if wrapper in wrapper_value_options and base in wrapper_value_options[wrapper]:
+                    wrapper_option = "skip"
+                    continue
                 if eq and name.isidentifier():
                     continue
-                base = os.path.basename(word)
                 if base in _HEREDOC_WRAPPERS:
                     wrapper = base
                     continue
-                if wrapper == "env" and base in ("-S", "--split-string"):
-                    wrapper_option = "split"
-                    continue
-                if wrapper == "env" and base in ("-C", "--chdir"):
-                    wrapper_option = "chdir"
-                    continue
-                if base in ("cat", "rm", "cp", "tee"):
+                if base in _CMD_SPECS or base in ("cat", "rm", "cp", "tee", "true", "false"):
                     head = base
                     wrapper = None
                     continue
-                if wrapper is not None or word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \\
+                if wrapper is None:
+                    head = base
+                    continue
+                if word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
                         or (word.startswith("-") and len(word) > 1):
                     continue
-                head = base
-                continue
 ''')
+    src = once(src, "        seen_bare = set()", "        if wrapper_option_error:\n            return False, _INCOMPLETE, OVERFLOW_TARGET\n        seen_bare = set()")
     return once(src, "os.path.join(cwd_path, value)", "os.path.join(event_cwd, value)")
 
 
@@ -101,6 +148,31 @@ def patch_test(src):
         ("doas_user_write", "doas -u root rm -f remove.txt", "remove.txt"),
         ("exec_name_write", "exec -a name cat notes.txt", "notes.txt"),
         ("ionice_class_write", "ionice -c best-effort cat notes.txt", "notes.txt"),
+        ("env_chdir_does_not_leak_into_next_command", "env -C /tmp true; rm -f remove.txt", "remove.txt"),
+        ("env_chdir_does_not_leak_into_and_branch", "env -C /tmp true && cat notes.txt", "notes.txt"),
+        ("env_chdir_does_not_leak_into_pipe", "env -C /tmp true | tee leak-new.txt", "leak-new.txt"),
+        ("env_chdir_does_not_leak_into_group", "env -C /tmp true; { rm -f remove.txt; }", "remove.txt"),
+        ("env_unset_argument_is_not_the_command", "env -u cat tee wr-new.txt", "wr-new.txt"),
+        ("exec_name_argument_is_not_the_command", "exec -a cat tee wr-new.txt", "wr-new.txt"),
+        ("sudo_user_argument_is_not_the_command", "sudo -u cat tee wr-new.txt", "wr-new.txt"),
+        ("env_unset_argument_is_not_copy_source", f"env -u cat cp {ws}/source.txt cp-new.txt", "cp-new.txt"),
+        ("env_attached_split_write", "env -S'rm -f remove.txt'", "remove.txt"),
+        ("env_long_split_write", "env --split-string='rm -f remove.txt'", "remove.txt"),
+        ("env_combined_i_split_write", "env -iS 'rm -f remove.txt'", "remove.txt"),
+        ("env_combined_v_split_write", "env -vS 'rm -f remove.txt'", "remove.txt"),
+        ("env_long_attached_chdir_read", f"env --chdir={outside} cat notes.txt", "notes.txt"),
+        ("env_short_attached_chdir_read", f"env -C{outside} cat notes.txt", "notes.txt"),
+''')
+    src = once(src, '''    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
+''', '''    check("sudo_echo_does_not_treat_rm_as_its_command", reach("sudo echo rm remove.txt")[0])
+    check("env_printf_does_not_treat_cat_as_its_command", reach("env printf '%s' cat notes.txt")[0])
+    check("timeout_echo_does_not_treat_tee_as_its_command", reach("timeout 5 echo tee new.txt")[0])
+    check("nice_true_does_not_treat_rm_as_its_command", reach("nice -n 5 true rm remove.txt")[0])
+    check("env_split_expansion_is_an_ordinary_unenumerated_refusal",
+          not reach('env -S "rm -f $X remove.txt"')[0])
+    check("env_split_unterminated_quote_is_an_ordinary_unenumerated_refusal",
+          not reach("env -S \\\"rm -f 'x\\\"")[0])
+    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
 ''')
     return once(src, '''    check("an_explicit_cwd_grant_admits_the_same_new_write",
 ''', '''    check("env_chdir_uses_its_actual_working_directory",
