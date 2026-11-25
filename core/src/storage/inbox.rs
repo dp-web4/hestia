@@ -1544,6 +1544,7 @@ impl SqliteInboxStore {
                             claim_expires_at: raw_expiry.clone(),
                         },
                     };
+                    dbg!(&intent);
                     tx.execute(
                         "UPDATE member_notices
                          SET lease_intent_json = ?2, claimed_by_session = ?3, claim_expires_at = ?4
@@ -4228,6 +4229,7 @@ mod tests {
                 store.claim_member_notice(id, "kimi-code", owner, 60),
                 Ok(MemberNoticeClaimOutcome::Claimed { .. })
             ));
+            dbg!(store.member_notice_lease_intents().unwrap());
             assert_eq!(store.member_notice_lease_intents().unwrap().len(), 1);
             id
         };
