@@ -1516,8 +1516,7 @@ impl SqliteInboxStore {
         let outcome = match prior {
             None => MemberNoticeClaimOutcome::NotFound,
             Some((Some(_), _, _, _)) => MemberNoticeClaimOutcome::AlreadyDrained,
-            Some((_, _, _, Some(_))) => MemberNoticeClaimOutcome::UnresolvedIntent,
-            Some((_, claimed_by, raw_expiry, None)) => {
+            Some((_, claimed_by, raw_expiry, lease_intent)) => {
                 let prior_expiry = raw_expiry
                     .as_deref()
                     .map(DateTime::parse_from_rfc3339)
@@ -1532,6 +1531,8 @@ impl SqliteInboxStore {
                         claimed_by_session: claimed_by.expect("checked above"),
                         claim_expires_at: prior_expiry,
                     }
+                } else if lease_intent.is_some() {
+                    MemberNoticeClaimOutcome::UnresolvedIntent
                 } else {
                     let renewed = claimed_by.as_deref() == Some(session.as_str())
                         && prior_expiry.is_some_and(|expiry| expiry > now);
@@ -4299,6 +4300,7 @@ mod tests {
             .unwrap();
         assert_eq!(drained_at, None, "the losing session did not mark a live claim drained");
         assert_eq!(claimed_by, Some(winner.to_string()));
+        clear_lease_intent_for_test(&store, id);
 
         store
             .conn
@@ -4675,6 +4677,7 @@ mod tests {
     fn a_second_claim_cannot_overwrite_an_unresolved_lease_intent() {
         let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
         let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
         let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
         let (expiry, operation_id) = claim_operation(&store, id, owner, 60);
         witness_lease_operation(
@@ -4694,6 +4697,11 @@ mod tests {
         assert!(store.clear_member_notice_lease_intent(id, "kimi-code", &operation_id).is_err());
         store.conn.lock().unwrap().execute_batch("DROP TRIGGER fail_lease_intent_clear").unwrap();
 
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", bystander, 120),
+            Ok(MemberNoticeClaimOutcome::Conflict { claimed_by_session, .. })
+                if claimed_by_session == owner.to_string()
+        ));
         assert!(matches!(
             store.claim_member_notice(id, "kimi-code", owner, 120),
             Ok(MemberNoticeClaimOutcome::UnresolvedIntent)
