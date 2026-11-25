@@ -64,12 +64,36 @@ enum Command {
     /// Show hestia home + vault info
     Info,
 
-    /// Verify the witness chain: link integrity AND chain-witness signatures (#339).
-    ///
-    /// Reads an online-backup SNAPSHOT of witness.db (safe while the daemon runs; nothing is
-    /// written to the live chain). Prints both predicates, per-witness-key row counts, and
-    /// the first failures. Exits non-zero if the link breaks or any required signature fails.
-    ChainVerify,
+    /// Export an inclusive chain range and its public signature evidence for offline checking.
+    /// The local vault authorizes the read; the segment contains no vault secrets.
+    ChainExport {
+        /// First chain position to include.
+        #[arg(long)]
+        from: u64,
+        /// Last chain position to include.
+        #[arg(long)]
+        to: u64,
+    },
+
+    /// Verify the witness chain, or a portable segment without opening a vault or daemon.
+    /// With no segment, reads an online-backup SNAPSHOT of witness.db and checks the whole chain.
+    ChainVerify {
+        /// A hestia-chain-segment:v1 JSON file to verify offline.
+        #[arg(value_name = "SEGMENT")]
+        segment: Option<PathBuf>,
+        /// Externally trusted Ed25519 witness public key (hex). Repeat for each trusted key.
+        #[arg(long = "trusted-witness-key", value_name = "HEX")]
+        trusted_witness_key: Vec<String>,
+        /// Externally expected chain id (genesis hash), required for authenticated verification.
+        #[arg(long)]
+        expect_chain_id: Option<String>,
+        /// Externally expected hash before a non-genesis segment.
+        #[arg(long)]
+        expect_previous_hash: Option<String>,
+        /// Externally expected hash of the segment's terminal entry, required for completeness.
+        #[arg(long)]
+        expect_end_hash: Option<String>,
+    },
 
     /// Run the MCP server daemon
     Serve {
@@ -1233,7 +1257,12 @@ pub fn run() -> AnyResult<()> {
     match cli.command {
         Command::Init { force, ai } => cmd_init(&home, force, ai),
         Command::Info => cmd_info(&home),
-        Command::ChainVerify => cmd_chain_verify(&home),
+        Command::ChainExport { from, to } => cmd_chain_export(&home, from, to),
+        Command::ChainVerify { segment, trusted_witness_key, expect_chain_id,
+                               expect_previous_hash, expect_end_hash } => {
+            cmd_chain_verify(&home, segment.as_deref(), trusted_witness_key,
+                             expect_chain_id, expect_previous_hash, expect_end_hash)
+        }
         Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Scope(ScopeCmd::Arbitrate { request_id, grant, deny, reason, as_member, endpoint, target }) => {
@@ -5109,25 +5138,95 @@ fn open_witnessed_chain(
     Ok(chain)
 }
 
-fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
+fn chain_snapshot(home: &std::path::Path) -> AnyResult<(Vault, tempfile::TempDir, hestia::storage::SqliteChainStore)> {
     let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let key = hestia::storage::storage_key(home, &passphrase)
         .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
     // An exclusively created, owner-only directory (Codex review of #1322): never adopt a
     // predictable pre-existing path, which a planted symlink could point at the live chain.
-    // Dropping `tmp` removes only the directory this call created.
     let tmp = tempfile::Builder::new()
         .prefix("hestia-chain-verify-")
         .tempdir()
         .context("creating private snapshot dir")?;
     let copy = tmp.path().join("witness.db");
-    let v = (|| -> AnyResult<hestia::storage::ChainVerification> {
-        hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
-            .context("snapshotting the witness chain")?;
-        let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
-        store.verify_chain()
-    })()?;
-    drop(tmp);
+    hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
+        .context("snapshotting the witness chain")?;
+    let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
+    Ok((vault, tmp, store))
+}
+
+fn cmd_chain_export(home: &std::path::Path, from: u64, to: u64) -> AnyResult<()> {
+    let (vault, _snapshot, store) = chain_snapshot(home)?;
+    let society = hestia::sovereign::Sovereign::persisted_lct_id(&vault)
+        .context("cannot export a segment without a persisted society LCT")?;
+    let segment = store.export_segment(from, to, &society)?;
+    println!("{}", serde_json::to_string_pretty(&segment)?);
+    Ok(())
+}
+
+const MAX_CHAIN_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn cmd_chain_verify(
+    home: &std::path::Path,
+    segment: Option<&std::path::Path>,
+    trusted_witness_key: Vec<String>,
+    expect_chain_id: Option<String>,
+    expect_previous_hash: Option<String>,
+    expect_end_hash: Option<String>,
+) -> AnyResult<()> {
+    if let Some(path) = segment {
+        let bytes = std::fs::metadata(path)
+            .with_context(|| format!("reading chain segment metadata {}", path.display()))?
+            .len();
+        anyhow::ensure!(
+            bytes <= MAX_CHAIN_SEGMENT_BYTES,
+            "chain segment is {bytes} bytes, exceeding the {MAX_CHAIN_SEGMENT_BYTES}-byte limit"
+        );
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading chain segment {}", path.display()))?;
+        let segment: hestia::storage::ChainSegment = match serde_json::from_str(&raw) {
+            Ok(segment) => segment,
+            Err(e) => {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "unverifiable",
+                    "checked_entries": 0,
+                    "tampered": [],
+                    "unverifiable": [format!("invalid segment JSON: {e}")],
+                    "limitations": [
+                        "complete capture and non-bypass of the gate are not established",
+                        "truthful event semantics and key custody are not established (A1)",
+                    ],
+                }))?);
+                anyhow::bail!("chain segment is unverifiable");
+            }
+        };
+        let anchor = hestia::storage::ChainSegmentTrustAnchor {
+            chain_id: expect_chain_id,
+            previous_hash: expect_previous_hash,
+            end_hash: expect_end_hash,
+            trusted_witness_keys: trusted_witness_key.into_iter().collect(),
+        };
+        let has_anchor = anchor.chain_id.is_some()
+            || anchor.previous_hash.is_some()
+            || anchor.end_hash.is_some()
+            || !anchor.trusted_witness_keys.is_empty();
+        let report = hestia::storage::verify_chain_segment_with_anchor(
+            &segment,
+            has_anchor.then_some(&anchor),
+        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        anyhow::ensure!(
+            report.is_valid(),
+            "chain segment verification FAILED (status={:?}, tampered={}, unverifiable={})",
+            report.status,
+            report.tampered.len(),
+            report.unverifiable.len()
+        );
+        return Ok(());
+    }
+
+    let (vault, _snapshot, store) = chain_snapshot(home)?;
+    let v = store.verify_chain()?;
     let sovereign = hestia::sovereign::Sovereign::persisted_lct_id(&vault);
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "link_intact": v.link_intact(),

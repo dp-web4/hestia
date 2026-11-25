@@ -6,6 +6,8 @@ Usage:
   hestia-mesh.py drain                                   # consume-once drain (act on results!)
   hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id] [--operation-id ID]
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
+  hestia-mesh.py pending                                 # pending escalations, read-only
+  hestia-mesh.py sweep                                   # inbox + pending over one session
   hestia-mesh.py kinds [term]                            # KINDS.md, or its sections naming term
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
@@ -574,7 +576,7 @@ def send_operation_id_from_argv():
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered", "pending", "sweep"):
         print(__doc__); sys.exit(2)
     cmd = sys.argv[1]
     try:
@@ -678,6 +680,16 @@ def act(cmd):
         if len(sys.argv) > 2:
             args["older_than_secs"] = int(sys.argv[2])
         out = rpc(h, "hestia_member_unanswered", args)
+    elif cmd == "pending":
+        out = rpc(h, "hestia_gate_pending_escalations", {"session_id": s})
+    elif cmd == "sweep":
+        def read_only(name, args):
+            try:
+                return rpc(h, name, args)
+            except DaemonRefusal as r:
+                return {"_hestia_error": r.payload}
+        out = {"inbox": read_only("hestia_member_inbox", {"session_id": s, "peek": True}),
+               "pending": read_only("hestia_gate_pending_escalations", {"session_id": s})}
     else:
         # already_sent() ran above, before connect(). session_id is added here and is
         # deliberately NOT part of resend_key(): a fresh session is not a new act.
