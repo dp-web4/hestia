@@ -240,8 +240,10 @@ impl ServerHandler for HestiaServer {
                 "hestia://escalation/{id}",
                 "Gate escalation and its decision by id",
                 "Dereference the pointer an escalation invitation (#corroborate-or-dissent) \
-                 or disposition notice (#decided, #459) carries: status/decided_by/decided_at/\
-                 reason. Unknown id answers UNKNOWN, never denied.",
+                 or disposition notice (#decided, #459) carries: status/decided_by/decided_at. \
+                 Historical reason/factors and stated rationale require the original asking \
+                 session, matching poll; unproven reads return null for those fields. Unknown \
+                 id answers UNKNOWN, never denied.",
             ),
             make_resource_template(
                 "hestia://chain/{hash}",
@@ -10778,12 +10780,16 @@ fn resolve_escalation_pointer_for_session(
         "marker": get("marker"),
         "status": status,
         "how_to_answer": escalation_answer_guidance(),
-        "stated_reason": get("stated_reason"),
-        "stated_detail": get("stated_detail"),
+        // Historical rationale and peer factors follow the same rule as poll: only the original
+        // asking session may read them. An unauthenticated resource read must not expose them
+        // directly or smuggle them inside the full terminal entry (#1725).
+        "stated_reason": if asking_session_proven { get("stated_reason") } else { Value::Null },
+        "stated_detail": if asking_session_proven { get("stated_detail") } else { Value::Null },
         "bar": get("bar"),
         "invited_peers": get("invited_peers"),
         "asker_basis": get("asker_basis"),
         "asking_session_proven": asking_session_proven,
+        "historical_details_proven": asking_session_proven,
         // Shape parity with the live arm on the SPEND too — see there for why this
         // is not a fuse field. `claimed: false` is a measured absence here, not an
         // unsearched one: the exact lookup returns every entry naming this escalation
@@ -10808,9 +10814,13 @@ fn resolve_escalation_pointer_for_session(
         // `decided_at` passes through whatever the entry carries (null on
         // entries that predate the field, and while still unsettled).
         "decided_at": settled_get("decided_at"),
-        "factors_present": settled_get("factors_present"),
-        "reason": settled_get("reason"),
-        "settled_entry": settled.as_ref().map(chain_entry_json),
+        "factors_present": if asking_session_proven { settled_get("factors_present") } else { Value::Null },
+        "reason": if asking_session_proven { settled_get("reason") } else { Value::Null },
+        "settled_entry": if asking_session_proven {
+            settled.as_ref().map(chain_entry_json)
+        } else {
+            Value::Null
+        },
         "searched": searched,
         "complete": true,
         "lookup": "exact",
@@ -21435,6 +21445,7 @@ mod tests {
                 "plugin_id": "codex", "session_id": session.clone(),
                 "tool_name": "Edit", "marker": "pre_tool_use.py",
                 "act": "Edit -> pre_tool_use.py",
+                "reason": "private ask rationale",
             }),
         )
         .await
@@ -21643,10 +21654,13 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(unknown["status"], "unknown", "{unknown}");
-            assert_eq!(unknown["history_lookup"], "opened", "{unknown}");
+            assert_eq!(unknown["history_lookup"], "invalid", "{unknown}");
             assert_eq!(unknown["reason"], Value::Null, "{unknown}");
             assert_eq!(unknown["permits_write"], false, "{unknown}");
             assert_eq!(unknown["granted"], false, "{unknown}");
+            let note = unknown["note"].as_str().unwrap();
+            assert!(note.contains("malformed or unrecognized"), "{note}");
+            assert!(!note.contains("treated as expired"), "malformed is not ordinary expiry: {note}");
         }
 
         shared.lock().await.append_chain(
@@ -21731,6 +21745,51 @@ mod tests {
         assert_eq!(mine["factors_present"][0]["argument"], "private peer argument", "{mine}");
         assert_eq!(mine["permits_write"], false, "{mine}");
         assert_eq!(mine["granted"], false, "{mine}");
+    }
+
+    #[tokio::test]
+    async fn historical_resource_details_require_the_same_original_asking_session() {
+        let (_dir, shared, session, id, _opened) = reaped_poll_subject().await;
+        shared.lock().await.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "approved",
+                "decided_by": "operator", "decided_via": "operator_session",
+                "reason": "private review rationale", "bar_met": true,
+                "factors_present": [{"by": "operator", "argument": "private peer argument"}],
+            }),
+        )
+        .unwrap();
+        let other = tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let sibling = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h", "host_session_id": "another-wake",
+        }))
+        .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        for session_id in [None, Some(other.as_str()), Some(sibling.as_str())] {
+            let body = {
+                let s = shared.lock().await;
+                resolve_escalation_pointer_for_session(&s, &id, session_id)
+            };
+            assert_eq!(body["source"], "witness_chain", "{body}");
+            assert_eq!(body["status"], "approved", "{body}");
+            assert_eq!(body["decided_by"], "operator", "{body}");
+            assert_eq!(body["historical_details_proven"], false, "{body}");
+            for key in ["stated_reason", "stated_detail", "reason", "factors_present", "settled_entry"] {
+                assert_eq!(body[key], Value::Null, "{key} leaked to an unproven reader: {body}");
+            }
+        }
+
+        let mine = {
+            let s = shared.lock().await;
+            resolve_escalation_pointer_for_session(&s, &id, Some(&session))
+        };
+        assert_eq!(mine["historical_details_proven"], true, "{mine}");
+        assert_eq!(mine["stated_reason"], "private ask rationale", "{mine}");
+        assert_eq!(mine["reason"], "private review rationale", "{mine}");
+        assert_eq!(mine["factors_present"][0]["argument"], "private peer argument", "{mine}");
+        assert_eq!(mine["settled_entry"]["eventData"]["reason"], "private review rationale", "{mine}");
     }
 
     /// The positive control for the binding above, and the more important half of it: the fix
@@ -30005,6 +30064,9 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     };
     let history_lookup = match chain_answer.as_ref() {
         None => "not_queried",
+        Some(answer) if answer["_hestia_error"]["code"] == "hestia.escalation_history_invalid" => {
+            "invalid"
+        }
         Some(answer) if answer["source"] == "witness_chain"
             && answer.get("settled_entry").is_some_and(|e| !e.is_null()) => "terminal",
         Some(answer) if answer["source"] == "witness_chain" => "opened",
@@ -30157,6 +30219,9 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
                                                      open a new escalation for the act and cite \
                                                      this id: the recovered ruling is evidence \
                                                      for the decider, not a claim",
+            None if history_lookup == "invalid" => "the newest terminal history is malformed or \
+                                                   unrecognized: status is UNKNOWN, not an ordinary \
+                                                   expiry, and permits_write stays false",
             None if history_lookup == "opened" => "the recovered open record has no live ruling \
                                                    path: treated as expired and permits_write stays \
                                                    false",
@@ -33546,9 +33611,9 @@ mod disposition_durability_tests {
     }
 
     /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never
-    /// change an answer" — was only ever asserted over `status_of`. The resolver is
-    /// the new reader: the SAME escalation must read the same before the reap (live
-    /// store) and after it (witness chain).
+    /// change an answer" — was only ever asserted over `status_of`. Status and answer
+    /// guidance survive the move to chain history; detailed rationale follows the
+    /// original-asking-session rule rather than becoming anonymous when the row is reaped.
     #[tokio::test]
     async fn a_reaped_escalation_reads_the_same_from_the_chain() {
         let (_dir, state) = test_state().await;
@@ -33584,14 +33649,16 @@ mod disposition_durability_tests {
             "reaping can never change an answer — now pinned over the resolver, not \
              only over status_of"
         );
-        assert_eq!(after["stated_reason"], "needed the governance file");
+        assert_eq!(after["stated_reason"], Value::Null,
+            "an anonymous resource read does not reveal historical rationale");
+        assert_eq!(after["historical_details_proven"], false);
         assert_eq!(after["plugin_id"], "kimi-code");
         assert_eq!(after["how_to_answer"], before["how_to_answer"]);
     }
 
     /// Change 1, the decided case: the disposition notice outlives the store row by
-    /// days, so the pointer it carries must still resolve — verdict, decider and
-    /// rationale served from the chain entries.
+    /// days, so the pointer still resolves its verdict and decider. Detailed rationale
+    /// and factors require the original asking session on this path too (#1725).
     #[tokio::test]
     async fn a_decided_escalation_resolves_from_the_chain_after_the_reap() {
         let (_dir, state) = test_state().await;
@@ -33624,7 +33691,11 @@ mod disposition_durability_tests {
         assert_eq!(body["source"], "witness_chain");
         assert_eq!(body["status"], "denied");
         assert_eq!(body["decided_by"], "operator");
-        assert_eq!(body["reason"], "the diff widens more than the ask stated");
+        assert_eq!(body["reason"], Value::Null,
+            "verdict metadata remains public without the private rationale");
+        assert_eq!(body["factors_present"], Value::Null);
+        assert_eq!(body["settled_entry"], Value::Null,
+            "the raw terminal row cannot bypass the visibility rule");
     }
 
     /// Change 1, scope arm: same fallback, and the not-found arm must stop saying
@@ -34519,7 +34590,10 @@ mod disposition_durability_tests {
         assert_eq!(body["status"], "approved", "the settlement is found, however deep: {body}");
         assert_eq!(body["decided_by"], "operator");
         assert_eq!(body["claimed"], true, "and the spend: {body}");
-        assert_eq!(body["stated_reason"], "deep record");
+        assert_eq!(body["stated_reason"], Value::Null,
+            "deep recovery does not disclose rationale to an anonymous reader");
+        assert_eq!(body["settled_entry"], Value::Null);
+        assert_eq!(body["historical_details_proven"], false);
         assert_eq!(body["complete"], true);
 
         // An id nobody ever opened: absent over the whole chain, and the envelope says so.
