@@ -4786,7 +4786,7 @@ fn observed_role_payload(
             let (count, last_seen_at) = observations
                 .remove(*role)
                 .unwrap_or((0, String::new()));
-            let outside = has_declaration && !declared.contains(*role);
+            let outside = count > 0 && has_declaration && !declared.contains(*role);
             serde_json::json!({
                 "role": role,
                 "registered": true,
@@ -4798,11 +4798,13 @@ fn observed_role_payload(
         })
         .collect();
     let drift = roles.iter().any(|row| row["outside_declared"] == true)
-        || observations.keys().any(|role| has_declaration && !declared.contains(role));
+        || observations.iter().any(|(role, (count, _))| {
+            *count > 0 && has_declaration && !declared.contains(role)
+        });
     let extra: Vec<serde_json::Value> = observations
         .into_iter()
         .map(|(role, (count, last_seen_at))| {
-            let outside = has_declaration && !declared.contains(&role);
+            let outside = count > 0 && has_declaration && !declared.contains(&role);
             serde_json::json!({
                 "role": role,
                 "registered": false,
@@ -10519,6 +10521,33 @@ mod disposition_tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["effective"]["HESTIA_PLUGIN_ID"], "kimi-code", "{v}");
         assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
+    }
+
+    #[test]
+    fn unobserved_roles_do_not_invent_declared_role_drift() {
+        use std::collections::BTreeMap;
+
+        let declared = Some("role:constellation:interactive-dev,role:constellation:member".to_string());
+        let empty = super::observed_role_payload("synthetic-seat", BTreeMap::new(), declared.clone());
+        assert_eq!(empty["drift"], false, "an empty history is not evidence of drift: {empty}");
+        assert!(empty["roles"].as_array().unwrap().iter()
+            .all(|row| row["outside_declared"] == false), "{empty}");
+
+        let declared_only = super::observed_role_payload("synthetic-seat", BTreeMap::from([
+            ("role:constellation:interactive-dev".to_string(), (2, "t2".to_string())),
+            ("role:constellation:mesh-worker".to_string(), (0, String::new())),
+            ("role:constellation:future-role".to_string(), (0, String::new())),
+        ]), declared.clone());
+        assert_eq!(declared_only["drift"], false, "only observed roles count: {declared_only}");
+        assert_eq!(declared_only["extra_observations"][0]["outside_declared"], false);
+
+        let actual_drift = super::observed_role_payload("synthetic-seat", BTreeMap::from([
+            ("role:constellation:mesh-worker".to_string(), (1, "t1".to_string())),
+        ]), declared);
+        assert_eq!(actual_drift["drift"], true, "a real out-of-set observation stays visible: {actual_drift}");
+        let row = actual_drift["roles"].as_array().unwrap().iter()
+            .find(|row| row["role"] == "role:constellation:mesh-worker").unwrap();
+        assert_eq!(row["outside_declared"], true);
     }
 
     /// #1125: the picker derives from outcomes, preserves registry order, and names drift.
