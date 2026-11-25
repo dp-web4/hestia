@@ -93,9 +93,10 @@ def main() -> int:
         (root / "nested").mkdir()
         (root / "nested" / "helper.py").write_text("from sibling import VALUE\nprint(VALUE)\n")
         nested_command = f"cd /tmp && python3 {root / 'nested' / 'helper.py'}"
+        nested_grants = [f"path:{tmp}{gate.RECURSIVE_SUFFIX}"]
         check("file execution uses the script directory, not the invocation cwd",
-              signal(nested_command, "/tmp", workspace=tmp, scopes=grants) is None,
-              repr(signal(nested_command, "/tmp", workspace=tmp, scopes=grants)))
+              signal(nested_command, "/tmp", workspace=tmp, scopes=nested_grants) is None,
+              repr(signal(nested_command, "/tmp", workspace=tmp, scopes=nested_grants)))
         with tempfile.TemporaryDirectory() as untrusted:
             (Path(untrusted) / "helper.py").write_text("print('untrusted')\n")
             outside = f"python3 {untrusted}/helper.py"
@@ -277,6 +278,10 @@ print(json.dumps({'pid': os.getpid(), 'decision': verdict.decision, 'rule': verd
         check("a newline supplies the same command boundary as a semicolon",
               signal(trusted_newline, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
               repr(signal(trusted_newline, tmp, scopes=[f"path:{root / 'granted'}"])))
+        untrusted_newline = "echo hi\npython3 probe.py"
+        verdict = signal(untrusted_newline, tmp)
+        check("a newline does not hide a later interpreter invocation",
+              verdict is not None and verdict.target == str(root), repr(verdict))
         conditional = f"false && cd {shlex.quote(str(root / 'granted'))}; python3 probe.py"
         verdict = signal(conditional, tmp, scopes=[f"path:{root / 'granted'}"])
         check("a failed conditional cd cannot manufacture package trust",
@@ -285,6 +290,7 @@ print(json.dumps({'pid': os.getpid(), 'decision': verdict.decision, 'rule': verd
         check("a failed cd stops the dependent interpreter invocation",
               signal(missing, tmp, scopes=[f"path:{root / 'granted'}"]) is None,
               repr(signal(missing, tmp, scopes=[f"path:{root / 'granted'}"])))
+        (root / "granted" / ".git").mkdir()
         nested = root / "granted" / "downloads" / "untrusted"
         nested.mkdir(parents=True)
         (nested / "pyproject.toml").write_text("[project]\nname='nested-untrusted'\n")
@@ -293,6 +299,71 @@ print(json.dumps({'pid': os.getpid(), 'decision': verdict.decision, 'rule': verd
         verdict = signal(nested_command, tmp, scopes=[f"path:{root / 'granted'}"])
         check("an exact grant does not bless every nested package directory",
               verdict is not None and verdict.target == str(nested), repr(verdict))
+        unmarked = root / "granted" / "downloads" / "no-marker"
+        unmarked.mkdir()
+        (unmarked / "probe.py").write_text("print('unmarked')\n")
+        unmarked_command = f"cd {shlex.quote(str(unmarked))} && python3 probe.py"
+        verdict = signal(unmarked_command, tmp, scopes=[f"path:{root / 'granted'}"])
+        check("an exact grant does not bless an unmarked nested directory",
+              verdict is not None and verdict.target == str(unmarked), repr(verdict))
+        recursive = [f"path:{root / 'granted'}{gate.RECURSIVE_SUFFIX}"]
+        check("a recursive grant still reaches a nested package directory",
+              signal(unmarked_command, tmp, scopes=recursive) is None,
+              repr(signal(unmarked_command, tmp, scopes=recursive)))
+        untrusted = root / "untrusted"
+        untrusted.mkdir()
+        (untrusted / "probe.py").write_text("print('untrusted')\n")
+        conditional_untrusted = f"true && cd {shlex.quote(str(untrusted))} && python3 probe.py"
+        verdict = signal(conditional_untrusted, root / "granted", workspace=tmp,
+                         scopes=[f"path:{root / 'granted'}"])
+        check("a conditional cd adds an untrusted possible cwd",
+              verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        for label, prefix in (("cloned", "git clone example"), ("created", "mkdir -p")):
+            created = root / "granted" / (label + "-package")
+            command = f"{prefix} {created} && cd {created} && python3 setup.py install"
+            verdict = signal(command, root / "granted", workspace=tmp,
+                             scopes=[f"path:{root / 'granted'}"])
+            check(f"a {label} directory remains a possible cwd",
+                  verdict is not None and verdict.target == str(created), repr(verdict))
+        or_branch = f"cd {shlex.quote(str(untrusted))} || exit; python3 probe.py"
+        verdict = signal(or_branch, root / "granted", workspace=tmp,
+                         scopes=[f"path:{root / 'granted'}"])
+        check("an or-branch does not discard the cd target",
+              verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        (root / "granted" / "sub").mkdir()
+        conditional_sequence = (
+            f"true && cd {shlex.quote(str(untrusted))}; cd sub; python3 probe.py")
+        verdict = signal(conditional_sequence, root / "granted", workspace=tmp, scopes=recursive)
+        check("a later cd preserves conditional cwd alternatives",
+              verdict is not None and verdict.target == str(untrusted), repr(verdict))
+        other_second = root / "other" / "second"
+        other_second.mkdir(parents=True)
+        (other_second / "pyproject.toml").write_text("[project]\n")
+        other_granted = root / "other" / "granted"
+        other_granted.mkdir()
+        (other_granted / "probe.py").write_text("print('other')\n")
+        other_grants = [f"path:{root / 'granted'}", f"path:{other_second}"]
+        relative_sequence = (
+            f"true && cd {shlex.quote(str(other_second))} && cd ../granted && python3 probe.py")
+        verdict = signal(relative_sequence, root / "granted", workspace=tmp, scopes=other_grants)
+        check("a relative cd composes over every possible cwd",
+              verdict is not None and verdict.target == str(other_granted), repr(verdict))
+        commented_cd = f"# note; cd {shlex.quote(str(root / 'granted'))}\npython3 probe.py"
+        verdict = signal(commented_cd, tmp)
+        check("a comment cannot manufacture a trusted cwd",
+              verdict is not None and verdict.target == str(root), repr(verdict))
+        quoted_hash = "echo '#'; python3 probe.py"
+        verdict = signal(quoted_hash, tmp)
+        check("a quoted hash does not start a comment",
+              verdict is not None and verdict.target == str(root), repr(verdict))
+        planted = root / "python3"
+        planted.symlink_to("/bin/true")
+        check("a planted bare-name symlink cannot silence the advisory",
+              signal("python3 probe.py", tmp) is not None)
+        comment_newline = "echo hi # comment\npython3 probe.py"
+        verdict = signal(comment_newline, tmp)
+        check("a comment does not swallow the newline before Python",
+              verdict is not None and verdict.target == str(root), repr(verdict))
         with tempfile.TemporaryDirectory() as ambient:
             exported = f"export PYTHONPATH={shlex.quote(ambient)}; python3 -c 'import x'"
             verdict = signal(exported, tmp, scopes=[f"path:{root / 'granted'}"])

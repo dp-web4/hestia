@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 58fe09218f1e12686fae37473a57f8e40d2add3e8e5f4fe2caa6d1724afff042  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 78be4e398b55516fbf0e2d85d6420749063856857ae4ba37dc660d5f5f2fcf8d  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -3860,12 +3860,59 @@ def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
     return tuple(out)
 
 
+def _shell_without_comments(text: str) -> str:
+    out = []
+    quote = None
+    escaped = False
+    comment = False
+    word_start = True
+    for char in text:
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+                out.append(char)
+            else:
+                out.append(" ")
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            word_start = False
+            continue
+        if quote is not None:
+            out.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            word_start = False
+            continue
+        if char in ("'", '"'):
+            quote = char
+            out.append(char)
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            comment = True
+            out.append(" ")
+            continue
+        out.append(char)
+        word_start = char.isspace() or char in ";|&()"
+    return "".join(out)
+
+
 def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
     """Parse direct interpreter command positions as `(isolated, script_dir, cwd, PYTHONPATH)`."""
     if not command:
         return []
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;")
+        command = _shell_without_comments(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\n")
+        lexer.whitespace = " \t\r\f\v"
+        lexer.commenters = ""
         lexer.whitespace_split = True
         words = list(lexer)
     except ValueError:
@@ -3873,7 +3920,7 @@ def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
     segments = [[]]
     separators = []
     for word in words:
-        if re.fullmatch(r"[&|;]+", word):
+        if re.fullmatch(r"(?:[&|;]|\n)+", word):
             separators.append(word)
             segments.append([])
         else:
@@ -3881,11 +3928,20 @@ def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
 
     invocations = []
     current_cwd = os.path.realpath(cwd)
+    alternate_cwds = []
+    current_pythonpath = None
+    skip_next = False
     for segment_index, segment in enumerate(segments):
+        if skip_next:
+            if not segment:
+                continue
+            skip_next = False
+            continue
         if not segment:
             continue
+        previous_separator = separators[segment_index - 1] if segment_index else None
         i = 0
-        pythonpath = None
+        pythonpath = current_pythonpath
         while i < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[i]):
             name, value = segment[i].split("=", 1)
             if name == "PYTHONPATH":
@@ -3912,14 +3968,40 @@ def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
                 else:
                     break
         if i >= len(segment):
+            if segment[0] != "env":
+                current_pythonpath = pythonpath
+            continue
+        if segment[i] in ("export", "local", "declare", "typeset", "readonly"):
+            for arg in segment[i + 1:]:
+                name, eq, value = arg.partition("=")
+                if eq and name == "PYTHONPATH":
+                    current_pythonpath = value
+            continue
+        if segment[i] == "unset":
+            if any(arg == "PYTHONPATH" for arg in segment[i + 1:]):
+                current_pythonpath = None
             continue
         if segment[i] == "cd":
-            if (len(segment) == i + 2 and segment_index < len(separators)
-                    and separators[segment_index] in ("&&", ";")):
-                current_cwd = os.path.realpath(os.path.join(
-                    current_cwd, os.path.expanduser(segment[i + 1])))
+            next_separator = (separators[segment_index]
+                              if segment_index < len(separators) else None)
+            if len(segment) == i + 2 and next_separator in ("&&", "||", ";", "\n"):
+                possible = list(dict.fromkeys([current_cwd] + alternate_cwds))
+                targets = [os.path.realpath(os.path.join(c, os.path.expanduser(segment[i + 1])))
+                           for c in possible]
+                if previous_separator in ("&&", "||") or next_separator == "||":
+                    keep = possible + targets
+                else:
+                    keep = [target if os.path.isdir(target) else original
+                            for original, target in zip(possible, targets)]
+                    if (not any(os.path.isdir(target) for target in targets)
+                            and next_separator == "&&" and segment_index == 0):
+                        skip_next = True
+                keep = list(dict.fromkeys(keep))
+                current_cwd, alternate_cwds = keep[0], keep[1:]
             continue
-        if not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", os.path.basename(segment[i])):
+        program = (os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
+                   if "/" in segment[i] else segment[i])
+        if not re.fullmatch(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?(?:-dbg)?", program):
             continue
 
         isolated = False
@@ -3961,10 +4043,11 @@ def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
                 continue
             script = arg
             break
-        script_dir = None
-        if script and not stop_at_cwd:
-            script_dir = os.path.dirname(os.path.realpath(os.path.join(current_cwd, script)))
-        invocations.append((isolated, script_dir, current_cwd, pythonpath))
+        for invocation_cwd in dict.fromkeys([current_cwd] + alternate_cwds):
+            script_dir = None
+            if script and not stop_at_cwd:
+                script_dir = os.path.dirname(os.path.realpath(os.path.join(invocation_cwd, script)))
+            invocations.append((isolated, script_dir, invocation_cwd, pythonpath))
     return invocations
 
 
@@ -3980,11 +4063,12 @@ def _python_invocation(command: Optional[str], cwd: str) -> tuple:
 def _declared_package_root(cwd: str, workspace: str, scopes) -> Optional[str]:
     """The nearest root carrying both an explicit path grant and package/source evidence."""
     current = os.path.realpath(cwd)
+    evidence_dir = current
     workspace = os.path.realpath(workspace)
     markers = ("pyproject.toml", "setup.py", "setup.cfg", "Pipfile", ".git")
     while True:
         if any(os.path.exists(os.path.join(current, marker)) for marker in markers):
-            return current if _within_path_grant(current, scopes, workspace) else None
+            return current if _within_path_grant(evidence_dir, scopes, workspace) else None
         if current == workspace or os.path.dirname(current) == current:
             return None
         current = os.path.dirname(current)
@@ -3993,8 +4077,12 @@ def _declared_package_root(cwd: str, workspace: str, scopes) -> Optional[str]:
 def python_ambient_import_verdict(command: Optional[str], cwd: str, workspace: str, scopes) -> Optional[Verdict]:
     """Warn when non-isolated Python runs without a declared trusted package root.
 
-    Trust requires an explicit `path:` grant AND package evidence, never a marker alone.
-    Existing denies keep precedence: this is called only after scope has admitted the act.
+    Trust requires an explicit `path:` grant that reaches the actual script/import directory
+    AND package evidence, never a marker or an exact grant on an ancestor alone. Existing denies
+    keep precedence: this is called only after scope has admitted the act. Only direct interpreter
+    commands are parsed; `sh -c`, `uv run`, command substitution, `if`/`while` bodies, subshells,
+    `pushd`, and heredoc-fed interpreters are outside this advisory, so no warning is not proof
+    of import safety.
     """
     for isolated, script_dir, invocation_cwd, pythonpath in _python_invocations(command, cwd):
         if isolated:
