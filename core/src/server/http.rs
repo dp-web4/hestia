@@ -8414,7 +8414,7 @@ fn ungovern_ordered(
 /// no guarantee. The hashes a verdict or a ratification rests on are still taken under the lock.
 pub(crate) async fn discovered_gate_paths_off_lock() -> Result<Vec<(String, String)>, String> {
     let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
-    discovered_gate_paths_from(&inv)
+    super::gate_watch::with_deployed_engine(discovered_gate_paths_from(&inv))
 }
 
 /// The discovered gates AND the ids of installed members that declare a gate role, from ONE
@@ -8424,7 +8424,8 @@ pub(crate) async fn discovered_gate_paths_off_lock() -> Result<Vec<(String, Stri
 /// Off the lock and off the async workers, as above.
 async fn gate_inventory_off_lock() -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
-    Ok((discovered_gate_paths_from(&inv)?, members_declaring_a_gate(&inv)))
+    let discovered = super::gate_watch::with_deployed_engine(discovered_gate_paths_from(&inv))?;
+    Ok((discovered, members_declaring_a_gate(&inv)))
 }
 
 /// Ids (member id and atlas id, since an expectation's plugin_id may be either) of every
@@ -9050,7 +9051,7 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
             // The denominator, stated. A reader can now tell how many gates this verdict
             // covers, which is the fact the previous version silently omitted.
             "discovered": discovered.len(),
-            "coverage_source": "agent-inventory hook_targets (full scope chain), gate-role only",
+            "coverage_source": "agent-inventory hook_targets plus current-build shared_engine",
             // What an operator needs to ratify responsibly, stated beside the verdicts:
             // the bytes installed NOW, per discovered gate, and what the deployment
             // authority recorded installing. Evidence only; nothing is refused on it.
@@ -10051,6 +10052,20 @@ mod disposition_tests {
         assert_eq!(names, vec![("/h/codex.py".into(), "differs".into()), ("/h/kimi.py".into(), "not-deployed".into())]);
         // And with no deploy record at all, bulk cannot be accepted either.
         assert!(plan_ratification(&body, "r", &discovered, &current, None, &previous, chrono::Utc::now()).is_err());
+    }
+
+    #[test]
+    fn a_deployed_shared_engine_can_be_ratified() {
+        use serde_json::json;
+        let path = "/s/core.py";
+        let discovered = vec![(crate::server::gate_watch::ENGINE_PLUGIN_ID.to_string(), path.to_string())];
+        let current = serde_json::Map::from_iter([(path.to_string(), json!("aaaa"))]);
+        let deployed = json!({"files": {"/s/core.py": "aaaa"}});
+        let plan = plan_ratification(
+            &json!({"expected": current.clone()}), "reviewed engine", &discovered, &current,
+            Some(&deployed), &Default::default(), chrono::Utc::now()).unwrap();
+        assert_eq!(plan.next[path].plugin_id, crate::server::gate_watch::ENGINE_PLUGIN_ID);
+        assert_eq!(plan.next[path].sha256, "aaaa");
     }
 
     #[test]
