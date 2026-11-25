@@ -722,6 +722,7 @@ def test_real_daemon_warm_latency_within_hook_budget():
 
 TESTS = [
     test_every_verdict_commits_on_a_receipt_that_names_it,
+    test_an_older_daemon_gets_one_conservative_retry,
     test_sse_framed_receipt_commits,
     test_the_daemons_existing_row_is_a_committed_receipt,
     test_a_refused_verdict_is_not_committed,
