@@ -470,6 +470,8 @@ def test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial(m, g, w
                 check(f"{tag}-denial-carries-rule", second.get("rule_id") == "gate.evidence_uncommitted", second)
                 check(f"{tag}-denial-names-what-it-replaced",
                       "supersedes uncommitted allow" in (second.get("attempted") or ""), second)
+                check(f"{tag}-synthetic-denial-is-not-the-exact-original-act",
+                      second.get("attempted_exact") is False, second)
             finally:
                 stub.close()
     # A PERMITTED read whose RECORD does not commit keeps C11's read posture and says so (C11 text).
@@ -1820,12 +1822,37 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
 #: multi-second stall was measured here under `cargo -j2`, the #423 jitter class) cannot turn a
 #: behaviour check into a timing flake. The real deadline is what the parity arm runs at.
 RELAXED_DEADLINE_SECONDS = 15.0
+def test_attempted_exact_preserves_raw_whitespace_identity(m, g, wc, home):
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            expected = (
+                ("printf 'alpha beta'", True),
+                ("printf 'alpha  beta'", False),
+                ("printf 'alpha beta' ", False),
+            )
+            for command, exact in expected:
+                d, _ = _decide(g, "codex", "Bash", {"command": command}, home)
+                check("whitespace-act-recorded", d.evidence_committed, d)
+                sent = stub.named("hestia_witness_decision")[-1][0]
+                check(f"raw-whitespace-exact-{exact}", sent.get("attempted_exact") is exact, sent)
+            first, second = [a for a, _ in stub.named("hestia_witness_decision")][:2]
+            check("whitespace-distinct-acts-share-only-a-normalized-summary",
+                  first.get("attempted") == second.get("attempted")
+                  and first.get("attempted_exact") is True
+                  and second.get("attempted_exact") is False,
+                  (first, second))
+    finally:
+        stub.close()
+
+
 DEADLINE_TESTS = {"test_one_deadline_bounds_the_whole_invocation",
                   "test_the_gate_owns_no_cache_no_client_and_one_recorder",
                   # The real daemon is where the cold-start caveat lives: it MUST run at 3 s.
                   "test_against_an_isolated_real_daemon"}
 
 CONTRACT_TESTS = [
+    test_attempted_exact_preserves_raw_whitespace_identity,
     test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
     test_the_key_from_the_raw_event_reaches_every_join,
     test_the_gate_owns_no_cache_no_client_and_one_recorder,

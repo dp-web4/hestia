@@ -183,6 +183,7 @@ def test_every_verdict_commits_on_a_receipt_that_names_it():
                      ("correlation_key", "toolu_01ABC"), ("session_id", "sess-1")):
             check(f"wire-arg-{k}", a.get(k) == v, a)
         check("wire-carries-core-digest-key", "core_digest" in a, a)
+        check("older-direct-callers-default-to-inexact", a.get("attempted_exact") is False, a)
     finally:
         stub.close()
 

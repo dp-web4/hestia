@@ -659,6 +659,7 @@ fn hestia_tools() -> Vec<Tool> {
                     "verdict_available": {"type": "boolean", "description": "False means the gate could not judge; records infrastructure, not member conduct."},
                     "rule_id": {"type": "string"},
                     "attempted": {"type": "string", "description": "Bounded, redacted summary of the act."},
+                    "attempted_exact": {"type": "boolean", "description": "True only when the sender preserved the act byte-for-byte before redaction; absent means not exact."},
                     "role": {"type": "string"},
                     "action_id": {"type": "string", "format": "uuid"},
                     "correlation_key": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,200}$"},
@@ -3637,8 +3638,8 @@ fn redact_secrets(input: &str) -> String {
 /// Is `feedback.act` — a digest over `redacted`, the whole attempt after `redact_secrets` — an
 /// IDENTITY of the act, so that two equal digests mean two equal acts? Only when nothing was
 /// masked, bounded, or whitespace-normalised anywhere in the input: not by this daemon
-/// (`redacted` differs from `raw`), and not by the sender (its `***` value mask, `[REDACTED —`
-/// withholding, or `…` cut, which `attempted_summary` applies before the daemon sees the text).
+/// (`redacted` differs from `raw`), and not by the sender (its `attempted_exact: false` for
+/// whitespace collapse, `***` value mask, `[REDACTED —` withholding, or `…` cut).
 /// Decided at the producer over the whole input because the row's `attempted` is capped at
 /// `ATTEMPTED_MAX`: a mask past the cap is invisible to any reader of the row (NOVA's re-review
 /// of 7c73d48c9). Conservative: a command that merely contains `***` or `…` reads as not exact.
@@ -4830,6 +4831,7 @@ const WITNESS_DECISION_ACCEPTED_KEYS: &[&str] = &[
     "verdict_available",
     "rule_id",
     "attempted",
+    "attempted_exact",
     "role",
     "action_id",
     "correlation_key",
@@ -5066,10 +5068,13 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let attempted_whole = attempted_raw.as_deref().map(redact_secrets);
     // Judged over the WHOLE sent text: a gate's own mask or bound (`attempted_summary`'s
     // `***`, `[REDACTED —`, ` …`) makes the digest below a digest of a summary, not of the act.
+    // The sender must also attest that it preserved the raw act's whitespace. Older senders
+    // omitted that evidence and are conservatively not exact (#1588's witness-route gap).
+    let sender_act_exact = args.get("attempted_exact").and_then(Value::as_bool) == Some(true);
     let act_exact = attempted_raw
         .as_deref()
         .zip(attempted_whole.as_deref())
-        .map(|(raw, w)| act_exact_of(raw, w));
+        .map(|(raw, w)| sender_act_exact && act_exact_of(raw, w));
     let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
             a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
@@ -36448,6 +36453,7 @@ mod decision_witness_tests {
             "target": "/tmp/x",
             "verdict_available": true,
             "attempted": "Write -> /tmp/x",
+            "attempted_exact": true,
         })
     }
 
@@ -38855,7 +38861,7 @@ mod verdict_feedback_tests {
         json!({
             "plugin_id": "codex", "decision": "deny", "adjudicator": "plugin-gate:codex",
             "reason": "r", "rule_id": rule_id, "tool_name": "Read", "target": "/home/x/.ssh/id",
-            "attempted": "Read -> /home/x/.ssh/id", "serves": "q7",
+            "attempted": "Read -> /home/x/.ssh/id", "attempted_exact": true, "serves": "q7",
         })
     }
 
@@ -38929,6 +38935,40 @@ mod verdict_feedback_tests {
             "different long attempts must not share a digest");
         assert_eq!(second["feedback"]["repeat_of"], Value::Null,
             "a shared capped prefix is not a repeated act: {second}");
+    }
+
+    #[tokio::test]
+    async fn sender_whitespace_normalisation_is_not_exact_on_the_witness_route() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut hashes = Vec::new();
+        for _ in 0..2 {
+            let mut args = witnessed("mrh.path");
+            args["tool_name"] = json!("Bash");
+            args["attempted"] = json!("Bash: printf 'alpha beta'");
+            args["attempted_exact"] = json!(false);
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            let got = tool_witness_decision(&state, &args).await.unwrap();
+            hashes.push(got["witnessEntryHash"].as_str().unwrap().to_string());
+        }
+        let (a, b) = (row(&state, &hashes[0]).await, row(&state, &hashes[1]).await);
+        assert_eq!(a["feedback"]["act"], b["feedback"]["act"],
+            "precondition: whitespace-distinct raw acts have one normalized digest");
+        for r in [&a, &b] {
+            assert_eq!(r["act_exact"], json!(false), "sender normalization was lost: {r}");
+        }
+
+        let mut exact = witnessed("mrh.path");
+        exact["attempted_exact"] = json!(true);
+        let got = tool_witness_decision(&state, &exact).await.unwrap();
+        assert_eq!(row(&state, got["witnessEntryHash"].as_str().unwrap()).await["act_exact"],
+            json!(true), "an explicit lossless sender remains exact");
+
+        let mut legacy = witnessed("mrh.path");
+        legacy.as_object_mut().unwrap().remove("attempted_exact");
+        let got = tool_witness_decision(&state, &legacy).await.unwrap();
+        assert_eq!(row(&state, got["witnessEntryHash"].as_str().unwrap()).await["act_exact"],
+            json!(false), "an older sender without the field is conservatively inexact");
     }
 
     /// NOVA's re-review of 7c73d48c9: a mask PAST the 400-char display cut. Two acts that differ
