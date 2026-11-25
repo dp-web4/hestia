@@ -19716,15 +19716,15 @@ mod tests {
         assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
 
         // The shipped member-mesh client connects without host_session_id. An exact act from
-        // another session must retain the independent-open door, not a false mismatch refusal.
+        // another session must retain independent open/coalesce, not a false mismatch refusal.
         let other_session = connect_as(&shared, "kimi-code").await;
         let independent = tool_gate_escalation_open(
             &shared, &manual_open_args(&other_session, marker, canonical))
             .await
             .unwrap();
-        assert_eq!(independent["binding_status"], "marker_history_only", "{independent}");
-        assert_eq!(independent["binding_verified"], false, "{independent}");
-        assert_eq!(independent["bound_refusal_id"], Value::Null, "{independent}");
+        assert!(independent.get("_hestia_error").is_none(), "the door stayed open: {independent}");
+        assert!(independent["escalation_id"].as_str().is_some(), "{independent}");
+        assert_eq!(independent["coalesced"], true, "the existing exact ask coalesced: {independent}");
         assert!(independent.get("expected").is_none(), "no other session's act: {independent}");
         assert!(independent.get("refusal_id").is_none(), "no other session's id: {independent}");
         assert!(independent.get("alternatives").is_none(), "no refusal details: {independent}");
