@@ -25,7 +25,7 @@ import type { AgentInventory, AgentRow, OperatorStatus } from "../lib/types";
  * exactly what dp asked the bypass to test.
  */
 
-const memberOf = (r: AgentRow) => r.member || r.plugin;
+const memberOf = (r: AgentRow) => r.member || r.plugin || r.agent;
 const hasHestiaGate = (r: AgentRow) =>
   (r.hook_targets ?? []).some((t) => t.is_gate === true && t.owned_by_hestia === true);
 
@@ -161,7 +161,7 @@ export function Agents() {
               const isRetired = retired.includes(r.plugin);
               const retiredButLive = isRetired && (r.governed || r.wired);
               return (
-                <tr key={r.agent} data-agent={r.agent}>
+                <tr key={memberOf(r)} data-agent={memberOf(r)}>
                   <td>
                     {r.agent}
                     {r.kind === "being" && <span className="muted"> · being</span>}
