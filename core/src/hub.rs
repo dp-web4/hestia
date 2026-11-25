@@ -270,6 +270,82 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s.trim()).ok()?.try_into().ok()
 }
 
+/// Read a complete member identity without changing the vault.
+///
+/// Complete means coherent, not merely present: the stored `ai_identity_pubkey` is what a hub may
+/// have pinned, so a secret that derives a different key is not this member's identity. Returning
+/// it would sign as a key the hub does not know while every surface reports the pinned one.
+pub fn read_member_identity(vault: &crate::vault::Vault) -> Option<(Uuid, KeyPair)> {
+    let lct_e = vault.get("ai_identity_lct_id")?;
+    let pub_e = vault.get("ai_identity_pubkey")?;
+    let sec_e = vault.get("ai_identity_secret")?;
+    let lct = Uuid::parse_str(&lct_e.secret).ok()?;
+    let bytes = hex_to_32(&sec_e.secret)?;
+    let kp = KeyPair::from_secret_bytes(&bytes);
+    if !kp.verifying_key().to_hex().eq_ignore_ascii_case(pub_e.secret.trim()) {
+        return None;
+    }
+    Some((lct, kp))
+}
+
+/// Why three present identity entries do not form an identity. For the operator's repair message.
+fn member_identity_defect(vault: &crate::vault::Vault) -> &'static str {
+    let entry = |name| vault.get(name).map(|e| e.secret.trim().to_string()).unwrap_or_default();
+    if Uuid::parse_str(&entry("ai_identity_lct_id")).is_err() {
+        return "ai_identity_lct_id is not a UUID";
+    }
+    let Some(bytes) = hex_to_32(&entry("ai_identity_secret")) else {
+        return "ai_identity_secret is not 32 hex-encoded bytes";
+    };
+    let stored = entry("ai_identity_pubkey");
+    if hex_to_32(&stored).is_none() {
+        return "ai_identity_pubkey is not 32 hex-encoded bytes";
+    }
+    if !KeyPair::from_secret_bytes(&bytes).verifying_key().to_hex().eq_ignore_ascii_case(&stored) {
+        return "ai_identity_secret does not derive the stored ai_identity_pubkey";
+    }
+    "entries are unreadable"
+}
+
+/// Load or provision the member identity shared by the CLI and dashboard.
+pub fn ensure_member_identity(vault: &mut crate::vault::Vault) -> Result<(Uuid, KeyPair)> {
+    let has_lct = vault.get("ai_identity_lct_id").is_some();
+    let has_pubkey = vault.get("ai_identity_pubkey").is_some();
+    let has_secret = vault.get("ai_identity_secret").is_some();
+    if has_lct && has_pubkey && has_secret {
+        return read_member_identity(vault)
+            .ok_or_else(|| anyhow::anyhow!(
+                "member identity entries are malformed ({}); operator repair required — refusing to sign or remint",
+                member_identity_defect(vault)
+            ));
+    }
+    if has_pubkey || has_secret {
+        if has_pubkey && !has_secret {
+            anyhow::bail!("member identity has a public key but no private key; operator repair is required — refusing to remint a key a hub may have pinned");
+        }
+        anyhow::bail!("member identity is partial (lct_id={has_lct}, pubkey={has_pubkey}, secret={has_secret}); operator repair is required — refusing to remint");
+    }
+
+    // A lone LCT has no public key a hub could have pinned, so it is the only partial state we
+    // may replace. Otherwise this is a fresh identity. All three entries commit as one write.
+    let kp = KeyPair::generate();
+    let lct = Uuid::new_v4();
+    let secret_hex: String = kp
+        .secret_key_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    vault.upsert_many(&[
+        crate::vault::VaultEntry::new("ai_identity_lct_id", lct.to_string())
+            .with_tags(vec!["identity".into()]),
+        crate::vault::VaultEntry::new("ai_identity_pubkey", kp.verifying_key().to_hex())
+            .with_tags(vec!["identity".into()]),
+        crate::vault::VaultEntry::new("ai_identity_secret", secret_hex)
+            .with_tags(vec!["identity".into(), "secret".into()]),
+    ])?;
+    Ok((lct, kp))
+}
+
 /// Resolve the keypair that signs member-tier acts to a hub, per its
 /// `member_key_source`. `VaultIdentity` reads `ai_identity_secret` from the
 /// sealed vault (default); `ChannelKeyFile` reads a raw 32-byte Ed25519 seed —
@@ -1456,6 +1532,91 @@ fn channel_inner_request(tool: &str, args: serde_json::Value) -> serde_json::Val
 mod tests {
     use super::*;
     use web4_core::crypto::KeyPair;
+
+    #[test]
+    fn member_identity_provisions_all_three_entries_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.enc");
+        let mut vault = crate::vault::Vault::init(path, "p".into()).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("stop".into())));
+        assert!(ensure_member_identity(&mut vault).is_err());
+        for name in ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret"] {
+            assert!(vault.get(name).is_none(), "a failed identity commit left {name}");
+        }
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        let (lct, keypair) = ensure_member_identity(&mut vault).unwrap();
+        let (read_lct, read_keypair) = read_member_identity(&vault).unwrap();
+        assert_eq!(read_lct, lct);
+        assert_eq!(read_keypair.verifying_key().to_hex(), keypair.verifying_key().to_hex());
+    }
+
+    #[test]
+    fn only_a_lone_lct_is_replaced_but_a_missing_private_key_is_never_reminted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lone = crate::vault::Vault::init(dir.path().join("lone.enc"), "p".into()).unwrap();
+        let old = Uuid::new_v4();
+        lone.add(crate::vault::VaultEntry::new("ai_identity_lct_id", old.to_string())).unwrap();
+        let (new, _) = ensure_member_identity(&mut lone).unwrap();
+        assert_ne!(new, old);
+        assert!(read_member_identity(&lone).is_some());
+
+        let mut pinned = crate::vault::Vault::init(dir.path().join("pinned.enc"), "p".into()).unwrap();
+        pinned
+            .add(crate::vault::VaultEntry::new("ai_identity_pubkey", KeyPair::generate().verifying_key().to_hex()))
+            .unwrap();
+        let before = pinned.get("ai_identity_pubkey").unwrap().secret.clone();
+        let error = match ensure_member_identity(&mut pinned) {
+            Ok(_) => panic!("a missing private key must never remint"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("no private key"), "{error:#}");
+        assert_eq!(pinned.get("ai_identity_pubkey").map(|e| e.secret.as_str()), Some(before.as_str()));
+        assert!(pinned.get("ai_identity_lct_id").is_none());
+        assert!(pinned.get("ai_identity_secret").is_none());
+    }
+
+    /// A secret for key S beside a stored public key P is not a complete identity: a hub may have
+    /// pinned P. The reader refuses it, `ensure` names the mismatch and changes nothing.
+    #[test]
+    fn a_secret_that_does_not_derive_the_stored_pubkey_is_not_an_identity() {
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let build = |file: &str, pubkey: String, secret: String| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut v = crate::vault::Vault::init(dir.path().join(file), "p".into()).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_lct_id", Uuid::new_v4().to_string())).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_pubkey", pubkey)).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_secret", secret)).unwrap();
+            (dir, v)
+        };
+        let snapshot = |v: &crate::vault::Vault| {
+            ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret"]
+                .map(|n| v.get(n).map(|e| e.secret.clone()))
+        };
+        let pinned = KeyPair::generate();
+        let other = KeyPair::generate();
+
+        // Positive control: the matching pair reads, in either hex case.
+        let (_d, ok) = build("ok.enc", pinned.verifying_key().to_hex().to_uppercase(), hex(&pinned.secret_key_bytes()));
+        assert!(read_member_identity(&ok).is_some(), "a matching pair must read");
+
+        for (label, pubkey, want) in [
+            ("mismatch", pinned.verifying_key().to_hex(), "does not derive the stored ai_identity_pubkey"),
+            ("malformed", "not-a-key".to_string(), "ai_identity_pubkey is not 32 hex-encoded bytes"),
+        ] {
+            let (_d, mut v) = build("bad.enc", pubkey, hex(&other.secret_key_bytes()));
+            let before = snapshot(&v);
+            assert!(
+                read_member_identity(&v).is_none(),
+                "{label}: read_member_identity accepted a secret whose public key != stored ai_identity_pubkey"
+            );
+            let error = match ensure_member_identity(&mut v) {
+                Ok(_) => panic!("{label}: ensure_member_identity returned a signer"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(want), "{label}: {error}");
+            assert_eq!(snapshot(&v), before, "{label}: a refused identity must not be rewritten");
+        }
+    }
 
     // [retired 2026-07-20] sealed_secret_roundtrips_e2e_and_fails_closed tested the
     // send_secret primitives; superseded by `crate::pairing`'s pair-channel tests.
