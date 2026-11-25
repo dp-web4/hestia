@@ -2630,9 +2630,8 @@ async fn trust_derivation_json(
     let role = q
         .role
         .unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
-    // One shared window for every derivation surface: split budgets, so sparse
-    // governance evidence is not crowded out by routine outcomes. See
-    // `derivation::scan_window` for why the three call sites must not diverge.
+    // One cache for every derivation surface: each member's subject window uses
+    // split budgets, so peer traffic cannot crowd out that member's evidence.
     let derived = cached_derivation(&s, &q.plugin_id, &role);
     drop(s);
     Json(serde_json::to_value(derived).unwrap_or_default())
@@ -2654,9 +2653,8 @@ async fn trust_graph_turtle(
     let role = q
         .role
         .unwrap_or_else(|| "role:constellation:interactive-dev".to_string());
-    // One shared window for every derivation surface: split budgets, so sparse
-    // governance evidence is not crowded out by routine outcomes. See
-    // `derivation::scan_window` for why the three call sites must not diverge.
+    // One cache for every derivation surface: each member's subject window uses
+    // split budgets, so peer traffic cannot crowd out that member's evidence.
     let derived = cached_derivation(&s, &q.plugin_id, &role);
     // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here
     // would encode the attribution gap into the graph this projection exists to close.
