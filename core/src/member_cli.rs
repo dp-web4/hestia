@@ -40,20 +40,20 @@ use std::time::Duration;
 /// One challenge-signed operator session against the local daemon. Mirrors
 /// `tools/seed_seat_config.py`'s `Operator.call` — bearer token, JSON in/out,
 /// daemon error text surfaced verbatim (it is the diagnosis).
-struct OperatorSession {
+pub(crate) struct OperatorSession {
     client: reqwest::blocking::Client,
     base: String,
     token: String,
     /// The operator principal the daemon resolved (for display — the record's
     /// author comes from the daemon's side of the same session).
-    operator: String,
+    pub(crate) operator: String,
 }
 
 impl OperatorSession {
     /// Challenge → sign → session. The key is read here and never leaves the
     /// process. Errors refuse loudly: a session that cannot open is the whole
     /// answer, and continuing without one would mint nothing anyway.
-    fn open(endpoint: &str, key_path: &Path) -> Result<Self> {
+    pub(crate) fn open(endpoint: &str, key_path: &Path) -> Result<Self> {
         let cred_text = std::fs::read_to_string(key_path)
             .with_context(|| format!("reading operator credential {}", key_path.display()))?;
         let cred: serde_json::Value = serde_json::from_str(&cred_text)
@@ -128,7 +128,7 @@ impl OperatorSession {
         })
     }
 
-    fn get(&self, path: &str) -> Result<serde_json::Value> {
+    pub(crate) fn get(&self, path: &str) -> Result<serde_json::Value> {
         let resp = self
             .client
             .get(format!("{}{path}", self.base))
@@ -144,7 +144,7 @@ impl OperatorSession {
         Ok(answer)
     }
 
-    fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    pub(crate) fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let resp = self
             .client
             .post(format!("{}{path}", self.base))

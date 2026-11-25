@@ -356,6 +356,43 @@ impl HubStore {
     }
 }
 
+/// Resolve a discovered REST endpoint without letting discovery choose a new origin.
+pub fn absolute_rest_endpoint(base_url: &str, rest: &str) -> Result<String> {
+    let rest = if rest.is_empty() { "/v1" } else { rest };
+    if rest.contains('?') || rest.contains('#') {
+        anyhow::bail!("discovery endpoint query/fragment is not allowed");
+    }
+    let base = reqwest::Url::parse(base_url.trim()).context("invalid selected hub URL")?;
+    if !base.username().is_empty() || base.password().is_some() {
+        anyhow::bail!("selected hub URL user-info is not allowed");
+    }
+    if base.query().is_some() || base.fragment().is_some() {
+        anyhow::bail!("selected hub URL query/fragment is not allowed");
+    }
+    let candidate = if rest.starts_with("http://") || rest.starts_with("https://") {
+        rest.to_string()
+    } else {
+        if rest.contains("://") {
+            anyhow::bail!("non-http discovery endpoint refused");
+        }
+        format!("{}/{}", base_url.trim_end_matches('/'), rest.trim_matches('/'))
+    };
+    let endpoint = reqwest::Url::parse(&candidate).context("invalid discovery endpoint")?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        anyhow::bail!("discovery endpoint must be an HTTP(S) origin");
+    }
+    if base.scheme() != endpoint.scheme()
+        || base.host_str() != endpoint.host_str()
+        || base.port_or_known_default() != endpoint.port_or_known_default()
+    {
+        anyhow::bail!("cross-origin discovery endpoint refused");
+    }
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        anyhow::bail!("discovery endpoint user-info is not allowed");
+    }
+    Ok(endpoint.to_string().trim_end_matches('/').to_string())
+}
+
 /// HTTP client for hub API calls.
 pub struct HubClient {
     http: reqwest::Client,
@@ -1671,6 +1708,39 @@ mod tests {
         assert!(v.get("caller_lct_id").is_some());
         assert!(v.get("pair_id").is_some());
         assert_eq!(v.get("sealed").and_then(|s| s.as_str()), Some("AAAA"));
+    }
+
+    #[test]
+    fn rest_endpoint_resolution_is_confined_to_the_selected_origin() {
+        let selected = "http://127.0.0.1:8770";
+        assert_eq!(absolute_rest_endpoint(selected, "").unwrap(),
+                   "http://127.0.0.1:8770/v1");
+        assert_eq!(absolute_rest_endpoint(selected, "/v1").unwrap(),
+                   "http://127.0.0.1:8770/v1");
+        assert_eq!(absolute_rest_endpoint(selected, "http://127.0.0.1:8770/v1/").unwrap(),
+                   "http://127.0.0.1:8770/v1");
+
+        for endpoint in [
+            "http://127.0.0.1:9999/v1",
+            "https://127.0.0.1:8770/v1",
+            "http://example.com/v1",
+            "http://user@127.0.0.1:8770/v1",
+            "http://127.0.0.1:8770/v1?query=1",
+            "http://127.0.0.1:8770/v1#fragment",
+            "file:///tmp/hub",
+            "/v1?query=1",
+            "/v1#fragment",
+        ] {
+            assert!(absolute_rest_endpoint(selected, endpoint).is_err(), "{endpoint}");
+        }
+        for selected in [
+            "http://user@127.0.0.1:8770",
+            "http://127.0.0.1:8770/?query=1",
+            "http://127.0.0.1:8770/#fragment",
+        ] {
+            assert!(absolute_rest_endpoint(selected, "/v1").is_err(), "{selected}");
+            assert!(absolute_rest_endpoint(selected, "http://127.0.0.1:8770/v1").is_err(), "{selected}");
+        }
     }
 
     #[test]
