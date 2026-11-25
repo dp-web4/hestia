@@ -13,7 +13,7 @@
 //! stays end-to-end sealed inside it (two independent crypto layers). Bodies
 //! are only opened at drain time, with the vault identity keypair.
 
-use crate::storage::chain::ChainEntry;
+use crate::storage::chain::SqliteChainStore;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -1537,6 +1537,7 @@ impl SqliteInboxStore {
                         .as_deref()
                         .is_some_and(|owner| owner != session && !other_live_claim);
                     let intent = MemberNoticeLeaseIntent {
+                        operation_id: Uuid::new_v4().to_string(),
                         action: "claim".to_string(),
                         actor_session: session.clone(),
                         prior: MemberNoticeLease {
@@ -1544,32 +1545,25 @@ impl SqliteInboxStore {
                             claim_expires_at: raw_expiry.clone(),
                         },
                     };
-                    dbg!(&intent);
-                    let changed = tx.execute(
+                    tx.execute(
                         "UPDATE member_notices
                          SET lease_intent_json = ?2, claimed_by_session = ?3, claim_expires_at = ?4
                          WHERE id = ?1 AND to_plugin = ?5 AND drained_at IS NULL
                            AND dest_peer IS NULL",
                         params![
-                            serde_json::to_string(&intent)?,
                             id as i64,
+                            serde_json::to_string(&intent)?,
                             session,
                             expires_at.to_rfc3339(),
                             to_plugin,
                         ],
                     )
                     .context("claiming member notice")?;
-                    dbg!(changed);
-                    let raw_intent: Option<String> = tx.query_row(
-                        "SELECT lease_intent_json FROM member_notices WHERE id = ?1",
-                        params![id as i64],
-                        |row| row.get(0),
-                    )?;
-                    dbg!(raw_intent);
                     MemberNoticeClaimOutcome::Claimed {
                         claim_expires_at: expires_at,
                         renewed,
                         superseded_expired_claim,
+                        lease_operation_id: intent.operation_id,
                     }
                 }
             }
@@ -1623,6 +1617,7 @@ impl SqliteInboxStore {
                     },
                     Some(owner) => {
                         let intent = MemberNoticeLeaseIntent {
+                            operation_id: Uuid::new_v4().to_string(),
                             action: "release".to_string(),
                             actor_session: session.clone(),
                             prior: MemberNoticeLease {
@@ -1638,9 +1633,15 @@ impl SqliteInboxStore {
                             params![serde_json::to_string(&intent)?, id as i64, to_plugin, session],
                         )
                         .context("releasing member notice claim")?;
-                        MemberNoticeClaimOutcome::Released { was_claimed: true }
+                        MemberNoticeClaimOutcome::Released {
+                            was_claimed: true,
+                            lease_operation_id: Some(intent.operation_id),
+                        }
                     }
-                    None => MemberNoticeClaimOutcome::Released { was_claimed: false },
+                    None => MemberNoticeClaimOutcome::Released {
+                        was_claimed: false,
+                        lease_operation_id: None,
+                    },
                 }
             }
         };
@@ -1712,14 +1713,25 @@ impl SqliteInboxStore {
         Ok(changed == 1)
     }
 
-    pub fn clear_member_notice_lease_intent(&self, id: u64, to_plugin: &str) -> Result<()> {
+    pub fn clear_member_notice_lease_intent(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        operation_id: &str,
+    ) -> Result<()> {
         let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
-        conn.execute(
-            "UPDATE member_notices SET lease_intent_json = NULL WHERE id = ?1 AND to_plugin = ?2",
-            params![id as i64, to_plugin],
+        let changed = conn.execute(
+            "UPDATE member_notices SET lease_intent_json = NULL
+             WHERE id = ?1 AND to_plugin = ?2
+               AND json_extract(lease_intent_json, '$.operation_id') = ?3",
+            params![id as i64, to_plugin, operation_id],
         )
         .context("clearing member notice lease intent")?;
+        anyhow::ensure!(
+            changed == 1,
+            "lease intent for notice {id} operation {operation_id} was already resolved or replaced"
+        );
         Ok(())
     }
 
@@ -1747,9 +1759,10 @@ impl SqliteInboxStore {
     }
 
     /// Reconcile a lease intent left by a crash between the SQLite commit and its witness.
-    /// A matching witness accepts the mutation; no witness restores the prior lease. Any
-    /// unreadable intent or failed restore is an error, so the unresolved state stays visible.
-    pub fn reconcile_member_notice_lease_intents(&self, entries: &[ChainEntry]) -> Result<()> {
+    /// A witness under this operation's unique key accepts the mutation; no witness restores
+    /// the prior lease. Any unreadable intent, conflicting witness, or failed restore is an
+    /// error, so the unresolved state stays visible instead of becoming consumable silently.
+    pub fn reconcile_member_notice_lease_intents(&self, chain: &SqliteChainStore) -> Result<()> {
         for (id, to_plugin, intent) in self.member_notice_lease_intents()? {
             let expected_type = match intent.action.as_str() {
                 "claim" => "member_notice_claimed",
@@ -1760,14 +1773,20 @@ impl SqliteInboxStore {
                     ));
                 }
             };
-            let witnessed = entries.iter().any(|entry| {
-                entry.event_type == expected_type
-                    && entry.event_data["notice_id"] == id
-                    && entry.event_data["session_id"].as_str()
-                        == Some(intent.actor_session.as_str())
-            });
-            if witnessed {
-                self.clear_member_notice_lease_intent(id, &to_plugin)?;
+            let event_key = member_notice_lease_event_key(&intent.operation_id);
+            if let Some(entry) = chain.event_by_key(&event_key).with_context(|| {
+                format!("looking up lease witness for notice {id} operation {}", intent.operation_id)
+            })? {
+                anyhow::ensure!(
+                    entry.event_type == expected_type
+                        && entry.event_data["notice_id"] == id
+                        && entry.event_data["session_id"].as_str()
+                            == Some(intent.actor_session.as_str())
+                        && entry.event_data["lease_operation_id"].as_str()
+                            == Some(intent.operation_id.as_str()),
+                    "lease witness {event_key} does not match its durable intent"
+                );
+                self.clear_member_notice_lease_intent(id, &to_plugin, &intent.operation_id)?;
                 continue;
             }
             let Some(written) = self.member_notice_lease(id, &to_plugin)? else {
@@ -2354,9 +2373,14 @@ pub struct MemberNoticeLease {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemberNoticeLeaseIntent {
+    pub operation_id: String,
     pub action: String,
     pub actor_session: String,
     pub prior: MemberNoticeLease,
+}
+
+pub fn member_notice_lease_event_key(operation_id: &str) -> String {
+    format!("member_lease:{operation_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2365,9 +2389,11 @@ pub enum MemberNoticeClaimOutcome {
         claim_expires_at: DateTime<Utc>,
         renewed: bool,
         superseded_expired_claim: bool,
+        lease_operation_id: String,
     },
     Released {
         was_claimed: bool,
+        lease_operation_id: Option<String>,
     },
     Conflict {
         claimed_by_session: String,
@@ -3937,6 +3963,7 @@ mod tests {
                 claim_expires_at,
                 renewed,
                 superseded_expired_claim,
+                ..
             } => {
                 assert!(!renewed);
                 assert!(!superseded_expired_claim);
@@ -3989,12 +4016,15 @@ mod tests {
                 .unwrap(),
             MemberNoticeClaimOutcome::Conflict { .. }
         ));
-        assert_eq!(
+        assert!(matches!(
             store
                 .release_member_notice(id, "kimi-code", owner)
                 .unwrap(),
-            MemberNoticeClaimOutcome::Released { was_claimed: true }
-        );
+            MemberNoticeClaimOutcome::Released {
+                was_claimed: true,
+                ..
+            }
+        ));
         assert!(matches!(
             store
                 .claim_member_notice(id, "kimi-code", bystander, 60)
@@ -4213,83 +4243,259 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn lease_intents_reconcile_to_prior_without_a_witness_and_to_current_with_one() {
+    fn lease_recovery_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, u64) {
         let tmp = tempdir().unwrap();
-        let path = tmp.path().join("inbox.db");
+        let inbox_path = tmp.path().join("inbox.db");
+        let chain_path = tmp.path().join("witness.db");
+        let store = SqliteInboxStore::open(&inbox_path, [7u8; 32]).unwrap();
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/lease-recovery.md#thread=t"),
+                "hash-lease-recovery",
+                None,
+            )
+            .unwrap();
+        (tmp, inbox_path, chain_path, id)
+    }
+
+    fn open_lease_recovery_stores(
+        inbox_path: &Path,
+        chain_path: &Path,
+    ) -> (SqliteInboxStore, SqliteChainStore) {
+        (
+            SqliteInboxStore::open(inbox_path, [7u8; 32]).unwrap(),
+            SqliteChainStore::open(chain_path, [7u8; 32]).unwrap(),
+        )
+    }
+
+    fn claim_operation(
+        store: &SqliteInboxStore,
+        id: u64,
+        session: Uuid,
+        lease_secs: i64,
+    ) -> (DateTime<Utc>, String) {
+        match store
+            .claim_member_notice(id, "kimi-code", session, lease_secs)
+            .unwrap()
+        {
+            MemberNoticeClaimOutcome::Claimed {
+                claim_expires_at,
+                lease_operation_id,
+                ..
+            } => (claim_expires_at, lease_operation_id),
+            other => panic!("claim failed: {other:?}"),
+        }
+    }
+
+    fn release_operation(store: &SqliteInboxStore, id: u64, session: Uuid) -> String {
+        match store.release_member_notice(id, "kimi-code", session).unwrap() {
+            MemberNoticeClaimOutcome::Released {
+                was_claimed: true,
+                lease_operation_id: Some(operation_id),
+            } => operation_id,
+            other => panic!("release failed: {other:?}"),
+        }
+    }
+
+    fn witness_lease_operation(
+        chain: &SqliteChainStore,
+        id: u64,
+        session: Uuid,
+        event_type: &str,
+        operation_id: &str,
+    ) {
+        chain
+            .append_once(
+                &member_notice_lease_event_key(operation_id),
+                event_type,
+                serde_json::json!({
+                    "notice_id": id,
+                    "session_id": session,
+                    "lease_operation_id": operation_id,
+                }),
+                "lct:test",
+            )
+            .unwrap();
+    }
+
+    fn settled_claim(
+        store: &SqliteInboxStore,
+        chain: &SqliteChainStore,
+        id: u64,
+        session: Uuid,
+        lease_secs: i64,
+    ) -> DateTime<Utc> {
+        let (expiry, operation_id) = claim_operation(store, id, session, lease_secs);
+        witness_lease_operation(
+            chain,
+            id,
+            session,
+            "member_notice_claimed",
+            &operation_id,
+        );
+        store
+            .clear_member_notice_lease_intent(id, "kimi-code", &operation_id)
+            .unwrap();
+        expiry
+    }
+
+    #[test]
+    fn an_unwitnessed_fresh_claim_is_restored_after_restart_and_drains_once() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let later_session = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        claim_operation(&store, id, owner, 60);
+        assert_eq!(store.member_notice_lease_intents().unwrap().len(), 1);
+        drop(store);
+        drop(chain);
+
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+        assert_eq!(
+            store.member_notice_lease(id, "kimi-code").unwrap().unwrap(),
+            MemberNoticeLease {
+                claimed_by_session: None,
+                claim_expires_at: None,
+            }
+        );
+        assert_eq!(
+            store.drain_member_for_session("kimi-code", later_session).unwrap().len(),
+            1,
+            "the unwitnessed claim must not block a post-restart session"
+        );
+        assert!(store.drain_member_for_session("kimi-code", later_session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unwitnessed_renewal_restores_the_prior_expiry_despite_the_old_witness() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        settled_claim(&store, &chain, id, owner, 60);
+        let prior = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+        claim_operation(&store, id, owner, 3600);
+        drop(store);
+        drop(chain);
+
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        assert_eq!(
+            store.member_notice_lease(id, "kimi-code").unwrap().unwrap(),
+            prior,
+            "the earlier claim witness must not validate a different renewal operation"
+        );
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unwitnessed_expired_takeover_restores_the_prior_owner_and_expiry() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        settled_claim(&store, &chain, id, owner, 60);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                params!["2000-01-01T00:00:00+00:00", id as i64],
+            )
+            .unwrap();
+        let prior = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+        claim_operation(&store, id, successor, 60);
+        drop(store);
+        drop(chain);
+
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        assert_eq!(store.member_notice_lease(id, "kimi-code").unwrap().unwrap(), prior);
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unwitnessed_release_restores_the_claim_and_blocks_a_bystander() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
         let owner = Uuid::new_v4();
         let bystander = Uuid::new_v4();
-        let id = {
-            let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
-            let id = store
-                .enqueue_member(
-                    "kimi-code",
-                    "claude-code",
-                    "role:constellation:interactive-dev",
-                    "review_request",
-                    Some("forum/lease-recovery.md#thread=t"),
-                    "hash-lease-recovery",
-                    None,
-                )
-                .unwrap();
-            assert!(matches!(
-                store.claim_member_notice(id, "kimi-code", owner, 60),
-                Ok(MemberNoticeClaimOutcome::Claimed { .. })
-            ));
-            dbg!(store.member_notice_lease_intents().unwrap());
-            assert_eq!(store.member_notice_lease_intents().unwrap().len(), 1);
-            id
-        };
-
-        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
-        store.reconcile_member_notice_lease_intents(&[]).unwrap();
-        assert_eq!(store.member_notice_lease_intents().unwrap().len(), 0);
-        let restored = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
-        assert_eq!(restored.claimed_by_session, None);
-        assert_eq!(restored.claim_expires_at, None);
-        assert!(matches!(
-            store.claim_member_notice(id, "kimi-code", owner, 60),
-            Ok(MemberNoticeClaimOutcome::Claimed { .. })
-        ));
-        assert!(matches!(
-            store.release_member_notice(id, "kimi-code", owner),
-            Ok(MemberNoticeClaimOutcome::Released { was_claimed: true })
-        ));
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        settled_claim(&store, &chain, id, owner, 60);
+        let prior = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+        release_operation(&store, id, owner);
         drop(store);
+        drop(chain);
 
-        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
-        store.reconcile_member_notice_lease_intents(&[]).unwrap();
-        assert_eq!(store.member_notice_lease_intents().unwrap().len(), 0);
-        assert_eq!(
-            store.member_notice_lease(id, "kimi-code").unwrap().unwrap().claimed_by_session,
-            Some(owner.to_string()),
-            "an unwitnessed release must restore the prior claim"
-        );
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        assert_eq!(store.member_notice_lease(id, "kimi-code").unwrap().unwrap(), prior);
         assert!(store.drain_member_for_session("kimi-code", bystander).unwrap().is_empty());
+        assert_eq!(store.drain_member_for_session("kimi-code", owner).unwrap().len(), 1);
+        assert!(store.drain_member_for_session("kimi-code", owner).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_witnessed_claim_survives_restart_when_intent_clearing_was_interrupted() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        let (expiry, operation_id) = claim_operation(&store, id, owner, 60);
+        witness_lease_operation(
+            &chain,
+            id,
+            owner,
+            "member_notice_claimed",
+            &operation_id,
+        );
         drop(store);
+        drop(chain);
 
-        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
-        assert!(matches!(
-            store.claim_member_notice(id, "kimi-code", owner, 60),
-            Ok(MemberNoticeClaimOutcome::Claimed { .. })
-        ));
-        let witnessed = ChainEntry {
-            hash: "hash-claim-witness".to_string(),
-            prev_hash: "hash-before".to_string(),
-            timestamp: Utc::now(),
-            event_type: "member_notice_claimed".to_string(),
-            event_data: serde_json::json!({"notice_id": id, "session_id": owner}),
-            signer_lct: "test".to_string(),
-            chain_position: 1,
-        };
-        store.reconcile_member_notice_lease_intents(&[witnessed]).unwrap();
-        assert_eq!(store.member_notice_lease_intents().unwrap().len(), 0);
-        assert_eq!(
-            store.member_notice_lease(id, "kimi-code").unwrap().unwrap().claimed_by_session,
-            Some(owner.to_string()),
-            "a witnessed claim remains effective"
-        );
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        let lease = store.member_notice_lease(id, "kimi-code").unwrap().unwrap();
+        assert_eq!(lease.claimed_by_session, Some(owner.to_string()));
+        assert_eq!(lease.claim_expires_at, Some(expiry.to_rfc3339()));
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
         assert!(store.drain_member_for_session("kimi-code", bystander).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_witnessed_release_survives_restart_when_intent_clearing_was_interrupted() {
+        let (_tmp, inbox_path, chain_path, id) = lease_recovery_fixture();
+        let owner = Uuid::new_v4();
+        let later_session = Uuid::new_v4();
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        settled_claim(&store, &chain, id, owner, 60);
+        let operation_id = release_operation(&store, id, owner);
+        witness_lease_operation(
+            &chain,
+            id,
+            owner,
+            "member_notice_released",
+            &operation_id,
+        );
+        drop(store);
+        drop(chain);
+
+        let (store, chain) = open_lease_recovery_stores(&inbox_path, &chain_path);
+        store.reconcile_member_notice_lease_intents(&chain).unwrap();
+        assert_eq!(
+            store.member_notice_lease(id, "kimi-code").unwrap().unwrap(),
+            MemberNoticeLease {
+                claimed_by_session: None,
+                claim_expires_at: None,
+            }
+        );
+        assert!(store.member_notice_lease_intents().unwrap().is_empty());
+        assert_eq!(store.drain_member_for_session("kimi-code", later_session).unwrap().len(), 1);
+        assert!(store.drain_member_for_session("kimi-code", later_session).unwrap().is_empty());
     }
 
     /// The queue cap must not be a cross-member denial channel: a sender

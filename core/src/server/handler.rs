@@ -9398,8 +9398,11 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
             claim_expires_at,
             renewed,
             superseded_expired_claim,
+            lease_operation_id,
         } => {
-            let entry = match s.append_chain(
+            let event_key = crate::storage::inbox::member_notice_lease_event_key(&lease_operation_id);
+            let entry = match s.append_chain_once(
+                &event_key,
                 "member_notice_claimed",
                 json!({
                     "notice_id": notice_id,
@@ -9410,6 +9413,7 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                     "lease_secs": lease_secs,
                     "renewed": renewed,
                     "superseded_expired_claim": superseded_expired_claim,
+                    "lease_operation_id": lease_operation_id.as_str(),
                 }),
             ) {
                 Ok(entry) => entry,
@@ -9424,7 +9428,11 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                     ));
                 }
             };
-            s.inbox_store.clear_member_notice_lease_intent(notice_id, &who.plugin_id)?;
+            s.inbox_store.clear_member_notice_lease_intent(
+                notice_id,
+                &who.plugin_id,
+                &lease_operation_id,
+            )?;
             Ok(json!({
                 "notice_id": notice_id,
                 "claimed": true,
@@ -9434,15 +9442,24 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                 "witnessEntryHash": entry.hash,
             }))
         }
-        MemberNoticeClaimOutcome::Released { was_claimed } => {
+        MemberNoticeClaimOutcome::Released {
+            was_claimed,
+            lease_operation_id,
+        } => {
             let witness = if was_claimed {
-                match s.append_chain(
+                let operation_id = lease_operation_id
+                    .as_deref()
+                    .expect("an actual release has a lease operation id");
+                let event_key = crate::storage::inbox::member_notice_lease_event_key(operation_id);
+                match s.append_chain_once(
+                    &event_key,
                     "member_notice_released",
                     json!({
                         "notice_id": notice_id,
                         "plugin_id": who.plugin_id,
                         "role_lct": who.role_lct,
                         "session_id": session,
+                        "lease_operation_id": operation_id,
                     }),
                 ) {
                     Ok(entry) => Some(entry),
@@ -9461,8 +9478,12 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
             } else {
                 None
             };
-            if was_claimed {
-                s.inbox_store.clear_member_notice_lease_intent(notice_id, &who.plugin_id)?;
+            if let Some(operation_id) = lease_operation_id {
+                s.inbox_store.clear_member_notice_lease_intent(
+                    notice_id,
+                    &who.plugin_id,
+                    &operation_id,
+                )?;
             }
             Ok(json!({
                 "notice_id": notice_id,
