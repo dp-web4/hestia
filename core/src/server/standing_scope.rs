@@ -597,17 +597,40 @@ impl StandingScopeStore {
         }
     }
 
-    /// A canonical digest of the ENTIRE authority: floor plus every per-member grant, with
-    /// the fields that decide reach. `floor_digest` answers "did two members get the same
+    /// Bind the complete refusal record and its position without printing its text.
+    /// A digest is not secrecy for guessable records; exposing it needs privacy review.
+    /// Order matters: `refusal_for` returns the first matching row. The tuple is
+    /// deliberately explicit, so a new field forces this encoding to be reviewed.
+    fn refusal_row(index: usize, refusal: &StandingRefusal) -> String {
+        let StandingRefusal { member, path, recursive, refused_at, refused_by, reason, request_id, modes } = refusal;
+        struct HashWriter(Sha256);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut writer = HashWriter(Sha256::new());
+        serde_json::to_writer(&mut writer, &(
+            index, member, path, recursive, refused_at, refused_by, reason, request_id,
+            modes.map(|m| m.as_letters()),
+        )).expect("standing refusal fields serialize as JSON");
+        format!("refusal\u{1f}{}", hex::encode(writer.0.finalize()))
+    }
+
+    /// A canonical digest of the ENTIRE authority: floor, per-member grants and standing
+    /// refusals, with the fields that decide reach. `floor_digest` answers "did two members get the same
     /// society baseline"; this answers "is this projection byte-equivalent to the vault's",
-    /// which is the question periodic verification asks. Order-independent and
-    /// length-prefixed for the same reasons.
+    /// which is the question periodic verification asks. Grant/floor order is independent;
+    /// refusal order is retained because `refusal_for` returns the first matching row.
     pub fn authority_digest(&self) -> String {
         let mut rows: Vec<String> = self
             .floor
             .iter()
             .map(|f| format!("floor\u{1f}{}", f.spelling()))
             .chain(self.grants.iter().map(Self::grant_row))
+            .chain(self.refusals.iter().enumerate().map(|(i, r)| Self::refusal_row(i, r)))
             .collect();
         rows.sort_unstable();
         let mut hasher = Sha256::new();
@@ -635,6 +658,11 @@ impl StandingScopeStore {
                 "generation: runtime {} vs vault {}",
                 self.generation, vault.generation
             ));
+        }
+        // This finding is delivered to members: do not expose another member's
+        // path, identity, reason or request id in the shared projection report.
+        if self.refusals != vault.refusals {
+            out.push("standing refusal projection differs".to_owned());
         }
         // Identity is (member, path): that is what "the same grant" means to an operator.
         // Every other field is a property OF that grant, and one that moved is neither a
