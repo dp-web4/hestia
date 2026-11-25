@@ -235,7 +235,8 @@ def start(home: Path, endpoint: str, watcher: Path = WATCHER) -> subprocess.Pope
         HESTIA_MESH_STATE=str(home / "state"),
         HESTIA_ENDPOINT=endpoint,
         WATCH_INTERVAL="0.1",
-        UNANSWERED_EVERY="1",  # gauge every second: the level, not just the edge
+        LEVEL_EVERY="1",  # gauge every second: the level, not just the edge
+        UNANSWERED_EVERY="3600",
     )
     return subprocess.Popen(
         [str(watcher), "daemon-drift-test", "test-host"],

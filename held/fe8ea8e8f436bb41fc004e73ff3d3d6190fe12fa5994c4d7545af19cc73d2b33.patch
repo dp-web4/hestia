@@ -1,0 +1,523 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1176,13 +1176,16 @@
+
+
+ # ── Workspace + scope resolution ─────────────────────────────────────────────────────────
++UNRESOLVED_WORKSPACE = "hestia:unresolved-workspace"
++
++
+ def detect_workspace(profile: HarnessProfile) -> str:
+     """Resolve explicit install scope and otherwise fail narrow.
+
+     A public gate cannot infer an operator's repository names or home layout. Installers
+     should always set ``HESTIA_WORKSPACE``. A ``.hestia-workspace`` marker is the portable
+-    fallback; absent either signal, cwd is returned and sibling-repository grants remain
+-    inert rather than widening from a guess.
++    fallback; absent either signal, ``UNRESOLVED_WORKSPACE`` is returned and every bounded
++    tool call refuses rather than guessing from the hook cwd.
+     """
+     env = os.environ.get(profile.workspace_env)
+     if env and os.path.isdir(env):
+@@ -1195,7 +1198,7 @@
+         if parent == d:
+             break
+         d = parent
+-    return os.getcwd()
++    return UNRESOLVED_WORKSPACE
+
+
+ #: Prefixes an `in_scope` entry may carry. Recognised DELIBERATELY rather than stripped by a
+@@ -3469,6 +3472,29 @@
+                 continue
+             return (False,) + refused
+
++    try:
++        absolute = _outside_candidates(scan, cwd or os.getcwd())
++    except _Unmodelled:
++        absolute = []
++    for spelling, kind, _globbed in absolute:
++        if kind != "abs":
++            continue
++        resolved = os.path.normpath(spelling).replace("\\", "/")
++        if resolved != ws and not resolved.startswith(ws + "/"):
++            continue
++        if patterns and _only_pattern_text(spelling, patterns, judged_words):
++            continue
++        # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
++        hidden = _symlink_target_forbidden(resolved, egress)
++        if hidden is not None:
++            return False, hidden, hidden
++        seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
++        if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
++            refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace)
++            if refused is None:
++                continue
++            return (False,) + refused
++
+     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
+     # with a per-command workdir the event does not carry (observed live via the Codex gate —
+     # event cwd = session launch dir while the command ran inside a granted repo). So a token
+@@ -3930,6 +3956,15 @@
+         # remaining standing scope normally. Fails narrow, which is the direction a replica may
+         # move in.
+         scopes = [s for s in scopes if s != AgentPolicy.UNSCOPED]
++
++    if ws == UNRESOLVED_WORKSPACE:
++        return _deny(
++            "mrh.command",
++            "cannot judge scope: no workspace is configured. Set HESTIA_WORKSPACE to the actual "
++            "workspace root, or place .hestia-workspace in that root or an ancestor of the launch "
++            "cwd. An unlocated workspace grants nothing and cannot be a denial domain.",
++            innate=True,
++        )
+
+     # Gate 1b — MRH scope. A repo-named MCP call is scoped on the NAME it carries (its
+     # `paths` are repo-relative and must not be re-scoped — egress above already saw
+diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.py
+--- a/plugins/_shared/test_gate_core.py
++++ b/plugins/_shared/test_gate_core.py
+@@ -21,6 +21,7 @@
+ """
+ from __future__ import annotations
+
++import dataclasses
+ import json
+ import os
+ import re
+@@ -289,6 +290,94 @@
+         json.dump({"mrh": mrh, "role": "role:constellation:member"}, fh)
+     return G.HarnessProfile(member_id="test-member", identity_path=p,
+                             home_markers=("~/.test-member",))
++
++
++def test_workspace_detection_is_explicit_and_unresolved_denies():
++    ws = _workspace()
++    nested = os.path.join(ws, "nested")
++    os.makedirs(nested)
++    key = "HESTIA_TEST_WORKSPACE"
++    previous_env, previous_cwd = os.environ.get(key), os.getcwd()
++    try:
++        os.environ.pop(key, None)
++        os.chdir(nested)
++        prof = dataclasses.replace(_profile(ws, []), workspace_env=key)
++        check("no-env-no-marker-is-explicitly-unresolved",
++              G.detect_workspace(prof) == G.UNRESOLVED_WORKSPACE, G.detect_workspace(prof))
++        target = os.path.join(ws, "ungranted", "README.md")
++        os.makedirs(os.path.dirname(target), exist_ok=True)
++        with open(target, "w", encoding="utf-8") as fh:
++            fh.write("x\n")
++        verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[target], cwd=nested), prof)
++        check("unresolved-workspace-denies-instead-of-using-cwd",
++              verdict.blocks and verdict.rule == "mrh.command" and verdict.innate, verdict)
++        check("unresolved-denial-names-the-configuration-remedy",
++              "HESTIA_WORKSPACE" in verdict.reason and ".hestia-workspace" in verdict.reason,
++              verdict.reason)
++        os.environ[key] = ws
++        check("valid-env-workspace-still-wins", G.detect_workspace(prof) == ws,
++              G.detect_workspace(prof))
++        os.environ[key] = os.path.join(ws, "deleted")
++        marker = os.path.join(ws, ".hestia-workspace")
++        with open(marker, "w", encoding="utf-8") as fh:
++            fh.write("# test marker\n")
++        check("marker-resolves-from-a-child-cwd", G.detect_workspace(prof) == ws,
++              G.detect_workspace(prof))
++        os.unlink(marker)
++        check("stale-env-without-marker-is-unresolved",
++              G.detect_workspace(prof) == G.UNRESOLVED_WORKSPACE, G.detect_workspace(prof))
++    finally:
++        os.chdir(previous_cwd)
++        if previous_env is None:
++            os.environ.pop(key, None)
++        else:
++            os.environ[key] = previous_env
++
++
++def test_absolute_scope_paths_do_not_depend_on_process_cwd():
++    ws = _workspace()
++    for repo in ("granted", "ungranted"):
++        os.makedirs(os.path.join(ws, repo), exist_ok=True)
++        with open(os.path.join(ws, repo, "README.md"), "w", encoding="utf-8") as fh:
++            fh.write("x\n")
++    prof = _profile(ws, ["repo:granted"])
++    for cwd in (ws, os.path.join(ws, "tools"), _workspace()):
++        ok, offending = G.command_in_scope(f"cat {ws}/ungranted/README.md", ["granted"], ws, cwd)
++        check(f"absolute-ungranted-path-denies-at-any-cwd: {cwd}", not ok and offending,
++              (ok, offending))
++        ok, offending = G.command_in_scope(f"cat {ws}/granted/README.md", ["granted"], ws, cwd)
++        check(f"granted-control-allows-at-any-cwd: {cwd}", ok, (ok, offending))
++    ok, offending = G.command_in_scope("cat ungranted/README.md", ["granted"], ws, ws)
++    check("bare-ungranted-token-denies-at-root", not ok and offending, (ok, offending))
++    sibling = ws + "-sibling"
++    os.makedirs(sibling, exist_ok=True)
++    with open(os.path.join(sibling, "README.md"), "w", encoding="utf-8") as fh:
++        fh.write("x\n")
++    ok, offending = G.command_in_scope(f"cat {sibling}/README.md", ["granted"], ws, ws)
++    check("workspace-prefix-sibling-is-not-inside", not ok and offending, (ok, offending))
++    parent = os.path.dirname(ws)
++    leaf = os.path.basename(ws)
++    for label, command in (
++            ("parent-dot-segment", f"cat {parent}/./{leaf}/ungranted/README.md"),
++            ("parent-dotdot-segment", f"cat {parent}/x/../{leaf}/ungranted/README.md"),
++            ("parent-double-slash", f"cat {parent}//{leaf}/ungranted/README.md"),
++            ("pattern-is-data-file-is-reach",
++             f"grep -e {ws}/ungranted/README.md {parent}/./{leaf}/ungranted/README.md")):
++        ok, offending = G.command_in_scope(command, ["granted"], ws, ws)
++        check(f"normalized-absolute-pass-denies-{label}", not ok and offending, (ok, offending))
++    ok, offending = G.command_in_scope(f"cat {parent}/./{leaf}/granted/README.md", ["granted"], ws, ws)
++    check("normalized-absolute-pass-allows-granted-control", ok, (ok, offending))
++    for label, command in (
++            ("sed-write", f"sed 'w {ws}/ungranted/README.md' {ws}/granted/README.md"),
++            ("pythonpath-import", f"PYTHONPATH={ws}/ungranted python3 -c 'import mod'"),
++            ("data-operand", f"echo {ws}/ungranted/README.md")):
++        ok, offending = G.command_in_scope(command, ["granted"], ws, ws)
++        check(f"legacy-workspace-floor-still-denies-{label}", not ok and offending, (ok, offending))
++    for label, command in (
++            ("unclosed-quote", f"cat {ws}/ungranted/README.md \"oops"),
++            ("substitution", f"cat {ws}/ungranted/$(echo x).txt")):
++        ok, offending = G.command_in_scope(command, ["path:" + G.UNENUMERATED_TARGET], ws, ws)
++        check(f"unenumerated-lift-does-not-widen-{label}", not ok and offending, (ok, offending))
+
+
+ def test_path_and_command_scope():
+@@ -1311,6 +1400,8 @@
+     "test_egress_offers_no_door",
+     "test_scope_remedy_distinguishes_itself_from_appeal",
+     "test_path_and_command_scope",
++    "test_workspace_detection_is_explicit_and_unresolved_denies",
++    "test_absolute_scope_paths_do_not_depend_on_process_cwd",
+     "test_path_grant_reaches_a_sibling_of_the_repos",
+     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
+     "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
+@@ -1390,6 +1481,8 @@
+     test_egress_offers_no_door()
+     test_scope_remedy_distinguishes_itself_from_appeal()
+     test_path_and_command_scope()
++    test_workspace_detection_is_explicit_and_unresolved_denies()
++    test_absolute_scope_paths_do_not_depend_on_process_cwd()
+     test_path_grant_reaches_a_sibling_of_the_repos()
+     test_path_grants_keep_their_type_and_match_resolved_boundaries()
+     test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -959,8 +959,9 @@
+ def _workspace_root() -> str:
+     """The ONE workspace-root answer for grant mapping — delegated to the core's portable
+     `detect_workspace` (env `HESTIA_WORKSPACE` when it names a real directory, else the
+-    marker-based cwd climb, else the core's documented default), so live and standing
+-    grants cannot diverge from the boundary the core's scope model actually enforces.
++    marker-based cwd climb, else UNRESOLVED_WORKSPACE), so live and standing grants cannot
++    diverge from the boundary the core's scope model actually enforces. An unconfigured
++    bounded snapshot maps no repo-name grant.
+     GPT review of #431, blocker 4: a second resolver here carried a machine-specific
+     fallback, so a repo-root grant admitted on one box and stayed inert on every layout
+     where the core discovered the workspace without the env var."""
+diff --git a/plugins/_shared/hestia_gate_mechanism_test.py b/plugins/_shared/hestia_gate_mechanism_test.py
+--- a/plugins/_shared/hestia_gate_mechanism_test.py
++++ b/plugins/_shared/hestia_gate_mechanism_test.py
+@@ -351,6 +351,8 @@
+     repo-root grant still admits — the portability arm the machine-specific fallback
+     failed."""
+     ws = _fake_workspace()
++    with open(os.path.join(ws, ".hestia-workspace"), "w", encoding="utf-8") as marker:
++        marker.write("# discovery fixture\n")
+     old_env = os.environ.pop("HESTIA_WORKSPACE", None)
+     old_cwd = os.getcwd()
+     os.chdir(ws)
+@@ -365,10 +367,26 @@
+             os.environ["HESTIA_WORKSPACE"] = old_env
+
+
++def test_workspace_mapping_unresolved_without_marker():
++    ws = _fake_workspace()
++    old_env = os.environ.pop("HESTIA_WORKSPACE", None)
++    old_cwd = os.getcwd()
++    os.chdir(ws)
++    try:
++        check("unmarked_workspace_is_explicitly_unresolved",
++              m._workspace_root() == "hestia:unresolved-workspace", m._workspace_root())
++    finally:
++        os.chdir(old_cwd)
++        if old_env is not None:
++            os.environ["HESTIA_WORKSPACE"] = old_env
++
++
+ def test_workspace_mapping_invalid_env_falls_back_to_discovery():
+     """An env var naming a NONEXISTENT dir must not poison the mapping: the core's
+     detect_workspace ignores it (isdir check) and discovery still admits the grant."""
+     ws = _fake_workspace()
++    with open(os.path.join(ws, ".hestia-workspace"), "w", encoding="utf-8") as marker:
++        marker.write("# invalid-env discovery fixture\n")
+     old_env = os.environ.get("HESTIA_WORKSPACE")
+     os.environ["HESTIA_WORKSPACE"] = ws + "-does-not-exist"
+     old_cwd = os.getcwd()
+@@ -746,6 +764,7 @@
+     test_society_floor_is_uniform_and_admitting_for_two_members,
+     test_live_grant_repo_root_maps_via_shared_resolver,
+     test_workspace_mapping_discovers_root_without_env,
++    test_workspace_mapping_unresolved_without_marker,
+     test_workspace_mapping_invalid_env_falls_back_to_discovery,
+     test_cached_snapshot_refused_after_bounded_horizon,
+     test_exhausted_deadline_refuses_request,
+diff --git a/tools/public_boundary_test.py b/tools/public_boundary_test.py
+--- a/tools/public_boundary_test.py
++++ b/tools/public_boundary_test.py
+@@ -235,7 +235,8 @@
+     try:
+         os.chdir(nested)
+         profile = HarnessProfile(member_id="test", identity_path="")
+-        check("no name-based discovery", detect_workspace(profile) == str(nested))
++        check("no-name-based-discovery-is-unresolved",
++              detect_workspace(profile) == "hestia:unresolved-workspace")
+         (root / "checkout" / ".hestia-workspace").write_text("\n")
+         check("portable marker", detect_workspace(profile) == str(root / "checkout"))
+         explicit = root / "explicit"
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+
+ dp, 2026-08-02:
+@@ -1177,13 +1177,16 @@
+
+
+ # ── Workspace + scope resolution ─────────────────────────────────────────────────────────
++UNRESOLVED_WORKSPACE = "hestia:unresolved-workspace"
++
++
+ def detect_workspace(profile: HarnessProfile) -> str:
+     """Resolve explicit install scope and otherwise fail narrow.
+
+     A public gate cannot infer an operator's repository names or home layout. Installers
+     should always set ``HESTIA_WORKSPACE``. A ``.hestia-workspace`` marker is the portable
+-    fallback; absent either signal, cwd is returned and sibling-repository grants remain
+-    inert rather than widening from a guess.
++    fallback; absent either signal, ``UNRESOLVED_WORKSPACE`` is returned and every bounded
++    tool call refuses rather than guessing from the hook cwd.
+     """
+     env = os.environ.get(profile.workspace_env)
+     if env and os.path.isdir(env):
+@@ -1196,7 +1199,7 @@
+         if parent == d:
+             break
+         d = parent
+-    return os.getcwd()
++    return UNRESOLVED_WORKSPACE
+
+
+ #: Prefixes an `in_scope` entry may carry. Recognised DELIBERATELY rather than stripped by a
+@@ -3470,6 +3473,29 @@
+                 continue
+             return (False,) + refused
+
++    try:
++        absolute = _outside_candidates(scan, cwd or os.getcwd())
++    except _Unmodelled:
++        absolute = []
++    for spelling, kind, _globbed in absolute:
++        if kind != "abs":
++            continue
++        resolved = os.path.normpath(spelling).replace("\\", "/")
++        if resolved != ws and not resolved.startswith(ws + "/"):
++            continue
++        if patterns and _only_pattern_text(spelling, patterns, judged_words):
++            continue
++        # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
++        hidden = _symlink_target_forbidden(resolved, egress)
++        if hidden is not None:
++            return False, hidden, hidden
++        seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
++        if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
++            refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace)
++            if refused is None:
++                continue
++            return (False,) + refused
++
+     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
+     # with a per-command workdir the event does not carry (observed live via the Codex gate —
+     # event cwd = session launch dir while the command ran inside a granted repo). So a token
+@@ -3931,6 +3957,15 @@
+         # remaining standing scope normally. Fails narrow, which is the direction a replica may
+         # move in.
+         scopes = [s for s in scopes if s != AgentPolicy.UNSCOPED]
++
++    if ws == UNRESOLVED_WORKSPACE:
++        return _deny(
++            "mrh.command",
++            "cannot judge scope: no workspace is configured. Set HESTIA_WORKSPACE to the actual "
++            "workspace root, or place .hestia-workspace in that root or an ancestor of the launch "
++            "cwd. An unlocated workspace grants nothing and cannot be a denial domain.",
++            innate=True,
++        )
+
+     # Gate 1b — MRH scope. A repo-named MCP call is scoped on the NAME it carries (its
+     # `paths` are repo-relative and must not be re-scoped — egress above already saw
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 481e20d4349f629c54c979b67e8f7065929d8ec1de316bdab02aaca957082eac  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -960,8 +960,9 @@
+ def _workspace_root() -> str:
+     """The ONE workspace-root answer for grant mapping — delegated to the core's portable
+     `detect_workspace` (env `HESTIA_WORKSPACE` when it names a real directory, else the
+-    marker-based cwd climb, else the core's documented default), so live and standing
+-    grants cannot diverge from the boundary the core's scope model actually enforces.
++    marker-based cwd climb, else UNRESOLVED_WORKSPACE), so live and standing grants cannot
++    diverge from the boundary the core's scope model actually enforces. An unconfigured
++    bounded snapshot maps no repo-name grant.
+     GPT review of #431, blocker 4: a second resolver here carried a machine-specific
+     fallback, so a repo-root grant admitted on one box and stayed inert on every layout
+     where the core discovered the workspace without the env var."""
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,12 +7,12 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc",
++      "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2",
++      "sha256": "481e20d4349f629c54c979b67e8f7065929d8ec1de316bdab02aaca957082eac",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "481e20d4349f629c54c979b67e8f7065929d8ec1de316bdab02aaca957082eac"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "55b869727686fae82518ad5da6304ff0ff70d2b3bf0a7fbf6a96d0fa93b8e3e5"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "481e20d4349f629c54c979b67e8f7065929d8ec1de316bdab02aaca957082eac"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "86a814ebe688baff335be638147ea416c6faecc8e74858fab52b6ddb723f7d3a"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "481e20d4349f629c54c979b67e8f7065929d8ec1de316bdab02aaca957082eac"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "ef73e08789e5ff6839ea14e2ca0bd4c1bfb2aa742aa22c73263d2b9fdf467ead"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "e8f18af4fe1ef3ff9c9b698a1642a5e9e87c16ec127b02a6f0672078f20ac59f",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "5bd787a08060d9199cf9383a573c18b2d6240dbd0dd34d53b5c87d97ff0faf03"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "481e20d4349f629c54c979b67e8f7065929d8ec1de316bdab02aaca957082eac"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "426e21137ee2c2cf2f9d67cfa8db864d7077baae72fb17e79d10ffaa786fdd38"
+ }

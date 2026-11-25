@@ -59,7 +59,8 @@
     }
   },
   "observe": [
-    "PostToolUse"
+    "PostToolUse",
+    "PostToolUseFailure"
   ],
   "targets": {
     "observe": [

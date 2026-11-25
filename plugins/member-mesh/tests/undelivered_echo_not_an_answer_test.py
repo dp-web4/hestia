@@ -101,7 +101,9 @@ for script in fire_scripts():
           "without the predicate the echo renders as an ordinary reply and the "
           "misread of 1172 is reproducible verbatim")
     check(f"A2. {script} counts fireworthiness by EXCLUSION, not by enumerating prefixes",
-          "grep -vc '^! '" in src,
+          # Exclusion of the two lines that are NOT a wake: `! WITHHELD`, and since #1249
+          # the `~ QUIET` self-withdrawal. Anything else, including kinds added later, counts.
+          "grep -vc -e '^! ' -e '^~ '" in src,
           "an enumerated prefix list silently drops every line kind added after it "
           "was written — which is exactly how the `!! ` label emptied the batch")
     check(f"A3. {script} no longer enumerates '^- ' as the only fireworthy shape",

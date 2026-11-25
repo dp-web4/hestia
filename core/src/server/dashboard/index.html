@@ -1176,6 +1176,15 @@
       <button class="esc-banner-btn" id="scope-banner-btn">review</button>
     </div>
 
+    <!-- GATE INTEGRITY overview banner (#1378). Modified, unratified, missing, unregistered,
+         deploy-different bytes and UNKNOWN stay above the views; only a verified set without
+         differing deployed bytes is silent. -->
+    <div class="esc-banner" id="gate-integrity-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="gate-integrity-banner-text">…</span>
+      <button class="esc-banner-btn" id="gate-integrity-banner-btn">Gates</button>
+    </div>
+
     <!-- TWO TOP-LEVEL VIEWS (dp, 2026-08-11). Everything from here to the end of .live-grid
          is the AGENTS view — local orchestrators + trust/histogram/witness-chain, i.e.
          governance of the agents on this box. The HUBS view (the outward community surface)
@@ -3057,6 +3066,107 @@
     return !!pol && (pol.preset === 'permissive' || !pol.enforce);
   }
 
+  function escalationView(e, pendingIds) {
+    const evidence = e.bar
+      ? `bar ${e.bar}${e.bar_met === true ? ' met' : e.bar_met === false ? ' not met' : ''}`
+      : '';
+    const via = [e.decided_via, evidence].filter(Boolean).join(', ');
+    const suffix = via ? ` (${via})` : '';
+    const ruler = e.decided_by || 'unattributed';
+    let status = 'info';
+    let statusClass = 'info';
+    let disposition;
+    if (e.event_type === 'gate_escalation_decided' && e.decided_via === 'self_withdrawn') {
+      status = 'withdrawn';
+      disposition = `withdrawn by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_decided') {
+      // Both decide writers record the outcome as `status` ("approved" / "denied"); the
+      // ruling row has no `granted` key (that is the caller's reply, not the chain's).
+      status = e.status === 'approved' || e.status === 'denied' ? e.status : 'decided';
+      statusClass = e.status === 'approved' ? 'ok' : e.status === 'denied' ? 'deny' : 'info';
+      disposition = `${status} by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_withdrawn') {
+      status = 'withdrawn';
+      disposition = `withdrawn by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_expired') {
+      status = 'expired';
+      statusClass = 'warn';
+      // WHICH lapse (`record_newly_lapsed`): an approval whose claim window passed unspent is
+      // NOT "unruled" -- it was ruled and never used. A row with no `lapse_kind` (written
+      // before the field existed, or a writer that omits it) claims neither.
+      disposition = e.lapse_kind === 'approved_unclaimed' ? 'approved, expired unclaimed'
+        : e.lapse_kind === 'undecided' ? 'expired unruled'
+        : 'expired';
+    } else if (e.event_type === 'gate_escalation_claimed') {
+      status = 'claimed';
+      statusClass = 'ok';
+      disposition = 'claimed (ruling outside this window)';
+    } else if (pendingIds.has(e.escalation_id)) {
+      status = 'pending';
+      disposition = 'pending';
+    } else {
+      // NOT a disposition. The feed (`recent`) is a chain read the snapshot worker may
+      // reuse, while `pending_escalations` is read from the store at fold time, so an ask
+      // ruled or lapsed between the two shows here, as does one whose ruling fell outside
+      // this window. Say only what is known: it is not pending and its outcome is not in
+      // this feed. Never render it as denied or expired; the escalation pointer has the rest.
+      status = 'not pending';
+      disposition = 'not pending; outcome not in this feed';
+    }
+    return {
+      status,
+      statusClass,
+      detail: `${(e.escalation_id || '').slice(0, 8)}${e.marker ? ' ' + e.marker : ''} -> ${disposition}`,
+    };
+  }
+
+  // The snapshot's pending items name their escalation `id` (dashboard.rs), not `escalation_id`.
+  function livePendingIds(data) {
+    return new Set((data?.pending_escalations ?? []).map(e => e.id).filter(Boolean));
+  }
+
+  function projectEscalations(entries, pendingIds) {
+    // Fold lifecycle rows only. Other witness events keep their own type and hash.
+    const lifecycleKinds = new Set([
+      'gate_escalation_opened', 'gate_escalation_decided', 'gate_escalation_withdrawn',
+      'gate_escalation_expired', 'gate_escalation_claimed',
+    ]);
+    const groups = new Map();
+    for (const e of entries) {
+      if (!e.escalation_id || !lifecycleKinds.has(e.event_type)) continue;
+      if (!groups.has(e.escalation_id)) groups.set(e.escalation_id, []);
+      groups.get(e.escalation_id).push(e);
+    }
+    const projections = new Map();
+    for (const [id, events] of groups) {
+      // NEWEST BY CHAIN POSITION, never first in array order: the feed arrives newest-first
+      // today, but nothing in this function may depend on that. Same precedence as the
+      // escalation pointer lookup in `handler.rs` (`newest(...)`): the newest settlement
+      // (decided / withdrawn / expired), else the newest claim (a spend, not a settlement),
+      // else the newest open. The chosen row's status AND chain hash are what the row shows.
+      const newest = kinds => events.reduce((best, e) =>
+        kinds.includes(e.event_type) && (!best || e.chain_position > best.chain_position) ? e : best,
+        null);
+      const opened = newest(['gate_escalation_opened']);
+      const representative =
+        newest(['gate_escalation_decided', 'gate_escalation_withdrawn', 'gate_escalation_expired']) ||
+        newest(['gate_escalation_claimed']) || opened;
+      const source = {
+        ...representative,
+        marker: representative.marker || opened?.marker,
+        plugin_id: opened?.plugin_id || representative.plugin_id,
+      };
+      projections.set(id, {source, view: escalationView(source, pendingIds)});
+    }
+    return entries.flatMap(e => {
+      if (!e.escalation_id || !lifecycleKinds.has(e.event_type)) return [e];
+      const projection = projections.get(e.escalation_id);
+      if (!projection) return [e];
+      if (projection.source.chain_position !== e.chain_position) return [];
+      return [{...projection.source, escalation_view: projection.view}];
+    });
+  }
+
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
@@ -3071,6 +3181,7 @@
         e.event_type === 'policy_decision' && e.decision === feedFilter
       );
     }
+    source = projectEscalations(source, livePendingIds(lastData));
     let filtered = selectedOrch
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
@@ -3198,8 +3309,15 @@
       let statusClass = 'info';
       let tool = '';
       let hover = null;   // hover text for the detail cell; null => fall back to `detail`
+      const escView = e.escalation_view;
+      const eventLabel = escView ? 'escalation' : e.event_type;
 
-      if (e.event_type === 'outcome') {
+      if (escView) {
+        detail = escView.detail;
+        status = escView.status;
+        statusClass = escView.statusClass;
+        hover = `${e.event_type}\n${detail}\n\nchain hash:\n${e.hash}`;
+      } else if (e.event_type === 'outcome') {
         tool = e.tool_name || '?';
         detail = e.target || '';
         if (e.success === true) { status = 'ok'; statusClass = 'ok'; }
@@ -3249,12 +3367,12 @@
         <div class="feed-row${isNew ? ' new' : ''}">
           <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${memberName(whoAgent)}</span>${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
-          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(e.event_type)}</span>
+          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(eventLabel)}</span>
           <span class="feed-detail" title="${escapeHtml(hover || detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
           </span>
           <span class="feed-status ${statusClass}">${status}</span>
-          <span class="feed-hash">${fmt.short(e.hash)}…</span>
+          <span class="feed-hash" title="${escapeHtml(e.hash)}">${fmt.short(e.hash)}…</span>
         </div>
       `;
     }).join('');
@@ -5256,7 +5374,19 @@
             reason: reason.trim(),
           });
         } else {
-          polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+          const current = lastData?.policy || {};
+          const strictness = { 'permissive': 0, 'audit-only': 1, 'safety': 2, 'strict': 3 };
+          const currentRank = strictness[current.preset];
+          const targetRank = strictness[t.dataset.preset];
+          if (typeof currentRank !== 'number' || targetRank < currentRank) {
+            const from = `${current.preset || 'unknown'}${current.enforce ? '' : ' (audit)'}`;
+            if (!confirm(`Change SOCIETY policy from ${from} to ${t.dataset.preset}. This loosens every member. Continue?`)) return;
+            const reason = prompt('Reason (required — this loosening is recorded in the witness chain):');
+            if (!reason || !reason.trim()) return;
+            polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset, reason: reason.trim() });
+          } else {
+            polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+          }
         }
       }
       else if (t.dataset.revert) polSend('DELETE', `/api/policy/override/${encodeURIComponent(t.dataset.revert)}`);
@@ -5898,6 +6028,76 @@
     });
   })();
 
+  // ---- GATE INTEGRITY overview banner (#1378) ------------------------------------------------
+  // A read that never answers (a hung daemon, a sign-in left pending) must not keep the last
+  // state: the read is bounded, and once the last answer is older than two polls the banner says
+  // the set is unverified and since when, instead of staying silent on an old VERIFIED (#1575).
+  const GATE_INTEGRITY_POLL_MS = 30000, GATE_INTEGRITY_TIMEOUT_MS = 15000;
+  let gateIntegrityBusy = false, gateIntegrityVerifiedAt = 0;
+  function gateIntegrityHealthy(r) {
+    return r.status === 'VERIFIED'
+      && !(r.gates || []).some(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
+  }
+  function gateIntegrityStale(text, banner, why) {
+    const since = gateIntegrityVerifiedAt ? new Date(gateIntegrityVerifiedAt).toLocaleTimeString() : 'this page opened';
+    text.textContent = `Gate integrity unverified — stale since ${since}${why ? ` (${why})` : ''}`;
+    banner.hidden = false;
+  }
+  async function gateIntegrityLoad() {
+    const banner = $('gate-integrity-banner'), text = $('gate-integrity-banner-text');
+    if (gateIntegrityBusy) {
+      if (Date.now() - gateIntegrityVerifiedAt > 2 * GATE_INTEGRITY_POLL_MS) gateIntegrityStale(text, banner, 'the last read has not answered');
+      return;
+    }
+    gateIntegrityBusy = true;
+    const ctl = new AbortController();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => { ctl.abort(); reject(new Error(`no answer after ${GATE_INTEGRITY_TIMEOUT_MS / 1000}s`)); },
+        GATE_INTEGRITY_TIMEOUT_MS);
+    });
+    try {
+      const r = await Promise.race([timeout, (async () => {
+        const res = await apiFetch('/api/gates/verify', { cache: 'no-store', signal: ctl.signal });
+        if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+        return res.json();
+      })()]);
+      gateIntegrityVerifiedAt = Date.now();
+      if (gateIntegrityHealthy(r)) { banner.hidden = true; return; }
+      if (r.status === 'UNKNOWN') {
+        text.textContent = `Gate integrity UNKNOWN — ${r.reason || 'the gate set could not be established'}`;
+        banner.hidden = false;
+        return;
+      }
+      const rows = (r.gates || []).filter(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
+      const count = pick => rows.filter(pick).length;
+      const parts = [];
+      const notRegistered = count(g => g.not_registered === true);
+      const modified = count(g => g.status === 'modified');
+      const missing = count(g => g.status === 'missing' || g.status === 'unreadable');
+      const differs = count(g => g.deployment === 'differs');
+      const pending = count(g => g.status === 'unratified' && g.deployment === 'match');
+      const unratified = count(g => g.status === 'unratified' && g.deployment !== 'match');
+      if (notRegistered) parts.push(`${notRegistered} not registered — possible bypass`);
+      if (modified) parts.push(`${modified} modified since ratification`);
+      if (missing) parts.push(`${missing} missing or unreadable`);
+      if (differs) parts.push(`${differs} differs from the deploy`);
+      if (pending) parts.push(`${pending} deployed, not yet ratified`);
+      if (unratified) parts.push(`${unratified} unratified`);
+      if (!parts.length) parts.push(r.status);
+      const members = [...new Set(rows.map(g => g.plugin_id || g.path.split('/').filter(Boolean).pop() || g.path))];
+      const shown = members.slice(0, 3).join(', ') + (members.length > 3 ? ` +${members.length - 3} more` : '');
+      text.textContent = `Gate integrity: ${rows.length} gate${rows.length === 1 ? '' : 's'}: ${parts.join(' · ')}${shown ? ` — ${shown}` : ''}`;
+      banner.hidden = false;
+    } catch (e) {
+      if (gateIntegrityVerifiedAt) gateIntegrityStale(text, banner, e.message);
+      else { text.textContent = `Gate integrity could not be read — ${e.message}`; banner.hidden = false; }
+    } finally {
+      clearTimeout(timer);
+      gateIntegrityBusy = false;
+    }
+  }
+
   // ---- GATES pane ----------------------------------------------------------------------------
   // GET /api/gates/verify and POST /api/gates/ratify, as the desktop app's Gates screen uses them.
   // The ratify carries `expected` = the evidence.current THIS pane rendered: the daemon recomputes
@@ -6055,6 +6255,7 @@
   let cfgSelected = null;       // member currently open in the editor
   let cfgShared = { configured: false, keys: [] };   // the shared set, from the last list
   let cfgRows = [];             // [{key, value}] the editor holds (a draft, not the vault)
+  let cfgStored = { role: '', note: '' };   // the vault's document as opened (cfgRows is the draft)
   let cfgSeats = [];            // last list
 
   function cfgVerdictHtml(v) {
@@ -6171,6 +6372,7 @@
     $('cfg-err').hidden = true; $('cfg-saved').hidden = true;
     $('cfg-editor-verdict').innerHTML = ''; $('cfg-editor-digest').textContent = '';
     document.querySelectorAll('#cfg-seat-list .cfg-seat').forEach(el => el.classList.toggle('selected', el.dataset.member === member));
+    cfgStored = { role: '', note: '' };
     if (!configured) { cfgRows = []; $('cfg-note').value = ''; $('cfg-inherited').hidden = true; cfgRenderRows(); return; }
     try {
       const res = await apiFetch('/api/config/seat/' + encodeURIComponent(member));
@@ -6179,6 +6381,7 @@
       const env = (data.config && data.config.env) || {};
       cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k] }));
       $('cfg-note').value = (data.config && data.config.note) || '';
+      cfgStored = { role: env.HESTIA_ROLE || '', note: $('cfg-note').value };
       // INHERITED, READ-ONLY. The lines this seat gets from the shared set, with their values,
       // shown above its own rows so the whole projection is visible while only the seat's own
       // lines are editable here. Editing a shared value means opening the shared set.
@@ -6222,6 +6425,19 @@
       if (!k) continue;
       if (k in env) { err.textContent = 'duplicate key ' + k; err.hidden = false; return; }
       env[k] = r.value;
+    }
+    // Against the STORED role (cfgReadRows just replaced cfgRows with the draft), and a reason
+    // that is new: the note field opens holding the last change's reason.
+    const previousRole = cfgStored.role;
+    const nextRole = env.HESTIA_ROLE || '';
+    if (previousRole !== nextRole) {
+      if (!confirm(`Change capacity role for ${cfgSelected} from ${previousRole || 'member'} to ${nextRole || 'member'}?`)) return;
+      const note = $('cfg-note').value.trim();
+      if (!note || note === cfgStored.note.trim()) {
+        err.textContent = 'a new reason (note) is required to change a capacity role';
+        err.hidden = false;
+        return;
+      }
     }
     const btn = $('cfg-save'); btn.disabled = true;
     try {
@@ -6501,6 +6717,33 @@
              The grant was recorded and no seat may ever read it. This is what a typo looks
              like; it is only correct if you are granting ahead of a first connect.
              <em>Nothing is enforced differently until a member by that exact id connects.</em>`;
+        const grantTerms = t => {
+          const reach = t.recursive ? 'recursive' : 'exact';
+          const until = t.expires_at ? `expires ${new Date(t.expires_at * 1000).toISOString().slice(0, 16)}Z` : 'until revoked';
+          return `modes ${t.modes || '?'}, ${reach}, ${until}`;
+        };
+        if (out.replaced_existing) {
+          // WHAT was replaced (NOVA, #1638): the same path with other terms is a replacement,
+          // never an overlap, so the old row's terms are shown, and a lapsed one is named as such.
+          const was = out.replaced_terms
+            ? ` (was ${grantTerms(out.replaced_terms)}${out.replaced_terms.live === false ? ', already lapsed' : ''})`
+            : '';
+          ok.innerHTML = `<strong>Replaced the existing grant on this member and path${escapeHtml(was)}.</strong> `
+            + ok.innerHTML;
+        }
+        const coverageOverlaps = Array.isArray(out.coverage_overlaps) ? out.coverage_overlaps : [];
+        if (coverageOverlaps.length) {
+          // PATH containment only (NOVA, #1638): the server compares paths, not modes, reach or
+          // expiry, so the label says "path" and the existing grant's own terms are shown beside it.
+          const described = coverageOverlaps.slice(0, 3).map(o =>
+            `${o.relation === 'existing_path_covers_new' ? 'existing path covers new' : 'new path covers existing'}: `
+              + `${o.path} (${grantTerms(o)})`);
+          const remainder = coverageOverlaps.length > 3 ? ` (+${coverageOverlaps.length - 3} more)` : '';
+          ok.innerHTML += `<br><strong>Path overlap:</strong> ${escapeHtml(described.join('; ') + remainder)}.
+            Existing rows are retained; a path overlap does not make either grant redundant —
+            modes, exact/recursive reach, and expiry can differ intentionally. Paths are compared
+            as written (normalised; symlinks are not resolved).`;
+        }
         ok.hidden = false;
         path.value = ''; reason.value = '';
         sync();
@@ -6969,7 +7212,11 @@
   // CPU (measured 2026-09-17). Coming back to the tab refreshes at once, so nothing is stale
   // when it is actually read.
   setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { tick(); gateIntegrityLoad(); } });
+
+  $('gate-integrity-banner-btn').addEventListener('click', () => { setView('govern', true); governShow('gates'); });
+  gateIntegrityLoad();
+  setInterval(() => { if (!document.hidden) gateIntegrityLoad(); }, GATE_INTEGRITY_POLL_MS);
 
   // Display alias editor (#998). Set and clear are operator acts on the console's own
   // presentation store; neither is witnessed, by ruling. The picker's value is the id.
@@ -7037,6 +7284,13 @@
       const r = await hubFetch('/api/hub/status', { cache: 'no-store' });
       const d = await r.json();
       const st = $('hub-state');
+      if (!r.ok) {
+        st.className = 'hub-state err';
+        st.textContent = d.error || ('HTTP ' + r.status);
+        $('hub-meta').textContent = '';
+        $('hub-join').hidden = true;
+        return d;
+      }
       // Membership is the HUB's answer (pinned-pubkey resolve against our LCT),
       // not a local claim — so it gets its own words per state, and an unknown
       // stays unknown rather than defaulting to either yes or no.
@@ -7199,7 +7453,11 @@
       d = await r.json();
       if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     } catch (e) {
-      box.innerHTML = '<div class="empty">could not read hub list</div>'; return;
+      // Keep the daemon's reason (e.g. config_invalid + its recovery step): a bare
+      // "could not read" leaves the operator no way to the fix. Text, not HTML.
+      box.innerHTML = '<div class="empty"></div>';
+      box.firstChild.textContent = 'could not read hub list: ' + ((e && e.message) || e);
+      return;
     }
     const sup = d.supported || {};
     const rows = (d.hubs || []);
@@ -7325,10 +7583,13 @@
       }
       if (!(d.entries || []).length) {
         const o = document.createElement('option');
-        o.value = ''; o.textContent = '(list empty — using ' + d.source + ')';
+        o.value = '';
+        o.textContent = d.source === 'unconfigured' ? '(no hubs configured)' : '(list empty — using ' + d.source + ')';
         sel.appendChild(o);
       }
-      $('hub-urls-summary').textContent = 'hub: ' + d.resolved + '  (' + d.source + ')'
+      $('hub-urls-summary').textContent = (d.resolved
+        ? 'hub: ' + d.resolved + '  (' + d.source + ')'
+        : 'hub: ' + d.source)
         + (d.env_override_active ? ' — env override wins; list edits will not retarget' : '');
     } catch (e) { $('hub-urls-summary').textContent = 'hubs: unavailable (' + e.message + ')'; }
   }

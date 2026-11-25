@@ -1128,10 +1128,28 @@ def prepare_member(member: str, spec: dict, template: dict, home: str, *, dry: b
     L = got
     flat = L.layout == "flat"
     regs = index_hooks(L.hooks, flat)
+    post_targets = {os.path.normpath(d.target) for d in L.desired
+                    if d.event == "PostToolUse" and d.base == "witness.py" and d.target}
+    foreign_post = any(r.event == "PostToolUse" and r.base == "witness.py"
+                       and os.path.normpath(r.target) not in post_targets for r in regs)
+    owned_post = any(r.event == "PostToolUse" and r.base == "witness.py"
+                     and os.path.normpath(r.target) in post_targets for r in regs)
+    wants_failure = any(d.event == "PostToolUseFailure" and d.base == "witness.py" for d in L.desired)
+    has_failure = any(r.event == "PostToolUseFailure" and r.base == "witness.py" for r in regs)
+    uncovered_failure = foreign_post and not owned_post and wants_failure and not has_failure
+    if uncovered_failure:
+        # A foreign witness owns the whole outcome lifecycle. Do not split success and failure
+        # across two witnesses by installing Hestia only for failures, but name the uncovered seat.
+        L.desired = [d for d in L.desired
+                     if not (d.event == "PostToolUseFailure" and d.base == "witness.py")]
     P = plan_reconcile(L.desired, regs, L.hooks, L.layout, installed=installed, dry=dry, plan_mode=plan)
+    if uncovered_failure:
+        P.notes.append("UNCOVERED PostToolUseFailure/witness.py: the only PostToolUse witness is "
+                       "registered outside the declared destination; failure outcomes on this seat "
+                       "are not witnessed by hestia")
     if plan:
         return "plan", [f"{b}\t{t}" for b, t in P.planned] + \
-            [n for n in P.notes if n.startswith(("NARROW", "PENDING"))]
+            [n for n in P.notes if n.startswith(("NARROW", "PENDING", "UNCOVERED"))]
     changes = [f"{verb} {text}" for verb, text in P.changes]
     if L.layout == "json":
         if not P.ops:
@@ -1362,7 +1380,7 @@ def unregister_member(member: str, spec: dict, template: dict, home: str, dry: b
 
 # ---------------------------------------------------------------- main -------------------
 _VERB = {"add": "REGISTERED", "rewrite": "REWROTE", "remove": "REMOVED", "ensure": "REGISTERED"}
-_NOTES = ("NARROW ", "PENDING ", "SHORT ", "INERT ", "FOREIGN ")
+_NOTES = ("NARROW ", "PENDING ", "SHORT ", "INERT ", "FOREIGN ", "UNCOVERED ")
 
 
 def main(argv: list[str]) -> int:
@@ -1471,7 +1489,9 @@ def main(argv: list[str]) -> int:
                     log(f"  {_VERB.get(verb, verb.upper())} {member}: {c if verb == 'ensure' else text}")
             for n in notes:
                 log(f"  {n.split(' ', 1)[0]} {member}: {n.split(' ', 1)[1]}")
-            if verdict == "ok":
+            if verdict == "ok" and any(n.startswith("UNCOVERED ") for n in notes):
+                log(f"  partial {member} — templated hooks are registered, but failure coverage is not")
+            elif verdict == "ok":
                 log(f"  ok    {member} — every templated hook is registered as the template renders it")
             # the exit code comes from the NOTES, not the headline verdict
             if any(n.startswith("NARROW ") for n in notes):
