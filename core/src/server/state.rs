@@ -1039,6 +1039,10 @@ pub struct ServerState {
     /// append that fails for the named event types only (so an intent lands and its success row
     /// does not), and a `persist_standing_scope` that fails (the memory-first rollback's vault
     /// write). Compiled out of the daemon.
+    /// Witness budget for refusals of UNATTRIBUTED would-be arbiters (#991): `(window start,
+    /// rows written in the window, refusals not written since the last row)`. The caller is
+    /// nobody the daemon can name, so nothing else bounds how many chain rows it can cause.
+    pub unattributed_arbiter_refusals: (u64, u32, u64),
     #[cfg(test)]
     pub chain_fault_on: std::collections::HashSet<String>,
     #[cfg(test)]
@@ -1609,6 +1613,7 @@ impl ServerState {
             standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            unattributed_arbiter_refusals: (0, 0, 0),
             #[cfg(test)]
             chain_fault_on: std::collections::HashSet::new(),
             #[cfg(test)]
