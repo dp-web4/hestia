@@ -130,6 +130,25 @@ const CATEGORY_COVERAGE: &[(&str, Coverage, &[&str])] = &[
         ),
         &["policy/extract.rs::classify"],
     ),
+    // #689 (2026-11-23, hub-claude second pass on #1632). Should law be able to DENY this
+    // act? Yes in principle: a confirmation moves another member's conduct score upward,
+    // and `tool_confirm_self_correction` already asks `gate_direct_tool`, so an operator
+    // rule or role overlay naming the category takes effect today. No BUILT-IN rule names
+    // it, and shipping one is a law change — dp's, not a test author's. Recorded as
+    // default-allow so the category is not invisible.
+    (
+        "conduct_confirmation",
+        DefaultAllow(
+            "no built-in rule; what stops a self-serving confirmation is the NOT-SAME \
+             confirmer check inside tool_confirm_self_correction, not a category rule. \
+             The surface is gateable (it calls gate_direct_tool), so a rule can be \
+             shipped without a code change — revisit when one is",
+        ),
+        &[
+            "policy/extract.rs::classify",
+            "server/handler.rs::tool_confirm_self_correction",
+        ],
+    ),
     (
         "credential_access",
         Ruled,

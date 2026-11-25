@@ -1,4 +1,4 @@
-//! Derived trust — `v3-derived-v1` (Stage 2 of the T3-from-V3 arc).
+//! Derived trust — `v3-derived-v2` (Stage 2 of the T3-from-V3 arc).
 //!
 //! The value proposition is AUDITABLE trust: every displayed score must be a
 //! pure function over witnessed evidence, with receipts (score → formula →
@@ -51,6 +51,9 @@
 //!   `answers_deny` still do not score — the link is never inferred from
 //!   timing, because a guessed link would manufacture the evidence that makes
 //!   the score real.
+//! - confirmed-self-correction (score 0.9): a subject-reported reversal linked
+//!   to witnessed original and successful corrective outcomes, confirmed by an
+//!   independent actor through the dedicated conduct-confirmation surface.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -59,7 +62,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::storage::chain::ChainEntry;
 
-pub const DERIVATION_VERSION: &str = "v3-derived-v1";
+pub const DERIVATION_VERSION: &str = "v3-derived-v2";
+pub const CONDUCT_CONFIRMATION_SCHEMA_V1: &str = "hestia.conduct-confirmation/v1";
+/// Independently confirmed self-correction sits between quiet compliance (0.85) and
+/// an accountable appeal (1.0): one observation yields 0.70 on the 0.5 prior.
+pub const SELF_CORRECTION_SCORE: f64 = 0.9;
 
 // ---- Witnessed-volume baseline -------------------------------------------------------
 //
@@ -257,12 +264,13 @@ fn ema_fold(scores: &[f64]) -> Option<f64> {
 /// A projection that silently omits a key does not fail; it derives a WRONG number and
 /// looks fine, so this list is load-bearing and belongs next to the code that reads it.
 pub const DERIVATION_KEYS: &[&str] = &[
-    "about_deny_hash", "action_id", "adjudicator", "alias", "alias_of", "answers_deny",
+    "about_deny_hash", "action_id", "adjudicated_by", "adjudicator", "alias", "alias_of", "answers_deny",
     "attempted", "axis", "before_position", "cause", "charge", "charge_held_by", "class",
-    "data", "decision", "deny_hash", "depends_on", "enforced", "escalation_id", "magnitude",
-    "member", "method", "outcome_hash", "plugin_id", "reason", "ref", "reported_by",
-    "requested_by", "role_lct", "row", "score", "session_id", "status", "subject_plugin_id",
-    "subject_role", "success", "supersedes", "target", "tool_name", "upheld", "verdict",
+    "conduct", "confirmed_by", "correction_hash", "data", "decision", "declared_by", "deny_hash", "depends_on",
+    "enforced", "escalation_id", "magnitude", "member", "method", "outcome_hash", "plugin_id",
+    "reason", "ref", "reported_by", "requested_by", "reversal_hash", "role_lct", "row", "schema",
+    "score", "session_id", "status", "subject_instance_lct", "subject_plugin_id", "subject_role",
+    "success", "supersedes", "target", "target_hash", "tool_name", "upheld", "verdict",
     "verdict_available",
 ];
 
@@ -270,7 +278,7 @@ pub const DERIVATION_KEYS: &[&str] = &[
 /// whole window — `IDENTITY_ALIAS_EVENT` is included because `alias_target` and
 /// `aliased_identities` need it even though no dimension folds it.
 pub const DERIVATION_EVENT_TYPES: &[&str] = &[
-    "adjudication", "amnesty", "appeal", "decision_charge_settled", "exoneration",
+    "adjudication", "amnesty", "appeal", "conduct_confirmation", "decision_charge_settled", "exoneration",
     "exoneration_correction", "gate_escalation_decided", "gate_escalation_opened",
     "gate_escalation_withdrawn", "outcome", "policy_decision", "refutation", "reversal",
     "scope_attestation", IDENTITY_ALIAS_EVENT,
@@ -284,7 +292,7 @@ pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
 /// not be crowded out of the window by another member's routine traffic — a trust level
 /// that depends on how busy your peers are is not a trust level.
 pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
-    "adjudication", "amnesty", "appeal", "decision_charge_settled", "exoneration",
+    "adjudication", "amnesty", "appeal", "conduct_confirmation", "decision_charge_settled", "exoneration",
     "exoneration_correction", "gate_escalation_decided", "gate_escalation_opened",
     "gate_escalation_withdrawn", "policy_decision", "refutation", "reversal", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
@@ -635,6 +643,10 @@ pub fn derive_with_volume(
 pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -> DerivedTrust {
     let mut entries: Vec<&ChainEntry> = window.iter().collect();
     entries.sort_by_key(|e| e.chain_position);
+    let entry_by_hash: HashMap<&str, &ChainEntry> = entries
+        .iter()
+        .map(|entry| (entry.hash.as_str(), *entry))
+        .collect();
 
     // ---- Temperament: governance-response conduct ----
     // Identities whose evidence folds here: this one, plus any witnessed alias of it.
@@ -1113,6 +1125,149 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         });
     }
 
+    // Independently confirmed self-correction (0.9): revalidate the whole graph at read
+    // time; never trust the confirmation's stored score. Multiple confirmations of one
+    // reversal remain receipts but cannot multiply one act into multiple observations.
+    //
+    // THE ACT IS THE PAIR OF OUTCOMES, NOT THE REVERSAL. A self-correction reversal costs
+    // nothing and one outcome can be reversed any number of times, so de-duplicating on the
+    // reversal alone let one original outcome be reversed N times and credited N times
+    // (Legion's probe on #1632: three reversals of one Edit, obs 0 -> 3). One original
+    // outcome earns at most one credit, and one corrective outcome backs at most one credit.
+    // The earliest valid confirmation in the chain wins; the window's order does not decide.
+    let mut confirmed_reversals: HashSet<&str> = HashSet::new();
+    let mut credited_targets: HashMap<&str, u64> = HashMap::new(); // target hash -> confirmation #
+    let mut spent_corrections: HashMap<&str, u64> = HashMap::new(); // correction hash -> confirmation #
+    let mut confirmations: Vec<&ChainEntry> = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            entry.event_type == "conduct_confirmation"
+                && entry_str(entry, "schema") == Some(CONDUCT_CONFIRMATION_SCHEMA_V1)
+                && entry_str(entry, "conduct") == Some("self-correction")
+                && is_member(entry_str(entry, "subject_plugin_id"))
+                && entry_str(entry, "subject_role")
+                    .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                    == role_lct
+        })
+        .collect();
+    confirmations.sort_by_key(|entry| entry.chain_position);
+    for confirmation in confirmations {
+        let confirmer = confirmation
+            .event_data
+            .get("confirmed_by")
+            .and_then(|who| who.get("plugin_id"))
+            .and_then(Value::as_str);
+        let same_instance = match (
+            entry_str(confirmation, "subject_instance_lct"),
+            confirmation
+                .event_data
+                .get("confirmed_by")
+                .and_then(|who| who.get("instance_lct"))
+                .and_then(Value::as_str),
+        ) {
+            (Some(subject), Some(witness)) => subject == witness,
+            _ => false,
+        };
+        if confirmer.is_none() || is_member(confirmer) || same_instance {
+            continue;
+        }
+        let (Some(reversal_hash), Some(target_hash), Some(correction_hash)) = (
+            entry_str(confirmation, "reversal_hash"),
+            entry_str(confirmation, "target_hash"),
+            entry_str(confirmation, "correction_hash"),
+        ) else {
+            continue;
+        };
+        let (Some(reversal), Some(target), Some(correction)) = (
+            entry_by_hash.get(chain_hash(reversal_hash)),
+            entry_by_hash.get(chain_hash(target_hash)),
+            entry_by_hash.get(chain_hash(correction_hash)),
+        ) else {
+            continue;
+        };
+        let valid_reversal = reversal.event_type == "reversal"
+            && entry_str(reversal, "cause") == Some("self-correction")
+            && is_member(entry_str(reversal, "subject_plugin_id"))
+            && entry_str(reversal, "subject_role")
+                .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                == role_lct
+            && reversal
+                .event_data
+                .get("reported_by")
+                .and_then(|who| who.get("plugin_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|reporter| is_member(Some(reporter)))
+            && entry_str(reversal, "ref").map(chain_hash) == Some(target.hash.as_str());
+        let is_subject_outcome = |candidate: &&ChainEntry| {
+            candidate.event_type == "outcome"
+                && is_member(entry_str(candidate, "plugin_id"))
+                && entry_str(candidate, "role_lct")
+                    .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                    == role_lct
+        };
+        let valid_graph = valid_reversal
+            && is_subject_outcome(target)
+            && is_subject_outcome(correction)
+            && correction.event_data.get("success").and_then(Value::as_bool) == Some(true)
+            && target.chain_position < reversal.chain_position
+            && target.chain_position < correction.chain_position
+            && reversal.chain_position < confirmation.chain_position
+            && correction.chain_position < confirmation.chain_position;
+        if !valid_graph {
+            continue;
+        }
+        if !confirmed_reversals.insert(reversal.hash.as_str()) {
+            temperament_evidence.push(Evidence {
+                chain_position: confirmation.chain_position,
+                hash: confirmation.hash.clone(),
+                event_type: confirmation.event_type.clone(),
+                timestamp: confirmation.timestamp,
+                contribution: format!(
+                    "EXCLUDED — duplicate confirmation of self-correction reversal #{}",
+                    reversal.chain_position
+                ),
+                reference: Some(format!("chain:{}", reversal.hash)),
+            });
+            continue;
+        }
+        let already = credited_targets
+            .get(target.hash.as_str())
+            .map(|by| ("original outcome", target.chain_position, *by))
+            .or_else(|| {
+                spent_corrections
+                    .get(correction.hash.as_str())
+                    .map(|by| ("corrective outcome", correction.chain_position, *by))
+            });
+        if let Some((what, position, by)) = already {
+            temperament_evidence.push(Evidence {
+                chain_position: confirmation.chain_position,
+                hash: confirmation.hash.clone(),
+                event_type: confirmation.event_type.clone(),
+                timestamp: confirmation.timestamp,
+                contribution: format!(
+                    "EXCLUDED — {what} #{position} was already credited by confirmation #{by}"
+                ),
+                reference: Some(format!("chain:{}", reversal.hash)),
+            });
+            continue;
+        }
+        credited_targets.insert(target.hash.as_str(), confirmation.chain_position);
+        spent_corrections.insert(correction.hash.as_str(), confirmation.chain_position);
+        temperament_scores.push(SELF_CORRECTION_SCORE);
+        temperament_evidence.push(Evidence {
+            chain_position: confirmation.chain_position,
+            hash: confirmation.hash.clone(),
+            event_type: confirmation.event_type.clone(),
+            timestamp: confirmation.timestamp,
+            contribution: format!(
+                "confirmed self-correction {:.2} (original #{} → correction #{})",
+                SELF_CORRECTION_SCORE, target.chain_position, correction.chain_position
+            ),
+            reference: Some(format!("chain:{}", reversal.hash)),
+        });
+    }
+
     // ---- Adjudicated V3: active leaves over immutable adjudication history ----
     let adjudications: Vec<&ChainEntry> = entries
         .iter()
@@ -1341,8 +1496,11 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
          payload out of this reader's view — and a not-same arbiter must rule via \
          `hestia_arbitrate_appeal`. A refused GOVERNANCE-SURFACE write escalates instead: the \
          escalation must carry `answers_deny` (the deny's chain hash) or it cannot be credited, \
-         because the link is never inferred from timing. Synthetic probe sessions \
-         (test/probe/verify/e2e/debug markers) are excluded from conduct.",
+         because the link is never inferred from timing. Independently confirmed self-correction \
+         scores 0.9 and requires a subject-reported reversal, witnessed original and successful \
+         corrective outcomes, plus a not-the-subject confirmation; duplicate confirmations count once, and one original \
+         or corrective outcome is credited at most once however often it is reversed. \
+         Synthetic probe sessions (test/probe/verify/e2e/debug markers) are excluded from conduct.",
     );
     // An unmeasured grain that says WHY beats one that just says nothing.
     let temperament = match sibling_role_denies {
@@ -1644,6 +1802,47 @@ mod tests {
         assert_eq!(with.level, "high", "saturated volume, no adverse conduct");
     }
 
+    #[test]
+    fn projected_authority_witnesses_match_full_row_derivation() {
+        let role = "role:constellation:interactive-dev";
+        let full = vec![
+            entry(1, 0, "policy_decision", json!({
+                "plugin_id":"codex", "role_lct":role, "decision":"deny",
+                "action_id":"a1", "tool_name":"Bash", "target":"synthetic"
+            })),
+            entry(2, 1, "amnesty", json!({
+                "declared_by":{"operator":true},
+                "data":{"class":"deny", "before_position":2}
+            })),
+            entry(3, 2, "adjudication", json!({
+                "subject_plugin_id":"codex", "subject_role":role, "axis":"validity",
+                "verdict":"refuted", "score":0.0,
+                "adjudicated_by":{"plugin_id":"claude-code"}
+            })),
+            entry(4, 3, "adjudication", json!({
+                "subject_plugin_id":"codex", "subject_role":role, "axis":"validity",
+                "verdict":"upheld", "score":1.0, "supersedes":"hash-3",
+                "adjudicated_by":{"plugin_id":"codex"}
+            })),
+        ];
+        let projected: Vec<_> = full.iter().map(|e| {
+            let data = serde_json::to_string(&e.event_data).unwrap();
+            let timestamp = e.timestamp.to_rfc3339();
+            project_row(crate::storage::chain::ChainRowRef {
+                chain_position:e.chain_position, hash:&e.hash, prev_hash:&e.prev_hash,
+                event_type:&e.event_type, event_data:&data, signer_lct:&e.signer_lct,
+                timestamp:&timestamp,
+            }).unwrap()
+        }).collect();
+        let expected = derive_evidence("codex", role, &full);
+        let actual = derive_evidence("codex", role, &projected);
+        assert_eq!(expected.temperament.observations, 0, "the sovereign amnesty is effective");
+        assert_eq!(expected.validity.observations, 2, "the subject replacement retires nothing");
+        assert_eq!(actual.temperament.observations, expected.temperament.observations);
+        assert_eq!(actual.validity.observations, expected.validity.observations);
+        assert_eq!(actual.validity.score, expected.validity.score);
+    }
+
     /// THE WINDOW FIX, MEASURED — a differential, not an assertion about a constant.
     ///
     /// Routine outcomes must not push governance evidence out of the window a member's
@@ -1895,6 +2094,92 @@ mod tests {
         assert!(derived.veracity.evidence.iter().any(|e| {
             e.hash == "hash-1" && e.contribution.contains("EXCLUDED — superseded by reversal #2")
         }));
+    }
+
+    /// One self-correction graph for `codex`: outcome `target`, a self-reported reversal of
+    /// it at `reversal`, corrective outcome `correction`, confirmed by `claude-code` at `at`.
+    fn self_correction_graph(target: u64, reversal: u64, correction: u64, at: u64) -> Vec<ChainEntry> {
+        let role = "role:constellation:interactive-dev";
+        vec![
+            entry(reversal, reversal as i64, "reversal", json!({
+                "subject_plugin_id":"codex","subject_role":role,"kind":"edit-reverted",
+                "cause":"self-correction","ref":format!("chain:hash-{target}"),
+                "reported_by":{"plugin_id":"codex"}
+            })),
+            entry(at, at as i64, "conduct_confirmation", json!({
+                "schema":CONDUCT_CONFIRMATION_SCHEMA_V1,"conduct":"self-correction",
+                "subject_plugin_id":"codex","subject_role":role,
+                "reversal_hash":format!("hash-{reversal}"),"target_hash":format!("hash-{target}"),
+                "correction_hash":format!("hash-{correction}"),
+                "confirmed_by":{"plugin_id":"claude-code"}
+            })),
+        ]
+    }
+
+    fn subject_outcome(pos: u64) -> ChainEntry {
+        entry(pos, pos as i64, "outcome", json!({
+            "plugin_id":"codex","role_lct":"role:constellation:interactive-dev","success":true
+        }))
+    }
+
+    fn self_correction_credits(d: &DerivedTrust) -> usize {
+        d.temperament.evidence.iter()
+            .filter(|e| e.contribution.starts_with("confirmed self-correction"))
+            .count()
+    }
+
+    /// Legion's probe on #1632: one outcome reversed three times, each reversal confirmed.
+    /// De-duplication was per reversal, so one act became three observations.
+    #[test]
+    fn one_outcome_reversed_many_times_is_credited_once() {
+        let role = "role:constellation:interactive-dev";
+        let mut window = vec![subject_outcome(1), subject_outcome(2)];
+        window.extend(self_correction_graph(1, 3, 2, 4));
+        window.extend(self_correction_graph(1, 5, 2, 6));
+        window.extend(self_correction_graph(1, 7, 2, 8));
+        let derived = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&derived), 1, "{:#?}", derived.temperament.evidence);
+        let excluded: Vec<_> = derived.temperament.evidence.iter()
+            .filter(|e| e.contribution.contains(
+                "EXCLUDED — original outcome #1 was already credited by confirmation #4"))
+            .map(|e| e.chain_position)
+            .collect();
+        assert_eq!(excluded.len(), 2, "the later confirmations are receipted, not dropped");
+        // The earliest confirmation wins whatever order the window arrives in.
+        window.reverse();
+        let reversed = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&reversed), 1);
+        assert!(reversed.temperament.evidence.iter().any(|e| {
+            e.chain_position == 4 && e.contribution.starts_with("confirmed self-correction")
+        }));
+    }
+
+    /// One corrective outcome cannot back the correction of two different originals.
+    #[test]
+    fn one_corrective_outcome_backs_one_credit() {
+        let role = "role:constellation:interactive-dev";
+        let mut window = vec![subject_outcome(1), subject_outcome(2), subject_outcome(3)];
+        window.extend(self_correction_graph(1, 4, 3, 5));
+        window.extend(self_correction_graph(2, 6, 3, 7));
+        let derived = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&derived), 1);
+        assert!(derived.temperament.evidence.iter().any(|e| {
+            e.chain_position == 7 && e.contribution.contains(
+                "EXCLUDED — corrective outcome #3 was already credited by confirmation #5")
+        }));
+    }
+
+    /// Two real, separate self-corrections are still two credits.
+    #[test]
+    fn distinct_self_corrections_each_count() {
+        let role = "role:constellation:interactive-dev";
+        let mut window = vec![
+            subject_outcome(1), subject_outcome(2), subject_outcome(3), subject_outcome(4),
+        ];
+        window.extend(self_correction_graph(1, 5, 2, 6));
+        window.extend(self_correction_graph(3, 7, 4, 8));
+        let derived = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&derived), 2);
     }
 
     #[test]
