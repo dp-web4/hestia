@@ -9290,13 +9290,14 @@ fn undo_unwitnessed_member_claim(
     notice_id: u64,
     to_plugin: &str,
     action: &str,
+    operation_id: &str,
     written: &crate::storage::inbox::MemberNoticeLease,
     prior: Option<&crate::storage::inbox::MemberNoticeLease>,
     append_err: &anyhow::Error,
 ) -> Value {
     let restore = match prior {
         Some(prior) => store
-            .restore_member_notice_lease(notice_id, to_plugin, written, prior)
+            .restore_member_notice_lease(notice_id, to_plugin, operation_id, written, prior)
             .map_err(|e| e.to_string()),
         None => Err("the prior lease was not readable before the change".to_string()),
     };
@@ -9423,8 +9424,8 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                         claim_expires_at: Some(claim_expires_at.to_rfc3339()),
                     };
                     return Ok(undo_unwitnessed_member_claim(
-                        &s.inbox_store, notice_id, &who.plugin_id, action, &written,
-                        prior_lease.as_ref(), &append_err,
+                        &s.inbox_store, notice_id, &who.plugin_id, action, &lease_operation_id,
+                        &written, prior_lease.as_ref(), &append_err,
                     ));
                 }
             };
@@ -9470,8 +9471,8 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                             claim_expires_at: None,
                         };
                         return Ok(undo_unwitnessed_member_claim(
-                            &s.inbox_store, notice_id, &who.plugin_id, action, &written,
-                            prior_lease.as_ref(), &append_err,
+                            &s.inbox_store, notice_id, &who.plugin_id, action, operation_id,
+                            &written, prior_lease.as_ref(), &append_err,
                         ));
                     }
                 }
@@ -9491,6 +9492,11 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                 "witnessEntryHash": witness.map(|entry| entry.hash),
             }))
         }
+        MemberNoticeClaimOutcome::UnresolvedIntent => Ok(hestia_error_envelope(
+            "hestia.member_claim_unresolved_intent",
+            "this notice has an unresolved lease mutation; reconcile it before another claim or release",
+            Some(json!({"notice_id": notice_id})),
+        )),
         MemberNoticeClaimOutcome::Conflict {
             claimed_by_session,
             claim_expires_at,
