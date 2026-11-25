@@ -1545,7 +1545,7 @@ impl SqliteInboxStore {
                         },
                     };
                     dbg!(&intent);
-                    tx.execute(
+                    let changed = tx.execute(
                         "UPDATE member_notices
                          SET lease_intent_json = ?2, claimed_by_session = ?3, claim_expires_at = ?4
                          WHERE id = ?1 AND to_plugin = ?5 AND drained_at IS NULL
@@ -1559,6 +1559,13 @@ impl SqliteInboxStore {
                         ],
                     )
                     .context("claiming member notice")?;
+                    dbg!(changed);
+                    let raw_intent: Option<String> = tx.query_row(
+                        "SELECT lease_intent_json FROM member_notices WHERE id = ?1",
+                        params![id as i64],
+                        |row| row.get(0),
+                    )?;
+                    dbg!(raw_intent);
                     MemberNoticeClaimOutcome::Claimed {
                         claim_expires_at: expires_at,
                         renewed,
