@@ -94,12 +94,14 @@ def patch_core(src):
                         hits = [option for option in env_long_options if option.startswith(name)]
                         if len(hits) == 1:
                             name = hits[0]
+                    if re.fullmatch(r"-[iv0]+u", word):
+                        wrapper_option = "skip"
+                        continue
                     attached = re.fullmatch(r"-[iv0]*([SC])(.*)", word, re.S)
                     if attached:
                         kind = "split" if attached.group(1) == "S" else "chdir"
                         if attached.group(2):
                             apply_wrapper_option(kind, attached.group(2))
-                            wrapper = None
                         else:
                             wrapper_option = kind
                         continue
@@ -110,14 +112,12 @@ def patch_core(src):
                     if name == "--split-string":
                         if eq:
                             apply_wrapper_option("split", value)
-                            wrapper = None
                         else:
                             wrapper_option = "split"
                         continue
                     if name == "--chdir":
                         if eq:
                             apply_wrapper_option("chdir", value)
-                            wrapper = None
                         else:
                             wrapper_option = "chdir"
                         continue
@@ -218,12 +218,27 @@ def patch_test(src):
         ("env_unset_long_write", "env --unset cat tee unset-new.txt", "unset-new.txt"),
         ("env_unset_abbreviated_write", "env --uns cat tee unset-abbreviated-new.txt", "unset-abbreviated-new.txt"),
         ("env_unset_shortest_unique_prefix_write", "env --u cat tee unset-prefix-new.txt", "unset-prefix-new.txt"),
+        ("env_attached_chdir_trailing_i_write", f"env -C{other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_long_chdir_trailing_i_write", f"env --chdir={other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_combined_chdir_trailing_i_write", f"env -iC{other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_long_chdir_double_dash_write", f"env --chdir={other} -- rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_attached_chdir_trailing_v_write", f"env -C{other} -v tee trailing-new.txt", f"{other}/trailing-new.txt"),
+        ("env_attached_chdir_trailing_unset_write", f"env -C{other} -u cat tee trailing-unset-new.txt", f"{other}/trailing-unset-new.txt"),
+        ("env_attached_chdir_trailing_i_read", f"env --chdir={other} -i cat secret.txt", f"{other}/secret.txt"),
+        ("env_attached_split_option_write", "env -S'-u cat tee split-option-new.txt'", "split-option-new.txt"),
+        ("env_long_split_option_write", "env --split-string='-i rm -f remove.txt'", "remove.txt"),
+        ("env_attached_split_chdir_read", f"env -S'-C {other} cat secret.txt'", f"{other}/secret.txt"),
+        ("env_attached_split_i_write", "env -S'-i rm -f remove.txt'", "remove.txt"),
+        ("env_i_cluster_unset_write", "env -iu cat tee cluster-unset-new.txt", "cluster-unset-new.txt"),
+        ("env_v_cluster_unset_write", "env -vu cat tee cluster-v-unset-new.txt", "cluster-v-unset-new.txt"),
 ''')
     src = once(src, '''    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
 ''', '''    check("sudo_echo_does_not_treat_rm_as_its_command", reach("sudo echo rm remove.txt")[0])
     check("env_printf_does_not_treat_cat_as_its_command", reach("env printf '%s' cat notes.txt")[0])
     check("timeout_echo_does_not_treat_tee_as_its_command", reach("timeout 5 echo tee new.txt")[0])
     check("nice_true_does_not_treat_rm_as_its_command", reach("nice -n 5 true rm remove.txt")[0])
+    check("env_split_true_ends_option_parsing_at_the_command", reach("env -S'true' -i rm -f remove.txt")[0])
+    check("env_long_split_true_ends_option_parsing_at_the_command", reach("env --split-string=true -i rm -f remove.txt")[0])
     unenumerated = scopes + ["path:" + G.UNENUMERATED_TARGET]
     for name, command in (
         ("env_split_expansion_is_an_ordinary_unenumerated_refusal",
