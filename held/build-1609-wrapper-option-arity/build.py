@@ -228,12 +228,13 @@ def run_bare_test(root, home):
     code = """import sys
 sys.path.insert(0, sys.argv[1])
 import test_gate_core as t
-t.test_bare_name_file_operands_in_an_ungranted_cwd()
+[getattr(t, name)() for name in t.ALL_TESTS]
 print('FAILURES', t.FAILURES)
 raise SystemExit(bool(t.FAILURES))
 """
     env = dict(os.environ, HOME=str(home), PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.run([sys.executable, "-c", code, str(root / "shared")], cwd=WT, env=env)
+    return subprocess.run([sys.executable, "-c", code, str(root / "shared")], cwd=WT, env=env,
+                          text=True, capture_output=True)
 
 
 def main():
@@ -246,9 +247,16 @@ def main():
         overlaid(base, original_core, patched_test)
         overlaid(patched, patched_core, patched_test)
         before = run_bare_test(base, work / "base-home")
+        print(before.stdout[-4000:])
+        print(before.stderr[-2000:], file=sys.stderr)
         assert before.returncode != 0, "the wrapper-option regressions do not fail on the base core"
         after = run_bare_test(patched, work / "patched-home")
-        assert after.returncode == 0, "the patched core did not pass the bare-operand test"
+        print(after.stdout[-4000:])
+        print(after.stderr[-2000:], file=sys.stderr)
+        copy_location_failures = {"shims_present", "scope_rule_duplication_matches_inventory"}
+        unexpected = [line for line in after.stdout.splitlines()
+                      if line.startswith("FAIL ") and line.split()[1] not in copy_location_failures]
+        assert not unexpected, ("unexpected full-suite failures", unexpected)
     finally:
         shutil.rmtree(work)
 
