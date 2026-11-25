@@ -19715,15 +19715,19 @@ mod tests {
         assert_eq!(opened["binding_verified"], true, "{opened}");
         assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
 
+        // The shipped member-mesh client connects without host_session_id. An exact act from
+        // another session must retain the independent-open door, not a false mismatch refusal.
         let other_session = connect_as(&shared, "kimi-code").await;
-        let rejected = tool_gate_escalation_open(
+        let independent = tool_gate_escalation_open(
             &shared, &manual_open_args(&other_session, marker, canonical))
             .await
             .unwrap();
-        assert_eq!(rejected["_hestia_error"]["code"], "hestia.escalation_open_binding_mismatch");
-        assert_eq!(rejected["_hestia_error"]["data"]["expected"], Value::Null);
-        assert_eq!(rejected["_hestia_error"]["data"]["refusal_id"], Value::Null);
-        assert!(rejected["_hestia_error"]["data"]["alternatives"].as_array().unwrap().is_empty());
+        assert_eq!(independent["binding_status"], "marker_history_only", "{independent}");
+        assert_eq!(independent["binding_verified"], false, "{independent}");
+        assert_eq!(independent["bound_refusal_id"], Value::Null, "{independent}");
+        assert!(independent.get("expected").is_none(), "no other session's act: {independent}");
+        assert!(independent.get("refusal_id").is_none(), "no other session's id: {independent}");
+        assert!(independent.get("alternatives").is_none(), "no refusal details: {independent}");
     }
 
     #[tokio::test]
@@ -27653,8 +27657,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // An approval is claimable only against the gate's exact act and marker. A warning after the
     // mint is too late: peers may already have ruled on a permit no re-issue can spend. Refuse a
     // mismatch against a live refusal BEFORE anything is opened, and name the refusal-linked door
-    // that copies both fields instead of asking the member to retype them. Ownership may be proven
-    // by the daemon MCP session or the stable host session; other members' acts stay undisclosed.
+    // that copies both fields instead of asking the member to retype them. Ownership may be
+    // established by the daemon MCP session or asserted by the stable host session (A1). When
+    // neither matches, retain the pre-existing independent-open door without disclosing the act.
     let asking_session_id = proven_session_uuid.map(|uuid| uuid.to_string());
     let asking_host_session_id = proven_session_uuid
         .and_then(|uuid| s.sessions.get(&uuid))
@@ -27685,9 +27690,6 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         let exact = candidates
             .iter()
             .find(|(_, a, m, _, owned)| a.as_str() == presented_act && m == &marker && *owned);
-        let exact_unowned = candidates
-            .iter()
-            .any(|(_, a, m, _, owned)| a.as_str() == presented_act && m == &marker && !*owned);
         if exact.is_none() {
             let mut mismatch: Vec<_> = candidates
                 .iter()
@@ -27699,7 +27701,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
                     .filter(|(_, _, m, _, owned)| *owned && m == &marker)
                     .collect();
             }
-            if exact_unowned || !mismatch.is_empty() {
+            if !mismatch.is_empty() {
                 mismatch.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
                 let expected = (mismatch.len() == 1).then(|| mismatch[0]);
                 let alternatives: Vec<Value> = mismatch
