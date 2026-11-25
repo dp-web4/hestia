@@ -2,6 +2,7 @@
   "pending_escalations": [
     {
       "act_text": "policy_edit -> pending.json",
+      "asker_basis": "session",
       "bar": "single_approver",
       "claimed_by": "claude-code",
       "expires_at": 1795433629,
