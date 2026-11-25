@@ -191,7 +191,9 @@ def _install_inventory_cases(fn: str, tmp: Path) -> None:
         f = home / "installer-ran"
         return f.read_text().strip() if f.exists() else ""
 
-    prelude = 'inventory=""\n'
+    # Match the deploy script's startup before extracting this function: an absent
+    # HESTIA_HOME uses the operator's existing home default, including the no-workspace arm.
+    prelude = 'HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}"\ninventory=""\n'
     wsdir = tmp / "seat-workspace"
     wsdir.mkdir()
     ws = str(wsdir)
