@@ -1726,11 +1726,14 @@ impl SqliteInboxStore {
             let id: i64 = row.get(0)?;
             let to_plugin: String = row.get(1)?;
             let raw: String = row.get(2)?;
-            Ok((id as u64, to_plugin, serde_json::from_str::<MemberNoticeLeaseIntent>(&raw)?))
+            Ok((id as u64, to_plugin, raw))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let (id, to_plugin, raw) = row?;
+            let intent = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing lease intent for notice {id}"))?;
+            out.push((id, to_plugin, intent));
         }
         Ok(out)
     }
