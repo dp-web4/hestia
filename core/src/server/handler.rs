@@ -9332,13 +9332,14 @@ fn undo_unwitnessed_member_claim(
     notice_id: u64,
     to_plugin: &str,
     action: &str,
+    operation_id: &str,
     written: &crate::storage::inbox::MemberNoticeLease,
     prior: Option<&crate::storage::inbox::MemberNoticeLease>,
     append_err: &anyhow::Error,
 ) -> Value {
     let restore = match prior {
         Some(prior) => store
-            .restore_member_notice_lease(notice_id, to_plugin, written, prior)
+            .restore_member_notice_lease(notice_id, to_plugin, operation_id, written, prior)
             .map_err(|e| e.to_string()),
         None => Err("the prior lease was not readable before the change".to_string()),
     };
@@ -9419,21 +9420,41 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
     let session = who.session_uuid.expect("attributed callers have a session");
     // The exact lease before this act, read under the same state lock as the change, so a
     // failed witness append can put it back (fresh claim, renewal, expired takeover, release).
-    let prior_lease = s
-        .inbox_store
-        .member_notice_lease(notice_id, &who.plugin_id)
-        .map_err(|e| anyhow::anyhow!("reading member notice lease: {e}"))?;
-    let outcome = if action == "release" {
-        s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
-    } else {
-        s.inbox_store.claim_member_notice(
-            notice_id,
-            &who.plugin_id,
-            session,
-            lease_secs,
-        )
-    }
-    .map_err(|e| anyhow::anyhow!("changing member notice claim: {e}"))?;
+    // An outstanding intent gets one inline reconciliation before refusing the new mutation.
+    let mut reconcile_attempted = false;
+    let (prior_lease, outcome) = loop {
+        let prior_lease = s
+            .inbox_store
+            .member_notice_lease(notice_id, &who.plugin_id)
+            .map_err(|e| anyhow::anyhow!("reading member notice lease: {e}"))?;
+        let outcome = if action == "release" {
+            s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
+        } else {
+            s.inbox_store.claim_member_notice(
+                notice_id,
+                &who.plugin_id,
+                session,
+                lease_secs,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("changing member notice claim: {e}"))?;
+        if matches!(&outcome, MemberNoticeClaimOutcome::UnresolvedIntent) && !reconcile_attempted {
+            if let Err(error) = s.inbox_store.reconcile_member_notice_lease_intent(
+                notice_id,
+                &who.plugin_id,
+                &s.chain_store,
+            ) {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_claim_reconcile_failed",
+                    "an earlier lease change could not be reconciled; it will be retried at the next daemon start",
+                    Some(json!({"notice_id": notice_id, "reconcile_error": error.to_string()})),
+                ));
+            }
+            reconcile_attempted = true;
+            continue;
+        }
+        break (prior_lease, outcome);
+    };
 
     match outcome {
         MemberNoticeClaimOutcome::Claimed {
@@ -9465,8 +9486,8 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                         claim_expires_at: Some(claim_expires_at.to_rfc3339()),
                     };
                     return Ok(undo_unwitnessed_member_claim(
-                        &s.inbox_store, notice_id, &who.plugin_id, action, &written,
-                        prior_lease.as_ref(), &append_err,
+                        &s.inbox_store, notice_id, &who.plugin_id, action, &lease_operation_id,
+                        &written, prior_lease.as_ref(), &append_err,
                     ));
                 }
             };
@@ -9512,8 +9533,8 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                             claim_expires_at: None,
                         };
                         return Ok(undo_unwitnessed_member_claim(
-                            &s.inbox_store, notice_id, &who.plugin_id, action, &written,
-                            prior_lease.as_ref(), &append_err,
+                            &s.inbox_store, notice_id, &who.plugin_id, action, operation_id,
+                            &written, prior_lease.as_ref(), &append_err,
                         ));
                     }
                 }
@@ -9533,6 +9554,11 @@ async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
                 "witnessEntryHash": witness.map(|entry| entry.hash),
             }))
         }
+        MemberNoticeClaimOutcome::UnresolvedIntent => Ok(hestia_error_envelope(
+            "hestia.member_claim_unresolved_intent",
+            "an earlier lease change is still unresolved after inline reconciliation; it will be retried at the next daemon start",
+            Some(json!({"notice_id": notice_id, "reconcile_attempted": reconcile_attempted})),
+        )),
         MemberNoticeClaimOutcome::Conflict {
             claimed_by_session,
             claim_expires_at,
@@ -14019,6 +14045,54 @@ mod member_mesh_tests {
     #[tokio::test]
     async fn an_unwitnessed_release_is_rolled_back_and_blocks_sibling_drain() {
         unwitnessed_lease_change_rolls_back("release").await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_lease_intent_clear_reconciles_inline_on_the_next_claim() {
+        let (dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let inbox = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+        inbox.pragma_update(None, "key", hex::encode(key)).unwrap();
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "shared-context/forum/lease-inline.md", "session_id": sender}),
+        )
+        .await
+        .unwrap();
+        let id = sent["queued_id"].as_u64().expect("notice queued");
+        inbox.execute_batch(
+            r#"CREATE TRIGGER fail_lease_intent_clear
+               BEFORE UPDATE OF lease_intent_json ON member_notices
+               WHEN OLD.lease_intent_json IS NOT NULL AND NEW.lease_intent_json IS NULL
+               BEGIN SELECT RAISE(ABORT, 'injected lease intent clear failure'); END;"#,
+        ).unwrap();
+
+        let first = tool_member_claim(
+            &state,
+            &json!({"notice_id": id, "session_id": owner, "lease_secs": 60}),
+        )
+        .await;
+        assert!(first.is_err(), "the injected clear failure must surface: {first:?}");
+        inbox.execute_batch("DROP TRIGGER fail_lease_intent_clear").unwrap();
+        assert_eq!(state.lock().await.inbox_store.member_notice_lease_intents().unwrap().len(), 1);
+
+        let second = tool_member_claim(
+            &state,
+            &json!({"notice_id": id, "session_id": owner, "action": "renew", "lease_secs": 120}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["claimed"], json!(true), "{second}");
+        assert_eq!(second["renewed"], json!(true), "{second}");
+        assert!(state.lock().await.inbox_store.member_notice_lease_intents().unwrap().is_empty());
+
+        let delivered = tool_member_inbox(&state, &json!({"session_id": owner})).await.unwrap();
+        assert_eq!(delivered["total"], json!(1), "{delivered}");
+        let second_drain = tool_member_inbox(&state, &json!({"session_id": owner})).await.unwrap();
+        assert_eq!(second_drain["total"], json!(0), "{second_drain}");
     }
 
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
