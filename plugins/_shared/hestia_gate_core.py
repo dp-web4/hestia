@@ -3477,6 +3477,10 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     cwd = (cwd or os.getcwd()).replace("\\", "/")
     bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
     cwd_path = os.path.normpath(cwd).replace("\\", "/")
+    event_cwd = cwd_path
+    event_cwd_explicit = False
+    wrapper, wrapper_option = None, None
+    wrapper_option_error = False
 
     # #1609: outside the workspace and every path grant, a slashless file operand resolves in
     # this cwd just as its `./` spelling does. Existing read operands retain the existence vote:
@@ -3495,7 +3499,7 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             except _Unenumerated:
                 return
             if value and value != "-" and not _path_shaped(value, False):
-                bare.append((value, write))
+                bare.append((value, write, event_cwd, event_cwd_explicit))
 
         def finish_bare_command():
             if head == "cp":
@@ -3517,12 +3521,43 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             bare_tokens = _shell_words(scan)
         except _Unmodelled:
             bare_tokens = []                     # pass 3 returns the ordinary unenumerated refusal
-        for kind, word, uglob in bare_tokens:
+        def apply_wrapper_option(kind, value):
+            nonlocal event_cwd, event_cwd_explicit, bare_tokens, wrapper_option_error
+            try:
+                value = _word_value(value)
+                if kind == "split":
+                    bare_tokens[i + 1:i + 1] = _shell_words(value)
+                elif kind == "chdir":
+                    if event_cwd is not None or os.path.isabs(value):
+                        event_cwd = os.path.normpath(os.path.join(
+                            event_cwd or "", value)).replace("\\", "/")
+                    event_cwd_explicit = True
+            except (_Unmodelled, _Unenumerated):
+                wrapper_option_error = True
+                if kind == "chdir":
+                    event_cwd = None
+                    event_cwd_explicit = True
+
+        wrapper_value_options = {
+            "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "doas": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "env": {"-u"},
+            "exec": {"-a"},
+            "timeout": {"-s", "-k", "--signal", "--kill-after"},
+            "stdbuf": {"-i", "-o", "-e"},
+            "nice": {"-n", "--adjustment"},
+            "ionice": {"-c", "-n", "-p"},
+        }
+        env_long_options = ("--split-string", "--chdir", "--unset")
+        for i, (kind, word, uglob) in enumerate(bare_tokens):
             if kind == "sep" or (kind == "word" and head is None
                                  and word.replace(_BRACE_OPEN, "") in _SHELL_KEYWORDS):
                 finish_bare_command()
                 head, operands, cp_target = None, [], False
                 redirect, pending, opts_done = None, None, False
+                wrapper, wrapper_option = None, None
+                event_cwd = cwd_path
+                event_cwd_explicit = False
                 continue
             if kind == "mark":
                 continue
@@ -3540,15 +3575,63 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             if kind != "word":
                 continue
             if head is None:
-                name, eq, _value = word.partition("=")
+                if wrapper_option is not None:
+                    kind = wrapper_option
+                    wrapper_option = None
+                    apply_wrapper_option(kind, word)
+                    continue
+                name, eq, value = word.partition("=")
+                base = os.path.basename(word)
+                if wrapper == "env":
+                    if name.startswith("--") and len(name) > 2:
+                        hits = [option for option in env_long_options if option.startswith(name)]
+                        if len(hits) == 1:
+                            name = hits[0]
+                    if re.fullmatch(r"-[iv0]+u", word):
+                        wrapper_option = "skip"
+                        continue
+                    attached = re.fullmatch(r"-[iv0]*([SC])(.*)", word, re.S)
+                    if attached:
+                        kind = "split" if attached.group(1) == "S" else "chdir"
+                        if attached.group(2):
+                            apply_wrapper_option(kind, attached.group(2))
+                        else:
+                            wrapper_option = kind
+                        continue
+                    if name == "--unset":
+                        if not eq:
+                            wrapper_option = "skip"
+                        continue
+                    if name == "--split-string":
+                        if eq:
+                            apply_wrapper_option("split", value)
+                        else:
+                            wrapper_option = "split"
+                        continue
+                    if name == "--chdir":
+                        if eq:
+                            apply_wrapper_option("chdir", value)
+                        else:
+                            wrapper_option = "chdir"
+                        continue
+                if wrapper in wrapper_value_options and base in wrapper_value_options[wrapper]:
+                    wrapper_option = "skip"
+                    continue
                 if eq and name.isidentifier():
                     continue
-                base = os.path.basename(word)
-                if base in _HEREDOC_WRAPPERS or word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
+                if base in _HEREDOC_WRAPPERS:
+                    wrapper = base
+                    continue
+                if base in _CMD_SPECS or base in ("cat", "rm", "cp", "tee", "true", "false"):
+                    head = base
+                    wrapper = None
+                    continue
+                if wrapper is None:
+                    head = base
+                    continue
+                if word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
                         or (word.startswith("-") and len(word) > 1):
                     continue
-                head = base
-                continue
             if pending is not None:
                 if pending == "target":
                     add_bare(word, uglob, True)
@@ -3576,16 +3659,20 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 operands.append((word, uglob))
         finish_bare_command()
 
+        if wrapper_option_error and not lift_unenum:
+            return False, f"{_UNMODELLED_PREFIX}an env -S/-C value the gate cannot read>", UNENUMERATED_TARGET
         seen_bare = set()
-        for value, write in bare:
-            if (value, write) in seen_bare:
+        for value, write, operand_cwd, operand_cwd_explicit in bare:
+            if (value, write, operand_cwd, operand_cwd_explicit) in seen_bare:
                 continue
             if len(seen_bare) >= SCOPE_JUDGE_BUDGET:
                 if lift_overflow:
                     break
                 return False, _INCOMPLETE, OVERFLOW_TARGET
-            seen_bare.add((value, write))
-            event_candidate = os.path.normpath(os.path.join(cwd_path, value)).replace("\\", "/")
+            seen_bare.add((value, write, operand_cwd, operand_cwd_explicit))
+            if operand_cwd is None:
+                continue
+            event_candidate = os.path.normpath(os.path.join(operand_cwd, value)).replace("\\", "/")
             if write:
                 refused = _outside_reach_refused(event_candidate, scopes, workspace, cwd,
                                                  egress, home_markers)
@@ -3595,8 +3682,11 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             if not os.path.lexists(event_candidate):
                 continue
             refused = None
-            read_bases = bases + [root for root, _recursive in
-                                  _scope_roots_with_reach(scopes, workspace)]
+            if operand_cwd_explicit:
+                read_bases = [operand_cwd]
+            else:
+                read_bases = bases + [root for root, _recursive in
+                                      _scope_roots_with_reach(scopes, workspace)]
             for base in dict.fromkeys(read_bases):
                 cand = os.path.normpath(os.path.join(base, value)).replace("\\", "/")
                 if not os.path.lexists(cand):

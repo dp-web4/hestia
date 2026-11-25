@@ -329,6 +329,10 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
         open(os.path.join(outside, name), "w").close()
     open(os.path.join(outside, "{notes"), "w").close()
     open(os.path.join(ws, "source.txt"), "w").close()
+    other = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    for name in ("secret.txt", "chdir-shared.txt"):
+        open(os.path.join(other, name), "w").close()
+    open(os.path.join(ws, "chdir-shared.txt"), "w").close()
 
     def reach(command):
         return G.command_scope_reach(command, scopes, ws, outside)
@@ -379,6 +383,61 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
         ("timeout_write", "timeout 5 rm -f remove.txt", "remove.txt"),
         ("nohup_write", "nohup rm -f remove.txt", "remove.txt"),
         ("sudo_read", "sudo -n cat notes.txt", "notes.txt"),
+        ("timeout_signal_name_write", "timeout -s KILL 5 rm -f remove.txt", "remove.txt"),
+        ("env_unset_write", "env -u FOO rm -f remove.txt", "remove.txt"),
+        ("sudo_user_write", "sudo -u root rm -f remove.txt", "remove.txt"),
+        ("sudo_group_write", "sudo -g wheel rm -f remove.txt", "remove.txt"),
+        ("grouped_env_unset_write", "{ env -u FOO rm -f remove.txt; }", "remove.txt"),
+        ("stdbuf_output_write", "stdbuf -o L rm -f remove.txt", "remove.txt"),
+        ("env_split_write", "env -S 'rm -f remove.txt'", "remove.txt"),
+        ("sudo_user_read", "sudo -u root cat notes.txt", "notes.txt"),
+        ("env_unset_read", "env -u FOO cat notes.txt", "notes.txt"),
+        ("nice_non_numeric_write", "nice -n x rm -f remove.txt", "remove.txt"),
+        ("doas_user_write", "doas -u root rm -f remove.txt", "remove.txt"),
+        ("exec_name_write", "exec -a name cat notes.txt", "notes.txt"),
+        ("ionice_class_write", "ionice -c best-effort cat notes.txt", "notes.txt"),
+        ("env_chdir_does_not_leak_into_next_command", "env -C /tmp true; rm -f remove.txt", "remove.txt"),
+        ("env_chdir_does_not_leak_into_and_branch", "env -C /tmp true && cat notes.txt", "notes.txt"),
+        ("env_chdir_does_not_leak_into_pipe", "env -C /tmp true | tee leak-new.txt", "leak-new.txt"),
+        ("env_chdir_does_not_leak_into_group", "env -C /tmp true; { rm -f remove.txt; }", "remove.txt"),
+        ("later_env_chdir_does_not_relocate_earlier_write", "rm -f remove.txt; env -C /tmp true", "remove.txt"),
+        ("later_env_chdir_does_not_relocate_earlier_read", f"env -C {other} cat secret.txt; env -C /tmp true", f"{other}/secret.txt"),
+        ("env_unset_argument_is_not_the_command", "env -u cat tee wr-new.txt", "wr-new.txt"),
+        ("exec_name_argument_is_not_the_command", "exec -a cat tee wr-new.txt", "wr-new.txt"),
+        ("sudo_user_argument_is_not_the_command", "sudo -u cat tee wr-new.txt", "wr-new.txt"),
+        ("env_unset_argument_is_not_copy_source", f"env -u cat cp {ws}/source.txt cp-new.txt", "cp-new.txt"),
+        ("env_attached_split_write", "env -S'rm -f remove.txt'", "remove.txt"),
+        ("env_long_split_write", "env --split-string='rm -f remove.txt'", "remove.txt"),
+        ("env_combined_i_split_write", "env -iS 'rm -f remove.txt'", "remove.txt"),
+        ("env_combined_v_split_write", "env -vS 'rm -f remove.txt'", "remove.txt"),
+        ("env_long_attached_chdir_read", f"env --chdir={other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_short_attached_chdir_read", f"env -C{other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_combined_attached_chdir_read", f"env -iC{other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_quoted_attached_chdir_read", f"env -C'{other}' cat secret.txt", f"{other}/secret.txt"),
+        ("env_relative_attached_chdir_read", f"env --chdir=../{os.path.basename(other)} cat secret.txt", f"{other}/secret.txt"),
+        ("env_repeated_chdir_write", f"env -C /tmp -C{other} rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_attached_split_with_slash_write", "env -S'rm -f remove.txt sub/x'", "remove.txt"),
+        ("env_attached_split_with_absolute_path_write", "env -S'rm -f remove.txt /tmp/x'", "remove.txt"),
+        ("env_combined_iv_split_write", "env -ivS 'rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_split_write", "env --spl='rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_split_long_write", "env --split='rm -f remove.txt'", "remove.txt"),
+        ("env_abbreviated_chdir_read", f"env --chd={other} cat secret.txt", f"{other}/secret.txt"),
+        ("env_unset_long_write", "env --unset cat tee unset-new.txt", "unset-new.txt"),
+        ("env_unset_abbreviated_write", "env --uns cat tee unset-abbreviated-new.txt", "unset-abbreviated-new.txt"),
+        ("env_unset_shortest_unique_prefix_write", "env --u cat tee unset-prefix-new.txt", "unset-prefix-new.txt"),
+        ("env_attached_chdir_trailing_i_write", f"env -C{other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_long_chdir_trailing_i_write", f"env --chdir={other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_combined_chdir_trailing_i_write", f"env -iC{other} -i rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_long_chdir_double_dash_write", f"env --chdir={other} -- rm -f secret.txt", f"{other}/secret.txt"),
+        ("env_attached_chdir_trailing_v_write", f"env -C{other} -v tee trailing-new.txt", f"{other}/trailing-new.txt"),
+        ("env_attached_chdir_trailing_unset_write", f"env -C{other} -u cat tee trailing-unset-new.txt", f"{other}/trailing-unset-new.txt"),
+        ("env_attached_chdir_trailing_i_read", f"env --chdir={other} -i cat secret.txt", f"{other}/secret.txt"),
+        ("env_attached_split_option_write", "env -S'-u cat tee split-option-new.txt'", "split-option-new.txt"),
+        ("env_long_split_option_write", "env --split-string='-i rm -f remove.txt'", "remove.txt"),
+        ("env_attached_split_chdir_read", f"env -S'-C {other} cat secret.txt'", f"{other}/secret.txt"),
+        ("env_attached_split_i_write", "env -S'-i rm -f remove.txt'", "remove.txt"),
+        ("env_i_cluster_unset_write", "env -iu cat tee cluster-unset-new.txt", "cluster-unset-new.txt"),
+        ("env_v_cluster_unset_write", "env -vu cat tee cluster-v-unset-new.txt", "cluster-v-unset-new.txt"),
     )
     for name, command, target in grouped_cases + wrapped_cases:
         ok, offending, refused = reach(command)
@@ -400,9 +459,47 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
     check("echo_operands_remain_strings", reach("echo notes.txt")[0])
     check("printf_operands_remain_strings", reach("printf '%s' notes.txt")[0])
 
-    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
+    check("sudo_echo_does_not_treat_rm_as_its_command", reach("sudo echo rm remove.txt")[0])
+    check("env_printf_does_not_treat_cat_as_its_command", reach("env printf '%s' cat notes.txt")[0])
+    check("timeout_echo_does_not_treat_tee_as_its_command", reach("timeout 5 echo tee new.txt")[0])
+    check("nice_true_does_not_treat_rm_as_its_command", reach("nice -n 5 true rm remove.txt")[0])
+    check("env_split_true_ends_option_parsing_at_the_command", reach("env -S'true' -i rm -f remove.txt")[0])
+    check("env_long_split_true_ends_option_parsing_at_the_command", reach("env --split-string=true -i rm -f remove.txt")[0])
+    unenumerated = scopes + ["path:" + G.UNENUMERATED_TARGET]
+    for name, command in (
+        ("env_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -S "rm -f $X remove.txt"'),
+        ("env_attached_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -S"rm -f $X remove.txt"'),
+        ("env_long_split_expansion_is_an_ordinary_unenumerated_refusal",
+         'env --split-string="rm -f $X remove.txt"'),
+        ("env_chdir_expansion_is_an_ordinary_unenumerated_refusal",
+         'env -C "$D" rm -f remove.txt'),
+    ):
+        ok, offending, refused = reach(command)
+        check(name, not ok and refused == G.UNENUMERATED_TARGET
+              and offending.startswith(G._UNMODELLED_PREFIX), repr((ok, offending, refused)))
+        check(name + "_one_time_approval_can_be_spent",
+              G.command_scope_reach(command, unenumerated, ws, outside)[0])
+    check("lifted_unknown_chdir_still_judges_literal_paths",
+          not G.command_scope_reach(f'env -C "$D" cat {other}/secret.txt',
+                                    unenumerated, ws, outside)[0])
+    check("env_split_unterminated_quote_is_an_ordinary_unenumerated_refusal",
+          reach("env -S \"rm -f 'x\"")[2] == G.UNENUMERATED_TARGET)
+    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX,
+                          "path:" + other + G.RECURSIVE_SUFFIX]
     check("an_explicit_cwd_grant_admits_the_same_read",
           G.command_scope_reach("cat notes.txt", permitted, ws, outside)[0])
+    check("env_chdir_uses_its_actual_working_directory",
+          G.command_scope_reach("env -C /tmp rm -f remove.txt", scopes, ws, outside)[0])
+    check("env_attached_chdir_uses_its_actual_working_directory",
+          reach("env -C/tmp rm -f remove.txt")[0])
+    check("env_chdir_missing_read_target_is_not_a_new_ask",
+          reach(f"env --chdir={other} cat absent.txt")[0])
+    ok, offending, refused = reach(f"env --chdir={other} cat chdir-shared.txt")
+    expected = os.path.normpath(os.path.join(other, "chdir-shared.txt")).replace("\\", "/")
+    check("env_chdir_read_does_not_use_an_in_scope_namesake",
+          not ok and refused == expected, repr((ok, offending, refused, expected)))
     check("an_explicit_cwd_grant_admits_the_same_new_write",
           G.command_scope_reach("echo hi > permitted.txt", permitted, ws, outside)[0])
     for name, command, _target in grouped_cases + wrapped_cases:
