@@ -21522,7 +21522,7 @@ mod tests {
         assert!(!err.to_string().contains("unknown ids"), "{err}");
     }
 
-    async fn reaped_poll_subject() -> (TempDir, SharedState, String, String, Value) {
+    pub(crate) async fn reaped_poll_subject() -> (TempDir, SharedState, String, String, Value) {
         let (_dir, shared) = make_shared_state();
         let session = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
             .await
@@ -34930,7 +34930,7 @@ mod disposition_durability_tests {
     /// read gets terminal truth without the private evidence.
     #[tokio::test]
     async fn the_chain_fallback_carries_the_decided_record_fields() {
-        let (_dir, shared, session, id, _opened) = super::reaped_poll_subject().await;
+        let (_dir, shared, session, id, _opened) = super::tests::reaped_poll_subject().await;
         let decided_at = now_secs();
         shared.lock().await.append_chain(
             "gate_escalation_decided",
