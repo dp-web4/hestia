@@ -74,7 +74,7 @@ impl Vault {
     ///
     /// The daemon holds one `Vault` in memory from startup; documents the CLI writes after
     /// that (a delegation minted with `hestia delegate grant`) are invisible to it until a
-    /// restart — and a restart destroys every pending scope request, so "restart to see the
+    /// restart — and before #1233 a restart destroyed every pending scope request, so "restart to see the
     /// delegation" would also destroy the ask it was minted to answer (measured on Legion,
     /// 2026-09-05, #952). A surface that must see the operator's latest durable state reads
     /// it fresh through this instead of the startup snapshot.

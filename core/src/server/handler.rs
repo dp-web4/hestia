@@ -30182,7 +30182,7 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
     };
     let Some(req) = s.scope_requests.get(&request_id) else {
         return Ok(hestia_error_envelope("hestia.scope_request_unknown",
-            "no such scope request (memory-only: it may have expired or the daemon restarted, \
+            "no such scope request (unknown, expired, or outside the replay window; \
              #908 / #1233)", Some(json!({ "request_id": request_id }))));
     };
     if viewer.plugin_id == req.plugin_id || s.same_entity(&viewer.plugin_id, &req.plugin_id) {
@@ -32129,8 +32129,9 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
         })
         .collect();
 
-    // THE OTHER QUEUE A RESTART DROPS. Scope requests (hestia_request_scope) are a separate,
-    // memory-only table from gate escalations, and a daemon restart loses every pending one
+    // THE OTHER QUEUE THE CHAIN RESTORES. Scope requests (hestia_request_scope) are replayed
+    // from lifecycle events into the same pending windows they held before the restart (#1233).
+    // Before that replay existed, a daemon restart lost every pending one
     // (measured on Sprout 2026-09-22). Until now the only all-members view of them was the
     // operator dashboard, so a seat about to restart the daemon for maintenance (SAGE #180,
     // delegation renewal needs the vault writer lease) could not CHECK "nothing pending" — it
