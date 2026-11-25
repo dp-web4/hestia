@@ -1051,6 +1051,10 @@ pub struct Escalation {
     /// reads as "every reading succeeded" — the direction that under-claims this finding.
     #[serde(default)]
     pub invited_reader_unknown: Vec<String>,
+    /// Invited members with a session-attributed record that this exact escalation was presented
+    /// by their completed member CLI wake. Mailbox reads and generic member activity never add to it.
+    #[serde(default)]
+    pub observed_peers: Vec<String>,
     /// The member asking. Recorded as claimed — `plugin_id` is caller-asserted (HST-005), and
     /// this field inherits that weakness rather than laundering it.
     pub plugin_id: String,
@@ -1413,15 +1417,9 @@ impl Escalation {
 
     /// What the invited peers actually did — the half of the bar that survives.
     ///
-    /// Under blocker semantics a missing peer was indistinguishable from a peer that
-    /// looked and declined, because both rendered as `bar_met: false`. Under invitation
-    /// semantics those are different facts about different seats, and only one of them
-    /// says anything about the decision.
-    ///
-    /// Reported rather than enforced, and reported for MORE THAN ONE PEER — dp, on whether
-    /// the invitation should go to several seats: *"i think yes."* One invited seat that
-    /// happens to be asleep is an availability accident; three invited seats that all
-    /// declined to look is a finding.
+    /// A missing factor is `unanswered`, not a decline. Only a session-attributed record bound
+    /// to this exact invitation can move a peer to `observed_no_response`; mailbox and generic
+    /// actor liveness cannot. Explicit factors remain the only concurrence/dissent evidence.
     pub fn peer_participation(&self) -> PeerParticipation {
         let concurred = self
             .factors
@@ -1469,42 +1467,45 @@ impl Escalation {
             .filter(|f| f.channel == Channel::PeerMember)
             .map(|f| f.by.as_str())
             .collect();
-        // Three exclusions, not two. A seat whose reading FAILED is not silent-after-seeing:
-        // nobody knows whether it saw. Counting it in `absent` is the defect this closes —
-        // an unreadable store became affirmative conduct evidence about a peer.
-        //
-        // ALL THREE ARE KEYED ON THE MAILBOX, AND THE MAILBOX IS THE WATCHER (CBP 2026-08-31,
-        // measured). `member_inbox_touch` is written by `touch_inbox` from `drain_member` on
-        // whoever DRAINS the box; the mesh watcher drains into a primer before firing the
-        // member's CLI, so a seat whose agent never runs keeps a touch seconds old and reads
-        // `live`. It is therefore in neither `invited_without_reader` (it has a row, and a
-        // fresh one, so the TTL window does not catch it) nor `invited_reader_unknown` (the
-        // read succeeded), and it falls straight through into `absent` — published as a peer
-        // that saw the ask and declined, which is the ONE distinction this function exists to
-        // make. On the live mesh that day both real peers were in exactly this state: `codex`
-        // (78 s touch, 29,783 reads, newest act 3.4 h old) and `kimi-code` (42 s touch, 21,870
-        // reads, no act in 15.7 h), both out of credits, 148 notices queued against them,
-        // while this seat was live with an act 36 s old.
-        //
-        // The signal that answers the conduct question is `actor_liveness` — the member's own
-        // chain acts, which no watcher can write — and `resolve_invitation` already ranks the
-        // invitation pool by it. Deliberately NOT changed here: whether `absent` should key on
-        // acts rather than the mailbox decides what conduct evidence the daemon publishes
-        // about a peer, which is dp's call. Until it is made, read `absent` as "did not
-        // answer", never as "declined". Driver:
-        // `tools/liveness_is_the_watcher_not_the_member.py`.
         let reader_unknown = self
             .invited_peers
             .iter()
             .filter(|p| self.invited_reader_unknown.contains(p))
             .count();
-        let absent = self
+        let peer_states: Vec<InvitationPeerState> = self
             .invited_peers
             .iter()
-            .filter(|p| !self.invited_without_reader.contains(p))
-            .filter(|p| !self.invited_reader_unknown.contains(p))
-            .filter(|p| !answered.contains(p.as_str()))
+            .map(|peer| {
+                let state = if answered.contains(peer.as_str()) {
+                    if self.factors.iter().any(|f| {
+                        f.channel == Channel::PeerMember && f.by == peer.as_str() && f.dissent
+                    }) {
+                        PeerEvidenceState::Dissented
+                    } else {
+                        PeerEvidenceState::Concurred
+                    }
+                } else if self.observed_peers.contains(peer) {
+                    PeerEvidenceState::ObservedNoResponse
+                } else if self.invited_reader_unknown.contains(peer) {
+                    PeerEvidenceState::ReaderUnknown
+                } else if self.invited_without_reader.contains(peer) {
+                    PeerEvidenceState::Unreachable
+                } else {
+                    PeerEvidenceState::Unanswered
+                };
+                InvitationPeerState { peer: peer.clone(), state }
+            })
+            .collect();
+        let unanswered = peer_states
+            .iter()
+            .filter(|row| matches!(row.state, PeerEvidenceState::Unanswered))
             .count();
+        let observed_no_response = peer_states
+            .iter()
+            .filter(|row| matches!(row.state, PeerEvidenceState::ObservedNoResponse))
+            .count();
+        // Compatibility: `absent` remains the no-factor population, never a decline judgment.
+        let absent = unanswered + observed_no_response;
         let invoked = self
             .factors
             .iter()
@@ -1520,6 +1521,9 @@ impl Escalation {
             // verdict. Post-decision participation is expressly allowed, so this number
             // can fall after a decision — which is the mechanism working, not drift.
             absent,
+            unanswered,
+            observed_no_response,
+            peer_states,
             invited_without_reader: no_reader,
             invited_reader_unknown: reader_unknown,
         }
@@ -1826,6 +1830,23 @@ impl Opened {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerEvidenceState {
+    Unreachable,
+    ReaderUnknown,
+    Unanswered,
+    ObservedNoResponse,
+    Concurred,
+    Dissented,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InvitationPeerState {
+    pub peer: String,
+    pub state: PeerEvidenceState,
+}
+
 #[derive(Default)]
 /// The outcome of an invitation, as a record rather than a gate.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1835,15 +1856,17 @@ pub struct PeerParticipation {
     pub invited: Vec<String>,
     pub concurred: usize,
     pub dissented: usize,
-    /// Invited seats that HAD A MAILBOX READER and have not answered — counted by identity,
-    /// not by subtracting `concurred + dissented`. Derived, not stored; see
-    /// `peer_participation` for why the difference is load-bearing.
-    ///
-    /// Does NOT complete a partition with the fields above it: `concurred`/`dissented` count
-    /// every peer factor, including one from a seat that was never invited, while this counts
-    /// only invited seats. `absent + invited_without_reader <= invited.len()` is the invariant;
-    /// equality holds exactly while no invited seat has answered.
+    /// Compatibility count of invited seats without a factor. It means UNANSWERED, never
+    /// "saw it and declined". `peer_states` carries the distinct evidence for each invitee.
     pub absent: usize,
+    /// Invited seats with no factor and no exact presentation evidence. Generic liveness and
+    /// mailbox activity do not change this state; it is not conduct evidence.
+    pub unanswered: usize,
+    /// Invited seats with exact member-side presentation evidence and no subsequent factor.
+    pub observed_no_response: usize,
+    /// One state per invited member. Explicit factors take precedence over presentation,
+    /// and presentation takes precedence over generic mailbox or actor liveness.
+    pub peer_states: Vec<InvitationPeerState>,
     /// Invited seats no watcher had ever read a mailbox for at invite time. Held out of
     /// `absent` because they cannot have looked, and reported beside it because they were
     /// still asked: a reader must be able to see that the invitation went somewhere nobody
@@ -2118,6 +2141,11 @@ impl EscalationStore {
                 }
             }
             match e.event_type.as_str() {
+                "gate_escalation_presented" => {
+                    if let Some(peer) = s(d, "presented_to") {
+                        self.record_presented(&id, &peer);
+                    }
+                }
                 "gate_escalation_opened" => {
                     let (Some(plugin_id), Some(marker), Some(expires_at)) =
                         (s(d, "plugin_id"), s(d, "marker"), u(d, "expires_at"))
@@ -2227,6 +2255,7 @@ impl EscalationStore {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
+                            observed_peers: Vec::new(),
                             plugin_id,
                             // Restored from the entry when present — the open writer emits
                             // `asker_basis` on every `gate_escalation_opened`. Absent fails
@@ -2536,6 +2565,7 @@ impl EscalationStore {
             payload_stated_but_not_measured: binding
                 .and_then(|b| b.stated_but_not_measured.clone()),
             invited_reader_unknown: Vec::new(),
+            observed_peers: Vec::new(),
             plugin_id: plugin_id.to_string(),
             // Fail closed: every `open` caller is unproven until the handler records
             // otherwise via `record_asker_basis`. An asserted-by-default asker can be
@@ -2743,6 +2773,21 @@ impl EscalationStore {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Record invitation-specific member presentation. Uninvited members and duplicates change
+    /// nothing; a later explicit factor supersedes this state in `peer_participation`.
+    pub fn record_presented(&mut self, id: &str, peer: &str) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) if e.invited_peers.iter().any(|p| p == peer) => {
+                if e.observed_peers.iter().any(|p| p == peer) {
+                    return false;
+                }
+                e.observed_peers.push(peer.to_string());
+                true
+            }
+            _ => false,
         }
     }
 
@@ -5432,6 +5477,107 @@ mod tests {
         assert_eq!(p.concurred, 0);
         assert_eq!(p.dissented, 0);
         assert_eq!(p.absent, 0, "nobody was invited, so nobody is absent — absent is DERIVED");
+    }
+
+    #[test]
+    fn invitation_states_require_exact_presentation_not_generic_liveness() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let invited: Vec<String> = [
+            "watcher-live", "acting-elsewhere", "presented", "concurring", "dissenting",
+            "readerless", "unreadable",
+        ].iter().map(|name| name.to_string()).collect();
+        s.invite(&e.id, invited.clone());
+        let evidence = vec![
+            serde_json::json!({"peer": "watcher-live", "mailbox_reader": true}),
+            serde_json::json!({"peer": "acting-elsewhere", "mailbox_reader": true}),
+            serde_json::json!({"peer": "presented", "mailbox_reader": true}),
+            serde_json::json!({"peer": "concurring", "mailbox_reader": true}),
+            serde_json::json!({"peer": "dissenting", "mailbox_reader": true}),
+            serde_json::json!({"peer": "readerless", "mailbox_reader": false}),
+            serde_json::json!({"peer": "unreadable", "mailbox_reader": null}),
+        ];
+        assert!(s.record_invitee_readers(&e.id, &evidence));
+
+        assert!(s.record_presented(&e.id, "presented"));
+        assert!(!s.record_presented(&e.id, "presented"), "presentation is idempotent");
+        assert!(!s.record_presented(&e.id, "never-invited"), "an invitation id binds the observation");
+        s.corroborate(&e.id, "concurring", "role:constellation:member", None, false, None, T0 + 1)
+            .unwrap();
+        s.corroborate(&e.id, "dissenting", "role:constellation:member", None, true, Some("why"), T0 + 2)
+            .unwrap();
+
+        let p = s.get(&e.id).unwrap().peer_participation();
+        let state = |name: &str| p.peer_states.iter().find(|row| row.peer == name).unwrap().state;
+        assert_eq!(state("watcher-live"), PeerEvidenceState::Unanswered);
+        assert_eq!(state("acting-elsewhere"), PeerEvidenceState::Unanswered);
+        assert_eq!(state("presented"), PeerEvidenceState::ObservedNoResponse);
+        assert_eq!(state("concurring"), PeerEvidenceState::Concurred);
+        assert_eq!(state("dissenting"), PeerEvidenceState::Dissented);
+        assert_eq!(state("readerless"), PeerEvidenceState::Unreachable);
+        assert_eq!(state("unreadable"), PeerEvidenceState::ReaderUnknown);
+        assert_eq!(p.unanswered, 2);
+        assert_eq!(p.observed_no_response, 1);
+        assert_eq!(p.absent, 3, "the compatibility count includes both no-factor states");
+        assert_eq!(p.concurred, 1);
+        assert_eq!(p.dissented, 1);
+    }
+
+    #[test]
+    fn exact_presentation_can_follow_an_initially_unreachable_mailbox() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        s.invite(&e.id, vec!["late-reader".into()]);
+        let evidence = vec![serde_json::json!({"peer": "late-reader", "mailbox_reader": false})];
+        assert!(s.record_invitee_readers(&e.id, &evidence));
+        assert_eq!(s.get(&e.id).unwrap().peer_participation().peer_states[0].state,
+                   PeerEvidenceState::Unreachable);
+        assert!(s.record_presented(&e.id, "late-reader"));
+        let p = s.get(&e.id).unwrap().peer_participation();
+        assert_eq!(p.peer_states[0].state, PeerEvidenceState::ObservedNoResponse);
+        assert_eq!(p.invited_without_reader, 1, "the original delivery measurement is not rewritten");
+    }
+
+    #[test]
+    fn invitation_observation_survives_rehydration_without_state_drift() {
+        let mut live = EscalationStore::default();
+        let e = live
+            .open("claude-code", "r", "Edit", "m.py", Some("Edit -> m.py"), None, None, T0, 3600)
+            .unwrap();
+        live.invite(&e.id, vec!["presented".into(), "unanswered".into()]);
+        let evidence = vec![
+            serde_json::json!({"peer": "presented", "mailbox_reader": true}),
+            serde_json::json!({"peer": "unanswered", "mailbox_reader": true}),
+        ];
+        assert!(live.record_invitee_readers(&e.id, &evidence));
+        assert!(live.record_presented(&e.id, "presented"));
+        let expected = live.get(&e.id).unwrap().peer_participation();
+
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": e.id, "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit", "marker": "m.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+                "act_digest": null, "invited_peers": ["presented", "unanswered"],
+                "invitation_evidence": evidence,
+            }),
+        );
+        let presented = chain_entry(
+            "gate_escalation_presented",
+            serde_json::json!({"escalation_id": e.id, "presented_to": "presented"}),
+        );
+        let mut replayed = EscalationStore::default();
+        replayed.rehydrate(&[opened, presented], T0 + 10);
+        let actual = replayed.get(&e.id).unwrap().peer_participation();
+        assert_eq!(actual.peer_states, expected.peer_states);
+        assert_eq!(actual.unanswered, expected.unanswered);
+        assert_eq!(actual.observed_no_response, expected.observed_no_response);
+        assert_eq!(actual.absent, expected.absent);
     }
 
     /// An UNREADABLE mailbox is not a silent peer (GPT review, 2026-08-20).

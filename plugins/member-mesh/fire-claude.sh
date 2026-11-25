@@ -540,5 +540,10 @@ cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-m
 # watcher's "retained on failure" alarm could never fire for the failure mode it
 # was built for (CBP 2026-07-25: 3 dead fires measured, 2 notices destroyed).
 RC=$?
+# Only a completed member CLI wake mints invitation-specific observation; watcher drains do not.
+if [ "$RC" -eq 0 ]; then
+  printf '%s\n' "$DIGEST" | HESTIA_MESH_PLUGIN="$MEMBER" python3 "$HERE_DIR/hestia-mesh.py" presented >> "$LOG_DIR/claude-$STAMP.log" 2>&1 || \
+    echo "[fire-claude] WARNING: invitation presentation was not recorded; the member remains unanswered, not observed." >> "$LOG_DIR/claude-$STAMP.log"
+fi
 echo "[fire-claude] done rc=$RC (log: $LOG_DIR/claude-$STAMP.log)"
 exit "$RC"

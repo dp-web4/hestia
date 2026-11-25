@@ -1465,6 +1465,30 @@ impl SqliteInboxStore {
         })
     }
 
+    /// Does this exact local `review_request` notice bind `to_plugin` to `escalation_id`?
+    /// Presentation evidence uses the notice as the wake's durable anchor, rather than asserting
+    /// that a bare CLI exit proves an invitation was read.
+    pub fn member_notice_binds_invitation(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        escalation_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let row = conn
+            .query_row(
+                "SELECT kind, pointer_uri FROM member_notices
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL",
+                params![id as i64, to_plugin],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let base = format!("hestia://escalation/{escalation_id}");
+        Ok(matches!(row, Some((kind, pointer))
+            if kind == "review_request" && (pointer == base || pointer.starts_with(&(base + "#")))))
+    }
+
     /// The ASKER of a stored notice (`from_plugin`, bare as written) — the second
     /// half of reply binding (#1115): a disposition answers a notice only when it is
     /// addressed back to this party. `None` when the id is not on record (aged out:
