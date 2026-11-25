@@ -780,6 +780,9 @@ def _client_name(profile: GateProfile) -> str:
 # ── the record: ONE call, every final verdict ────────────────────────────────────────────────
 
 def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
+    command = inv.event.tool_input.get("command")
+    attempted_exact = (attempted is None and isinstance(command, str)
+                       and " ".join(command.split()) == command)
     return mechanism.record_decision(
         None,
         plugin_id=inv.profile.member_id,
@@ -793,6 +796,7 @@ def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
         action_id=d.action_id,
         correlation_key=inv.key,
         deadline=inv.deadline,
+        attempted_exact=attempted_exact,
     )
 
 
