@@ -52,6 +52,12 @@ if node:
     js = (function_source("escalationView") + function_source("livePendingIds")
           + function_source("projectEscalations") + function_source("escapeHtml")
           + "const fx = " + fixture + ";\n" + r"""
+const auditRows = [
+  {event_type: 'gate_escalation_arbiter_refused', chain_position: 20, hash: 'arbiter-refused'},
+  {event_type: 'gate_escalation_payload_drift', chain_position: 21, hash: 'payload-drift'},
+  {event_type: 'gate_escalation_payload_assertion_mismatch', chain_position: 22, hash: 'payload-mismatch'},
+  {event_type: 'gate_escalation_corroborated', chain_position: 23, hash: 'corroborated'},
+].map(e => ({...e, escalation_id: 'a0a0a0a0approved', plugin_id: 'claude-code'}));
 const rows = id => fx.recent.filter(e => e.escalation_id === id);
 const only = (id, type) => rows(id).filter(e => e.event_type === type);
 const view = list => list.map(e => ({hash: e.hash, plugin_id: e.plugin_id, ...e.escalation_view}));
@@ -129,6 +135,9 @@ console.log(JSON.stringify({
     return {asker: slice.filter(e => e.plugin_id === 'claude-code').length,
             ruler: slice.filter(e => e.plugin_id === 'codex').length};
   })(),
+  auditRows,
+  auditOnly: projectEscalations(auditRows, new Set(['a0a0a0a0approved'])),
+  mixed: projectEscalations([...auditRows, ...rows('a0a0a0a0approved')], none),
   untouched: projectEscalations([{chain_position: 30, event_type: 'outcome', plugin_id: 'kimi-code', hash: 'o'}], none),
 }));
 """)
@@ -211,6 +220,11 @@ console.log(JSON.stringify({
               got["expiredNoKind"][0]["detail"].endswith("-> expired"), got["expiredNoKind"])
         check("a hostile marker is escaped on the rendered path",
               "<" not in got["hostileDetail"] and "&lt;img" in got["hostileDetail"], got["hostileDetail"])
+        check("audit-only slices do not invent a disposition", got["auditOnly"] == got["auditRows"])
+        check("audit events keep type, hash and order alongside the folded lifecycle",
+              got["mixed"][:-1] == got["auditRows"]
+              and got["mixed"][-1]["hash"] == "hash-2"
+              and got["mixed"][-1]["escalation_view"]["status"] == "approved", got["mixed"])
         check("non-escalation rows pass through unchanged", got["untouched"] == [{
             "chain_position": 30, "event_type": "outcome", "plugin_id": "kimi-code", "hash": "o",
         }])
