@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: aae31b9d2d0fe1ef9fb3aab0f4aecaf1baa86f481ca5daaeca89b9c7fb9cb722  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: a20a0af34b0627659e56d9753141ddc764da61afba09d0ea0fce87a7df95af09  (published ground truth; manifest: hooks-gt)
 """hestia-mesh — member-mesh CLI for a local hestia member (Kimi's send/receive surface).
 
 Usage:
@@ -7,6 +7,7 @@ Usage:
   hestia-mesh.py drain                                   # consume-once drain (act on results!)
   hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id] [--operation-id ID]
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
+  hestia-mesh.py presented                               # record escalation ids in the completed wake digest (stdin)
   hestia-mesh.py pending                                 # pending escalations, read-only
   hestia-mesh.py sweep                                   # inbox + pending over one session
   hestia-mesh.py kinds [term]                            # KINDS.md, or its sections naming term
@@ -39,7 +40,7 @@ is (seat, endpoint, recipient, kind, pointer_uri, in_reply_to) — a notice aime
 different HESTIA_ENDPOINT is a different act; scheme and host fold by case, the path
 does not.
 """
-import hashlib, json, math, os, sys, time, urllib.error, urllib.parse
+import hashlib, json, math, os, re, sys, time, urllib.error, urllib.parse
 import urllib.request
 
 EP = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
@@ -576,8 +577,20 @@ def send_operation_id_from_argv():
     return None
 
 
+def presented_invitations(text):
+    """(escalation_id, notice_id) pairs rendered into one completed wake, first notice wins."""
+    invitations = {}
+    shown = (line for line in text.splitlines() if not line.lstrip().startswith("!"))
+    for line in shown:
+        notice = re.search(r"\bid=(\d+)\b", line)
+        pointer = re.search(r"hestia://escalation/([0-9a-f]{16})(?![0-9a-f])", line)
+        if notice and pointer:
+            invitations.setdefault(pointer.group(1), int(notice.group(1)))
+    return list(invitations.items())
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered", "pending", "sweep"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered", "presented", "pending", "sweep"):
         print(__doc__); sys.exit(2)
     cmd = sys.argv[1]
     try:
@@ -609,6 +622,10 @@ def main():
 
 
 def act(cmd):
+    invitations = presented_invitations(sys.stdin.read()) if cmd == "presented" else []
+    if cmd == "presented" and not invitations:
+        print(json.dumps({"member": PLUGIN, "observations": []}, indent=1))
+        return
     # The duplicate check runs BEFORE connect(), not inside the send branch below.
     # KINDS.md promises that "a refused send leaves the chain and the recipient's inbox
     # bit-identical"; connecting first spent three POSTs (initialize/initialized/connect)
@@ -681,6 +698,22 @@ def act(cmd):
         if len(sys.argv) > 2:
             args["older_than_secs"] = int(sys.argv[2])
         out = rpc(h, "hestia_member_unanswered", args)
+    elif cmd == "presented":
+        observations, refusals = [], []
+        for escalation_id, notice_id in invitations:
+            result = rpc(h, "hestia_gate_escalation_presented",
+                         {"session_id": s, "escalation_id": escalation_id,
+                          "notice_id": notice_id})
+            if failed(result):
+                if "not invited" in json.dumps(result) or "not pending" in json.dumps(result):
+                    continue
+                refusals.append(result)
+                continue
+            observations.append(result)
+        out = {"member": PLUGIN, "observations": observations}
+        if refusals:
+            out["errors"] = refusals
+            out["_hestia_error"] = refusals[0].get("_hestia_error", {})
     elif cmd == "pending":
         out = rpc(h, "hestia_gate_pending_escalations", {"session_id": s})
     elif cmd == "sweep":
@@ -751,6 +784,10 @@ def confirm(cmd, out):
     a piped stdout is block-buffered and stderr is not. Last is the whole point.
     """
     sys.stdout.flush()
+    if cmd == "presented":
+        print(f"hestia-mesh: presented {len(out.get('observations', []))} invitation(s) as {PLUGIN}",
+              file=sys.stderr)
+        return
     if cmd != "send":
         return
     qid = out.get("queued_id")
