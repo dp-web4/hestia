@@ -975,7 +975,7 @@ mod tests {
             }],
             "count": 1,
             "you": {"plugin_id": "member-b", "role": "role:constellation:member"},
-            "scope": {"window_saturated": false, "caveat": "the whole chain fits"},
+            "scope": {"query": "SQL anti-join over the whole chain", "caveat": "one row per deny_hash"},
         });
         let rendered = appeals_json(&daemon).expect("appeal response serializes");
         let reparsed: Value = serde_json::from_str(&rendered).expect("JSON output reparses");
