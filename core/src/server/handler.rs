@@ -2031,6 +2031,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // constellation-role overlay by STRICTEST verdict. A self-declared role can
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
     // declaring a permissive role can't be used to escape the base floor.
+    let actor_source = if session_identity.is_some() {
+        super::delegation_gate::ActorSource::Session
+    } else {
+        super::delegation_gate::ActorSource::CallerStated
+    };
     let (session_plugin_id, session_role) = session_identity.unwrap_or_else(|| {
         (
             "unknown".to_string(),
@@ -2054,6 +2059,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             tool_name: &action.tool_name,
             category,
             target,
+            actor_source,
         },
         chrono::Utc::now(),
     );
@@ -5191,6 +5197,9 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             tool_name: &tool_name,
             category: crate::policy::classify(&tool_name),
             target: Some(target.as_str()),
+            // This path records the caller-stated plugin_id/role; the session_id it was
+            // handed is never resolved, so the match must not wear the session label.
+            actor_source: super::delegation_gate::ActorSource::CallerStated,
         },
         chrono::Utc::now(),
     )
@@ -11374,6 +11383,50 @@ mod delegation_gate_tests {
             .find(|e| e.event_type == "policy_allow")
             .expect("the permit is witnessed");
         assert_eq!(allow_row.event_data["delegation"]["status"], "revoked", "{allow_row:?}");
+    }
+
+    #[tokio::test]
+    async fn handler_entry_points_label_the_actor_source_on_a_match() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let _ = seed_delegation(&state, "codex", &["act"]).await;
+
+        let action_id = begin_read(&state, &sid, "resolved.md").await;
+        let resolved = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(resolved["delegation"]["status"], "match", "{resolved}");
+        assert_eq!(
+            resolved["delegation"]["coverage_basis"],
+            json!("operator-signed act scope matched to the A1 session identity"),
+            "{resolved}"
+        );
+
+        let witnessed = tool_witness_decision(
+            &state,
+            &json!({
+                "plugin_id": "codex", "decision": "allow", "adjudicator": "test",
+                "tool_name": "Read", "target": "witness.md", "reason": "caller-stated actor",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(witnessed["delegation"]["status"], "match", "{witnessed}");
+        assert_eq!(
+            witnessed["delegation"]["coverage_basis"],
+            json!("operator-signed act scope matched to the caller-stated plugin_id (no session resolved)"),
+            "{witnessed}"
+        );
+
+        let _ = connect(&state, "unknown").await;
+        let _ = seed_delegation(&state, "unknown", &["act"]).await;
+        let missing_sid = Uuid::new_v4().to_string();
+        let action_id = begin_read(&state, &missing_sid, "unresolved.md").await;
+        let unresolved = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(unresolved["delegation"]["status"], "match", "{unresolved}");
+        assert_eq!(
+            unresolved["delegation"]["coverage_basis"],
+            json!("operator-signed act scope matched to the caller-stated plugin_id (no session resolved)"),
+            "{unresolved}"
+        );
     }
 
     #[tokio::test]

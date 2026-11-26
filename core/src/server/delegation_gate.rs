@@ -2,8 +2,11 @@
 //!
 //! This is evidence, not a new permit path. `assess` never changes a verdict. Unrestricted and
 //! role-only delegations do not acquire tool-act authority by implication: an operator must name
-//! `act` explicitly. The acting member remains the session's A1 plugin identity, so the record
-//! says which delegation covers that identity, not a stronger proof of who physically acted.
+//! `act` explicitly. The recorded identity is only as strong as its basis: `query_policy`
+//! resolves the acting member from the in-flight action's live session, while
+//! `witness_decision` records the caller-stated plugin_id/role without resolving a session.
+//! `coverage_basis` says which, so the record names which delegation covers that identity and
+//! never claims a stronger proof of who physically acted.
 
 use std::collections::HashMap;
 
@@ -136,6 +139,17 @@ impl Status {
     }
 }
 
+/// What the identity half of a `match` rests on. `query_policy` resolves the acting member
+/// from the in-flight action's live session; `witness_decision` takes plugin_id/role as
+/// caller-stated strings and never resolves the session it was handed. `Session` currently
+/// means A1 because sessions enroll as `Asserted`; stronger enrollment must carry its basis
+/// into the coverage label rather than inherit that wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorSource {
+    Session,
+    CallerStated,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Act<'a> {
     pub plugin_id: &'a str,
@@ -143,6 +157,7 @@ pub struct Act<'a> {
     pub tool_name: &'a str,
     pub category: &'a str,
     pub target: Option<&'a str>,
+    pub actor_source: ActorSource,
 }
 
 #[derive(Debug, Clone)]
@@ -270,7 +285,14 @@ pub fn assess(snap: &Snapshot, act: &Act, now: DateTime<Utc>) -> Finding {
         finding.delegator_lct = Some(first.delegator_lct_id.to_string());
         finding.matched_via = via(first);
         finding.matched_action = Some(action.clone());
-        finding.coverage_basis = Some("operator-signed act scope matched to the A1 session identity");
+        finding.coverage_basis = Some(match act.actor_source {
+            ActorSource::Session => {
+                "operator-signed act scope matched to the A1 session identity"
+            }
+            ActorSource::CallerStated => {
+                "operator-signed act scope matched to the caller-stated plugin_id (no session resolved)"
+            }
+        });
         finding.coverage_uncertainty = Some(
             "strict lexical absolute-path comparison; filesystem aliases and the physical actor are not verified",
         );
@@ -337,7 +359,14 @@ mod tests {
     }
 
     fn act<'a>(tool: &'a str, category: &'a str, target: Option<&'a str>) -> Act<'a> {
-        Act { plugin_id: "codex", role: "role:worker", tool_name: tool, category, target }
+        Act {
+            plugin_id: "codex",
+            role: "role:worker",
+            tool_name: tool,
+            category,
+            target,
+            actor_source: ActorSource::Session,
+        }
     }
 
     #[test]
@@ -378,6 +407,23 @@ mod tests {
         assert!(j["coverage_uncertainty"].as_str().unwrap().contains("lexical"));
         assert!(j["coverage_uncertainty"].as_str().unwrap().contains("physical actor"));
         assert!(j["detail"].as_str().unwrap().contains("not authorization"));
+    }
+
+    #[test]
+    fn no_session_match_is_labeled_caller_stated_not_session_identity() {
+        let mut f = fx();
+        grant(&mut f, &["act"], None, None);
+        let mut a = act("Bash", "command", Some("ls"));
+        a.actor_source = ActorSource::CallerStated;
+        let r = assess(&f.snap, &a, Utc::now());
+        assert_eq!(r.status, Status::Match);
+        let basis = r.coverage_basis.unwrap();
+        assert!(basis.contains("caller-stated plugin_id"));
+        assert!(basis.contains("no session resolved"));
+        assert!(!basis.contains("A1 session identity"));
+        let j = r.to_json("witness_decision");
+        assert_eq!(j["coverage_basis"].as_str().unwrap(), basis);
+        assert_eq!(j["assessed_by"], "witness_decision");
     }
 
     #[test]
@@ -468,7 +514,7 @@ mod tests {
     #[test]
     fn unkeyed_and_unavailable_do_not_read_as_none() {
         let f = fx();
-        let ghost = Act { plugin_id: "ghost", role: "role:none", tool_name: "Bash", category: "command", target: None };
+        let ghost = Act { plugin_id: "ghost", role: "role:none", tool_name: "Bash", category: "command", target: None, actor_source: ActorSource::Session };
         assert_eq!(assess(&f.snap, &ghost, Utc::now()).status, Status::Unkeyed);
         let mut f = fx();
         f.snap.store = None;
