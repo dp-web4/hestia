@@ -54,6 +54,19 @@ impl RateLimiter {
         }
     }
 
+    /// Observe the count without inserting, recording or pruning anything. A dry run must not
+    /// consume capacity or mutate even the limiter's housekeeping state.
+    pub fn peek(&self, key: &str, max_count: u32, window_ms: u64) -> RateLimitResult {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(window_ms);
+        let guard = self.windows.lock().unwrap();
+        let current = guard
+            .get(key)
+            .map(|timestamps| timestamps.iter().filter(|t| **t > cutoff).count() as u32)
+            .unwrap_or(0);
+        RateLimitResult { allowed: current < max_count, current, limit: max_count }
+    }
+
     /// Check and, when under the limit, record the firing, under ONE lock acquisition.
     ///
     /// Policy evaluation runs concurrently outside the state lock (#1272), so `check` then
@@ -194,6 +207,22 @@ mod tests {
             assert_eq!(admitted, 3);
             assert_eq!(l.count("k"), 3);
         }
+    }
+
+    #[test]
+    fn peek_neither_consumes_nor_prunes() {
+        let l = RateLimiter::new();
+        l.record("k");
+        l.record("k");
+        let before = l.count("k");
+        let seen = l.peek("k", 2, 50);
+        assert_eq!((seen.allowed, seen.current), (false, 2));
+        assert_eq!(l.count("k"), before);
+        std::thread::sleep(Duration::from_millis(60));
+        let expired = l.peek("k", 2, 50);
+        assert_eq!((expired.allowed, expired.current), (true, 0));
+        assert_eq!(l.count("k"), before, "an expired read still does not prune");
+        assert_eq!(l.key_count(), 1);
     }
 
     #[test]

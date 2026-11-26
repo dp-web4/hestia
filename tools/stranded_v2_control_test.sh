@@ -26,6 +26,13 @@
 # Usage: tools/stranded_v2_control_test.sh   (exit 0 = all controls fired)
 
 set -u
+# fixture-git-isolation (hestia #1738): never act on the caller's repository. With
+# GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE exported (as inside a git hook), git honours
+# the variable over cwd, so this fixture's `git config user.*` lands in the CALLER's
+# config. Every repo this script builds is under a tempdir; no inherited GIT_* is wanted.
+for _git_var in $(compgen -e); do
+  case "$_git_var" in GIT_*) unset "$_git_var" ;; esac
+done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V1="$HERE/stranded_by_content.py"
 V2="$HERE/stranded_by_content_v2.py"

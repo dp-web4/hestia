@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1  (published ground truth; manifest: hooks-gt)
 """The outcome witness — ONE implementation for every harness; the shims only say who they are.
 
 WHY THIS EXISTS (findings/per-harness-witness-drift-2026-09-28.md; dp agreed all five
@@ -310,7 +310,7 @@ def extract_target(tool_input: Any) -> Optional[str]:
 def derive_success(event: dict) -> tuple[bool, Optional[str]]:
     """Best-effort success flag across the harnesses' outcome shapes."""
     forced = OUTCOME_EVENTS.get(event.get("hook_event_name"))
-    if forced is False:  # kimi's PostToolUseFailure: the event IS the failure
+    if forced is False:  # PostToolUseFailure: the event IS the failure
         err = event.get("error")
         if isinstance(err, dict):
             err = err.get("message") or json.dumps(err)
