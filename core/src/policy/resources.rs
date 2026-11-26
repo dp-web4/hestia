@@ -888,13 +888,58 @@ pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
     Some(out)
 }
 
+/// At most this many word-suffixes are examined by [`fallback_texts`].
+pub const FALLBACK_MAX_SUFFIXES: usize = 2048;
+/// Each fallback suffix is at most this many characters, the separating spaces included.
+pub const FALLBACK_SUFFIX_CHARS: usize = 256;
+
+/// Why [`fallback_texts`] could not examine the whole line. Not "no consumer": the part past the
+/// limit was never looked at (NOVA at 9c1553d87), so a caller must not read silence there as
+/// absence. See [`Assessment::incomplete`] for what each mode does with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadingLimit {
+    /// More than [`FALLBACK_MAX_SUFFIXES`] words: the later ones never start a suffix.
+    SuffixCount,
+    /// A word (as its basename) longer than [`FALLBACK_SUFFIX_CHARS`]: its own suffix is cut
+    /// inside it, so its tail is seen by no suffix.
+    WordLength,
+}
+
+impl ReadingLimit {
+    pub fn describe(&self) -> String {
+        match self {
+            ReadingLimit::SuffixCount => {
+                format!("it has more than {FALLBACK_MAX_SUFFIXES} words")
+            }
+            ReadingLimit::WordLength => {
+                format!("a word in it is longer than {FALLBACK_SUFFIX_CHARS} characters")
+            }
+        }
+    }
+}
+
+/// What [`fallback_texts`] examined, and whether that was the whole line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fallback {
+    pub texts: Vec<String>,
+    /// `Some` when a limit was reached and part of the line was not examined.
+    pub limit: Option<ReadingLimit>,
+}
+
 /// For a line [`invocations`] could not read: every word-suffix of the line, quotes and shell
-/// punctuation flattened to spaces and escapes removed, each cut to 256 characters. A consumer
-/// that matches any of them counts, NOT routed. This over-matches on purpose: it is used only
-/// where exact reading failed, so its false positives land where lines are rare (codex on
-/// #1551), and it finds `cargo build` four substitutions deep, inside `python3 -c "…"`, or
-/// behind an unterminated `$(`. At most 2048 suffixes are produced.
-pub fn fallback_texts(cmd: &str) -> Vec<String> {
+/// punctuation flattened to spaces and escapes removed. A consumer that matches any of them
+/// counts, NOT routed. This over-matches on purpose: it is used only where exact reading failed,
+/// so its false positives land where lines are rare (codex on #1551), and it finds `cargo build`
+/// four substitutions deep, inside `python3 -c "…"`, or behind an unterminated `$(`.
+///
+/// Bounded work (NOVA at 9c1553d87: words were copied whole and the length was checked before
+/// the append): each suffix is built to at most [`FALLBACK_SUFFIX_CHARS`] characters, words cut
+/// where the room runs out, and at most [`FALLBACK_MAX_SUFFIXES`] suffixes are built. Past the
+/// flattening pass (linear in the line), the work is at most their product. A cut at the end of
+/// a suffix loses nothing, since every word starts a suffix of its own; what IS lost is reported
+/// in [`Fallback::limit`]: words past the suffix limit, or a word too long for its own suffix.
+pub fn fallback_texts(cmd: &str) -> Fallback {
     let flat: String = unescape(cmd)
         .chars()
         .map(|c| {
@@ -905,20 +950,41 @@ pub fn fallback_texts(cmd: &str) -> Vec<String> {
             }
         })
         .collect();
-    let words: Vec<&str> = flat.split_whitespace().collect();
-    (0..words.len().min(2048))
+    let mut words: Vec<&str> = flat
+        .split_whitespace()
+        .take(FALLBACK_MAX_SUFFIXES + 1)
+        .collect();
+    let mut limit = None;
+    if words.len() > FALLBACK_MAX_SUFFIXES {
+        words.truncate(FALLBACK_MAX_SUFFIXES);
+        limit = Some(ReadingLimit::SuffixCount);
+    }
+    let texts = (0..words.len())
         .map(|i| {
-            let mut s = basename(words[i]);
+            let head = basename(words[i]);
+            let mut s = String::new();
+            let mut room = FALLBACK_SUFFIX_CHARS;
+            if head.chars().nth(room).is_some() {
+                limit.get_or_insert(ReadingLimit::WordLength);
+            }
+            s.extend(head.chars().take(room));
+            room -= s.chars().count();
+            // Each pass spends at least one character of `room` (a space), so at most
+            // FALLBACK_SUFFIX_CHARS words are visited per suffix.
             for w in &words[i + 1..] {
-                if s.len() >= 256 {
+                if room == 0 {
                     break;
                 }
                 s.push(' ');
-                s.push_str(w);
+                room -= 1;
+                let before = s.len();
+                s.extend(w.chars().take(room));
+                room -= s[before..].chars().count();
             }
             s
         })
-        .collect()
+        .collect();
+    Fallback { texts, limit }
 }
 
 /// Reads probes. The daemon's implementation samples the live machine with a deadline; tests
@@ -990,6 +1056,12 @@ pub struct Assessment {
     pub alternatives: Vec<String>,
     pub runner_usage: Option<String>,
     pub remedy: Option<String>,
+    /// The command line was only partly examined for consumers ([`fallback_texts`] reached a
+    /// limit), so "not a consumer" could not be established. Fails closed like the rest of the
+    /// fallback (`PolicyEngine::matching_resources`: an unreadable line that consumes counts as
+    /// NOT routed): it is a refusal reason, so observe mode records an incomplete reading and a
+    /// would-refuse, and enforce mode denies.
+    pub incomplete: Option<ReadingLimit>,
 }
 
 impl Assessment {
@@ -1016,6 +1088,12 @@ impl Assessment {
             if let Some(u) = &self.runner_usage {
                 doors.push(format!("run it through the runner: {u}"));
             }
+        }
+        if self.incomplete.is_some() {
+            doors.push(format!(
+                "a line the gate can read whole (at most {FALLBACK_MAX_SUFFIXES} words, none \
+                 over {FALLBACK_SUFFIX_CHARS} characters, or plain commands it parses exactly)"
+            ));
         }
         doors.extend(self.alternatives.iter().cloned());
         if !doors.is_empty() {
@@ -1078,6 +1156,10 @@ impl Assessment {
             "reference": {
                 "readings": self.floors,
                 "routedThroughRunner": self.routed,
+                "commandReading": match self.incomplete {
+                    None => json!("complete"),
+                    Some(l) => json!({ "incomplete": l }),
+                },
             },
             "resource": {
                 "required": { "atp_milli": self.required_milli_atp },
@@ -1121,11 +1203,30 @@ fn fmt_reading(probe: &Probe, v: u64) -> String {
 
 /// Assess one act against one resource with the readings `sampler` gives.
 pub fn assess(resource: &GatedResource, routed: Option<bool>, sampler: &dyn Sampler) -> Assessment {
+    assess_reading(resource, routed, None, sampler)
+}
+
+/// [`assess`], for a command line whose reading may have stopped at a limit
+/// (`PolicyEngine::matching_resources`' third field).
+pub fn assess_reading(
+    resource: &GatedResource,
+    routed: Option<bool>,
+    incomplete: Option<ReadingLimit>,
+    sampler: &dyn Sampler,
+) -> Assessment {
     let mut reasons = Vec::new();
     if routed == Some(false) {
         reasons.push(format!(
             "this act consumes `{}` but does not go through its runner",
             resource.id
+        ));
+    }
+    if let Some(l) = incomplete {
+        reasons.push(format!(
+            "the command line could not be fully examined for consumers of `{}` ({}), and a \
+             line that was not examined fails closed",
+            resource.id,
+            l.describe()
         ));
     }
     let mut floors = Vec::with_capacity(resource.floors.len());
@@ -1227,6 +1328,7 @@ pub fn assess(resource: &GatedResource, routed: Option<bool>, sampler: &dyn Samp
         alternatives: resource.alternatives.clone(),
         runner_usage: resource.runner.as_ref().map(|r| r.usage.clone()),
         remedy: resource.remedy.clone(),
+        incomplete,
     }
 }
 
@@ -1415,7 +1517,172 @@ mod tests {
         engine
             .matching_resources(&bash(cmd))
             .first()
-            .map(|(_, routed)| *routed)
+            .map(|(_, routed, _)| *routed)
+    }
+
+    /// What the engine returns for one command: (routed, reading limit) per matched resource.
+    fn matched(r: &GatedResource, cmd: &str) -> Vec<(Option<bool>, Option<ReadingLimit>)> {
+        let mut cfg = crate::policy::get_preset("safety").unwrap().config;
+        cfg.resources = vec![r.clone()];
+        let engine = crate::policy::PolicyEngine::new(cfg);
+        engine
+            .matching_resources(&bash(cmd))
+            .into_iter()
+            .map(|(_, routed, limit)| (routed, limit))
+            .collect()
+    }
+
+    /// A benign line the exact reader refuses (inline interpreter code), `n` words in all.
+    fn unreadable_words(n: usize) -> String {
+        assert!(n >= 3);
+        format!("python3 -c x {}", vec!["w"; n - 3].join(" "))
+    }
+
+    // NOVA at 9c1553d87: the 256-character bound was checked BEFORE each append and the first
+    // word was copied whole, so a suffix's size (and the work to build it) was bounded by the
+    // longest word, not by the constant. Benign inputs only.
+    #[test]
+    fn fallback_suffixes_are_bounded_by_the_constant_not_by_the_words() {
+        let long = "a".repeat(10_000);
+        for line in [
+            format!("python3 -c x {long}"),
+            format!("python3 -c {long} x"),
+            format!("python3 -c x {}", vec!["b".repeat(200); 3000].join(" ")),
+        ] {
+            assert!(invocations(&line).is_none(), "the fallback path");
+            let fb = fallback_texts(&line);
+            assert!(fb.texts.len() <= FALLBACK_MAX_SUFFIXES);
+            for t in &fb.texts {
+                assert!(t.chars().count() <= FALLBACK_SUFFIX_CHARS, "{}", t.len());
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_suffix_count_boundary_is_reported_not_silent() {
+        let under = fallback_texts(&unreadable_words(FALLBACK_MAX_SUFFIXES));
+        assert_eq!(under.texts.len(), FALLBACK_MAX_SUFFIXES);
+        assert_eq!(
+            under.limit, None,
+            "exactly at the limit: every word starts a suffix"
+        );
+        let over = fallback_texts(&unreadable_words(FALLBACK_MAX_SUFFIXES + 1));
+        assert_eq!(over.texts.len(), FALLBACK_MAX_SUFFIXES);
+        assert_eq!(over.limit, Some(ReadingLimit::SuffixCount));
+    }
+
+    #[test]
+    fn fallback_word_length_boundary_is_reported_not_silent() {
+        let at = fallback_texts(&format!("python3 -c {}", "a".repeat(FALLBACK_SUFFIX_CHARS)));
+        assert_eq!(
+            at.limit, None,
+            "a word that fills its own suffix is seen whole"
+        );
+        assert_eq!(at.texts[2].chars().count(), FALLBACK_SUFFIX_CHARS);
+        assert_eq!(
+            at.texts[0].chars().count(),
+            FALLBACK_SUFFIX_CHARS,
+            "cut at the end: no loss"
+        );
+        let over = fallback_texts(&format!(
+            "python3 -c {}",
+            "a".repeat(FALLBACK_SUFFIX_CHARS + 1)
+        ));
+        assert_eq!(over.limit, Some(ReadingLimit::WordLength));
+    }
+
+    #[test]
+    fn an_unexamined_remainder_is_not_no_consumer() {
+        let r = cargo_resource(ResourceMode::Enforce);
+        // Just under: nothing consumes, and the whole line was examined.
+        assert!(matched(&r, &unreadable_words(FALLBACK_MAX_SUFFIXES)).is_empty());
+        // Just over, nothing consuming anywhere: still returned, with the limit, unrouted unknown.
+        assert_eq!(
+            matched(&r, &unreadable_words(FALLBACK_MAX_SUFFIXES + 1)),
+            vec![(None, Some(ReadingLimit::SuffixCount))]
+        );
+        // A consumer past the limit: before the fix this was `[]`, "no consumer".
+        let past = format!(
+            "{} cargo build",
+            unreadable_words(FALLBACK_MAX_SUFFIXES + 200)
+        );
+        assert_eq!(
+            matched(&r, &past),
+            vec![(None, Some(ReadingLimit::SuffixCount))]
+        );
+        // A consumer in the examined part keeps its not-routed verdict and carries the limit.
+        let early = format!(
+            "python3 -c x cargo build {}",
+            "w ".repeat(FALLBACK_MAX_SUFFIXES)
+        );
+        assert_eq!(
+            matched(&r, &early),
+            vec![(Some(false), Some(ReadingLimit::SuffixCount))]
+        );
+        // The word-length limit reaches the engine the same way.
+        let long = format!("python3 -c {}", "a".repeat(FALLBACK_SUFFIX_CHARS + 1));
+        assert_eq!(
+            matched(&r, &long),
+            vec![(None, Some(ReadingLimit::WordLength))]
+        );
+        let fits = format!("python3 -c {}", "a".repeat(FALLBACK_SUFFIX_CHARS));
+        assert!(matched(&r, &fits).is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_reading_denies_in_enforce_and_is_recorded_in_observe() {
+        let over = unreadable_words(FALLBACK_MAX_SUFFIXES + 1);
+        let healthy = readings(Some(200_000), Some(16_000));
+        for mode in [ResourceMode::Enforce, ResourceMode::Observe] {
+            let r = cargo_resource(mode);
+            let m = matched(&r, &over);
+            let (routed, limit) = m[0];
+            let a = assess_reading(&r, routed, limit, &healthy);
+            assert_eq!(a.incomplete, Some(ReadingLimit::SuffixCount));
+            assert!(a.refuses(), "{mode:?}: a would-refuse, floors healthy");
+            assert!(a.negotiation().contains("could not be fully examined"));
+            assert!(a.negotiation().contains("a line the gate can read whole"));
+            let v = a.to_r6(&R6Context {
+                law_hash: "h",
+                actor: "m",
+                role_lct: "role",
+                tool_name: "Bash",
+                target: None,
+                action_id: "a1",
+            });
+            assert_eq!(
+                v["reference"]["commandReading"]["incomplete"],
+                "suffix_count"
+            );
+            assert_eq!(v["resource"]["affordable"], false);
+            match mode {
+                ResourceMode::Enforce => {
+                    let d = a.as_evaluation().expect("enforce fails closed");
+                    assert_eq!(d.decision, PolicyDecision::Deny);
+                    assert!(d.enforced);
+                }
+                ResourceMode::Observe => {
+                    assert!(
+                        a.as_evaluation().is_none(),
+                        "observe records, never refuses"
+                    );
+                }
+            }
+        }
+        // Just under the limit, same healthy floors: complete, affordable, nothing added.
+        let r = cargo_resource(ResourceMode::Enforce);
+        assert!(matched(&r, &unreadable_words(FALLBACK_MAX_SUFFIXES)).is_empty());
+        let a = assess(&r, Some(true), &healthy);
+        assert!(!a.refuses());
+        let v = a.to_r6(&R6Context {
+            law_hash: "h",
+            actor: "m",
+            role_lct: "role",
+            tool_name: "Bash",
+            target: None,
+            action_id: "a1",
+        });
+        assert_eq!(v["reference"]["commandReading"], "complete");
     }
 
     #[test]

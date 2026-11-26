@@ -1931,18 +1931,24 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // keeps its attribution, and nothing here can turn a deny into an allow (kimi-code's review
     // of #1548, points 1-2). Society layer only: the machine's disk is the same whatever a
     // member's role or grant.
-    let gated: Vec<(crate::policy::GatedResource, Option<bool>)> = published
+    // The third field: the command line was only partly examined (#1551, NOVA at 9c1553d87);
+    // `assess_reading` makes that a refusal reason, recorded in observe, denied in enforce.
+    let gated: Vec<(
+        crate::policy::GatedResource,
+        Option<bool>,
+        Option<crate::policy::resources::ReadingLimit>,
+    )> = published
         .society
         .matching_resources(&pa)
         .into_iter()
-        .map(|(r, routed)| (r.clone(), routed))
+        .map(|(r, routed, limit)| (r.clone(), routed, limit))
         .collect();
     let mut answered_probes: Vec<crate::policy::resources::Probe> = Vec::new();
     let assessments: Vec<crate::policy::resources::Assessment> = if gated.is_empty() {
         Vec::new()
     } else {
         let mut probes: Vec<crate::policy::resources::Probe> = Vec::new();
-        for (r, _) in &gated {
+        for (r, _, _) in &gated {
             for p in r.probes() {
                 if !probes.contains(&p) {
                     probes.push(p);
@@ -1961,7 +1967,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             .collect();
         gated
             .iter()
-            .map(|(r, routed)| crate::policy::resources::assess(r, *routed, &readings))
+            .map(|(r, routed, limit)| {
+                crate::policy::resources::assess_reading(r, *routed, *limit, &readings)
+            })
             .collect()
     };
     for a in &assessments {

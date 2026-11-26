@@ -125,7 +125,10 @@ impl PolicyEngine {
     /// runner elsewhere in the line does not route a consumer (codex/kimi-code/NOVA on #1551).
     /// A line that cannot be read exactly is matched by [`super::resources::fallback_texts`]
     /// (every word-suffix, over-matching on purpose) and, if it consumes, counts as NOT routed:
-    /// the relation could not be established, so it fails closed.
+    /// the relation could not be established, so it fails closed. If the fallback stopped at a
+    /// limit (the third field, NOVA at 9c1553d87), every declared resource is returned with it,
+    /// whether or not the examined part consumed: silence past the limit is not "no consumer",
+    /// and [`super::resources::assess_reading`] turns it into a refusal reason.
     ///
     /// What no text check can see is out of scope and documented: a script file, a Makefile, a
     /// shell function or alias defined elsewhere. The runner is where every spelling that does
@@ -137,7 +140,11 @@ impl PolicyEngine {
     pub fn matching_resources(
         &self,
         action: &PolicyAction<'_>,
-    ) -> Vec<(&super::resources::GatedResource, Option<bool>)> {
+    ) -> Vec<(
+        &super::resources::GatedResource,
+        Option<bool>,
+        Option<super::resources::ReadingLimit>,
+    )> {
         let consumes = |r: &super::resources::GatedResource, a: &PolicyAction<'_>| {
             r.consumers.iter().any(|m| {
                 let mut unused = false;
@@ -175,13 +182,17 @@ impl PolicyEngine {
                 // Not a command: match the act as a whole. Runners are a command notion.
                 None => {
                     if consumes(r, action) {
-                        out.push((r, None));
+                        out.push((r, None, None));
                     }
                 }
-                // A command line that could not be read exactly: over-match, fail closed.
-                Some(Err(texts)) => {
-                    if consumes(r, action) || texts.iter().any(|t| consumes_text(r, t)) {
-                        out.push((r, r.runner.as_ref().map(|_| false)));
+                // A command line that could not be read exactly: over-match, fail closed. Where
+                // the fallback stopped at a limit, the unexamined rest may consume: returned
+                // with the limit even when nothing examined matched, never as "no consumer".
+                Some(Err(fb)) => {
+                    if consumes(r, action) || fb.texts.iter().any(|t| consumes_text(r, t)) {
+                        out.push((r, r.runner.as_ref().map(|_| false), fb.limit));
+                    } else if fb.limit.is_some() {
+                        out.push((r, None, fb.limit));
                     }
                 }
                 Some(Ok(invs)) => {
@@ -194,7 +205,7 @@ impl PolicyEngine {
                         .runner
                         .as_ref()
                         .map(|_| consuming.iter().all(|inv| r.is_runner(&inv.head)));
-                    out.push((r, routed));
+                    out.push((r, routed, None));
                 }
             }
         }
