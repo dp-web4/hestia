@@ -104,6 +104,80 @@ impl Observation {
     }
 }
 
+pub const ENGINE_PLUGIN_ID: &str = "_shared";
+
+/// Add the installed decision engine to the same verification set as the shims that import it.
+/// A discovered shim with no readable engine record has unknown coverage, never a green verdict.
+pub fn with_deployed_engine(
+    discovered: Result<Vec<(String, String)>, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE").map(PathBuf::from);
+    with_deployed_engine_at(discovered, path.as_deref())
+}
+
+fn with_deployed_engine_at(
+    discovered: Result<Vec<(String, String)>, String>,
+    current_build: Option<&Path>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut discovered = discovered?;
+    if discovered.is_empty() {
+        return Ok(discovered);
+    }
+    let path = current_build
+        .ok_or_else(|| "shared engine deployment record is not configured".to_string())?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("shared engine deployment record is unreadable: {e}"))?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("shared engine deployment record is unparseable: {e}"))?;
+    // The installer makes `shared` a symlink into `shared.builds/<digest>` and records the
+    // stable `shared/<file>` path. Bound the realpath by the home's own entries, never by where
+    // the link points, so a repointed link cannot carry the bound with it.
+    let home = std::fs::canonicalize(path.parent().unwrap_or_else(|| Path::new("")))
+        .map_err(|e| format!("shared engine root is unreadable: {e}"))?;
+    let shared_roots = [home.join("shared"), home.join("shared.builds")];
+    let engine = document
+        .get("shared_engine")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| "shared engine deployment record names no engine files".to_string())?;
+    for row in engine {
+        row.get("file")
+            .and_then(Value::as_str)
+            .filter(|file| !file.is_empty())
+            .ok_or_else(|| "shared engine deployment record has a file with no name".to_string())?;
+        row.get("sha256")
+            .and_then(Value::as_str)
+            .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| "shared engine deployment record has an invalid sha256".to_string())?;
+        let raw_path = row
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "shared engine deployment record has a file with no path".to_string())?;
+        if !raw_path.starts_with('/') {
+            return Err(format!("shared engine path is not absolute: {raw_path}"));
+        }
+        let real = std::fs::canonicalize(raw_path)
+            .map_err(|e| format!("shared engine path is unreadable: {raw_path}: {e}"))?;
+        if !shared_roots.iter().any(|root| real.starts_with(root)) {
+            return Err(format!("shared engine path escapes the shared root: {raw_path}"));
+        }
+        if !real.is_file() {
+            return Err(format!("shared engine path is not a regular file: {raw_path}"));
+        }
+        // The realpath only dedupes aliases; the row is keyed on the recorded stable path, so a
+        // redeploy or rollback reads as `modified` against what was ratified there.
+        if discovered.iter().any(|(_, existing)| {
+            existing == raw_path
+                || std::fs::canonicalize(existing).map(|other| other == real).unwrap_or(false)
+        }) {
+            continue;
+        }
+        discovered.push((ENGINE_PLUGIN_ID.into(), raw_path.to_string()));
+    }
+    Ok(discovered)
+}
+
 /// One pass: verdicts from `vault::gate_integrity::verify` over the discovered gate set, or the
 /// reason the set could not be established.
 ///
@@ -550,8 +624,8 @@ mod tests {
     use super::*;
     use crate::vault::gate_integrity::GateExpectation;
 
-    fn gate(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
-        let p = dir.path().join(name);
+    fn gate(dir: impl AsRef<Path>, name: &str, body: &str) -> String {
+        let p = dir.as_ref().join(name);
         std::fs::write(&p, body).unwrap();
         p.to_string_lossy().into_owned()
     }
@@ -572,6 +646,185 @@ mod tests {
         let files: serde_json::Map<String, Value> =
             rows.iter().map(|(path, sha)| (path.to_string(), json!(sha))).collect();
         json!({"build_id": "build-test", "files": files})
+    }
+
+    #[test]
+    fn shared_engine_mutation_flips_production_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "reviewed shim");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let engine = gate(&shared, "engine.py", "reviewed engine");
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [{"file": "engine.py", "path": engine.clone(), "sha256": "0".repeat(64)}]
+        }).to_string()).unwrap();
+        let discovered = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest));
+        assert_eq!(discovered.as_ref().unwrap().len(), 2);
+        assert_eq!(discovered.as_ref().unwrap()[1].0, ENGINE_PLUGIN_ID);
+
+        let mut expectations = GateExpectations::new();
+        ratify(&mut expectations, &shim);
+        ratify(&mut expectations, &engine);
+        let paths = |d: Result<Vec<(String, String)>, String>| {
+            d.map(|rows| rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>())
+        };
+        let seen = observe(&expectations, paths(discovered.clone()));
+        assert!(seen.iter().all(|row| row.status == "verified"), "{seen:?}");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "VERIFIED");
+
+        std::fs::write(&engine, "tampered engine").unwrap();
+        let seen = observe(&expectations, paths(discovered));
+        let engine_row = seen.iter().find(|row| row.key == engine).unwrap();
+        assert_eq!(engine_row.status, "modified");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "MODIFIED");
+    }
+
+    #[test]
+    fn a_missing_engine_record_is_unknown_not_verified() {
+        let discovered = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), "/g/shim.py".into())]), None);
+        let seen = observe(&GateExpectations::new(), discovered.map(|rows| {
+            rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>()
+        }));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].key, COVERAGE_KEY);
+        assert_eq!(seen[0].status, "unknown");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "UNKNOWN");
+    }
+
+    #[test]
+    fn an_empty_engine_discovery_is_coverage_not_a_manifest_free_pass() {
+        let discovered = with_deployed_engine_at(Ok(vec![]), None);
+        assert!(discovered.as_ref().unwrap().is_empty());
+        let seen = observe(&GateExpectations::new(), discovered.map(|rows| {
+            rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>()
+        }));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].key, COVERAGE_KEY);
+        assert_eq!(seen[0].status, "unknown");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "UNKNOWN");
+    }
+
+    #[test]
+    fn shared_engine_paths_dedupe_realpaths_and_reject_external_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "shim");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let engine = gate(&shared, "engine.py", "engine");
+        let alias = shared.join("alias.py");
+        std::os::unix::fs::symlink(&engine, &alias).unwrap();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [
+                {"file": "alias.py", "path": alias, "sha256": "0".repeat(64)},
+                {"file": "engine.py", "path": engine.clone(), "sha256": "0".repeat(64)},
+            ]
+        }).to_string()).unwrap();
+        let discovered = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest)).unwrap();
+        // One row per real file, keyed on the first path the record states for it.
+        assert_eq!(discovered, vec![
+            ("claude-code".into(), shim.clone()),
+            (ENGINE_PLUGIN_ID.into(), alias.to_string_lossy().into_owned()),
+        ]);
+
+        let outside = gate(&dir, "outside.py", "outside");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [{"file": "outside.py", "path": outside, "sha256": "0".repeat(64)}]
+        }).to_string()).unwrap();
+        let err = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim)]), Some(&manifest)).unwrap_err();
+        assert!(err.contains("escapes the shared root"), "{err}");
+    }
+
+    /// The installer's real layout: `shared` is a symlink to `shared.builds/<digest>` and the
+    /// manifest records `shared/<file>`. A redeploy or a rollback repoints the link, so the row
+    /// must stay keyed on the stable path or the ratified build reads green forever.
+    #[test]
+    fn a_repointed_shared_link_reads_modified_on_the_stable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "shim");
+        let builds = dir.path().join("shared.builds");
+        for (build, body) in [("a", "engine a"), ("b", "engine b")] {
+            std::fs::create_dir_all(builds.join(build)).unwrap();
+            gate(builds.join(build), "engine.py", body);
+        }
+        let link = dir.path().join("shared");
+        let repoint = |target: &Path| {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        };
+        repoint(&builds.join("a"));
+        let stable = link.join("engine.py").to_string_lossy().into_owned();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [{"file": "engine.py", "path": stable.clone(), "sha256": "0".repeat(64)}]
+        }).to_string()).unwrap();
+        let pass = |e: &GateExpectations| {
+            let d = with_deployed_engine_at(Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest));
+            observe(e, d.map(|rows| rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>()))
+        };
+        let engine_key = || {
+            with_deployed_engine_at(Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest))
+                .unwrap()[1].1.clone()
+        };
+
+        let mut expectations = GateExpectations::new();
+        ratify(&mut expectations, &shim);
+        let key = engine_key();
+        ratify(&mut expectations, &key);
+        assert_eq!(status_document(&pass(&expectations), &HashMap::new(), 0, 0)["status"], "VERIFIED");
+
+        // Redeploy: the same row reads modified, not a fresh unratified row beside a green one.
+        repoint(&builds.join("b"));
+        let seen = pass(&expectations);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let row = seen.iter().find(|row| row.key == stable).expect("engine row on the stable path");
+        assert_eq!(row.status, "modified", "{seen:?}");
+
+        // Ratify build b, then roll back to a: the rollback must not read green.
+        let key = engine_key();
+        ratify(&mut expectations, &key);
+        assert_eq!(status_document(&pass(&expectations), &HashMap::new(), 0, 0)["status"], "VERIFIED");
+        repoint(&builds.join("a"));
+        let seen = pass(&expectations);
+        assert_ne!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "VERIFIED", "{seen:?}");
+        assert_eq!(seen.iter().find(|row| row.key == stable).unwrap().status, "modified");
+
+        // A link repointed outside the installer's build store is not under the shared root.
+        let evil = dir.path().join("evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        gate(&evil, "engine.py", "engine a");
+        repoint(&evil);
+        let err = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest)).unwrap_err();
+        assert!(err.contains("escapes the shared root"), "{err}");
+    }
+
+    #[test]
+    fn shared_engine_manifest_rejects_bad_paths_and_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "shim");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let engine = gate(&shared, "engine.py", "engine");
+        let manifest = dir.path().join("current-build.json");
+        let missing = shared.join("missing.py").to_string_lossy().into_owned();
+        for (path, digest, expected) in [
+            ("relative/engine.py", "0".repeat(64), "not absolute".to_string()),
+            (engine.as_str(), "short".to_string(), "invalid sha256".to_string()),
+            (missing.as_str(), "0".repeat(64), "unreadable".to_string()),
+        ] {
+            std::fs::write(&manifest, serde_json::json!({
+                "shared_engine": [{"file": "engine.py", "path": path, "sha256": digest}]
+            }).to_string()).unwrap();
+            let err = with_deployed_engine_at(
+                Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest)).unwrap_err();
+            assert!(err.contains(&expected), "{expected}: {err}");
+        }
     }
 
     /// Apply transitions the way `check` does when every witness lands.

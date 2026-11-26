@@ -728,7 +728,7 @@ _SUBSHELL_CMDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "busybox
 
 
 class _OpaqueWriter(Exception):
-    """A patch-applying command whose patch content cannot be read — write set unknowable."""
+    """A write whose destructive target set cannot be enumerated (patch content or hard reset)."""
     def __init__(self, source: str = "stdin"):
         self.source = source
 
@@ -1544,6 +1544,15 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
                 # `not pfiles` case above, and the same reason.
                 raise _OpaqueWriter()
             return out
+        if sub == "reset":
+            # #798: a hard reset can erase every uncommitted approved write in a shared
+            # worktree without naming any targets. Git accepts unambiguous long-option
+            # abbreviations, but only before the `--` that starts pathspec operands.
+            options_end = rest.index("--") if "--" in rest else len(rest)
+            for arg in rest[:options_end]:
+                if arg.startswith("--") and len(arg) > 2 and "hard".startswith(arg[2:]):
+                    raise _OpaqueWriter("git reset --hard")
+            return []
         if sub == "checkout":
             # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
             # switch is not a targeted closure write.

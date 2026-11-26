@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """`recipient_liveness: live` certifies the WATCHER, not the member — measured, two-sided.
 
-THE CLAIM. `peer_participation()` (gate_escalation.rs) exists to keep "a seat that saw the
-ask and declined" apart from "a seat that never saw it". It does that with three
-exclusions, all of them keyed on the MAILBOX: `invited_without_reader` (no
-`member_inbox_touch` row, or one older than the escalation's TTL) and
-`invited_reader_unknown` (the read itself failed). Everything else falls through into
-`absent`, which is published as conduct evidence about a peer.
+THE ORIGINAL DEFECT (pre-#757). `peer_participation()` tried to keep "a seat that saw the
+ask and declined" apart from "a seat that never saw it" with mailbox exclusions only:
+`invited_without_reader` (no `member_inbox_touch` row, or one older than the escalation's
+TTL) and `invited_reader_unknown` (the read itself failed). Everything else fell through
+into `absent`, which could be misread as conduct evidence. Current code keeps `absent` as
+a compatibility no-factor count and exposes `unanswered`, `observed_no_response`, and
+per-peer states instead; only an exact member-side presentation record changes the latter.
 
 `member_inbox_touch` is written by `touch_inbox`, called from `drain_member` and
 `peek_member` (storage/inbox.rs), keyed on `to_plugin` — i.e. on WHOEVER DRAINS THE
@@ -40,8 +41,9 @@ and the run is only interesting if some seats diverge and others do not.
 READING THE OUTPUT. `MAILBOX` is the daemon's own `recipient_liveness` verbatim. `ACTS`
 is the age of the newest chain act attributable to that plugin inside the walked window.
 `DIVERGENT` marks the class this driver exists to find: mailbox says `live`, acts say the
-member has not moved inside the escalation TTL. Those are the seats that `absent` would
-score as having declined.
+member has not moved inside the escalation TTL. Without an exact presentation record those
+seats remain `unanswered`, never observed; before #757 their `absent` count could be
+misread as a decline.
 
 CAVEATS, stated because they bound the numbers rather than decorate them:
   * The chain read is a HOP BUDGET, not a time window. Its left edge drifts as the chain

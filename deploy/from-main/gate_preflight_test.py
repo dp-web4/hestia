@@ -472,7 +472,163 @@ def test_the_preflight_refuses_exactly_what_the_installer_refuses():
             os.environ["HESTIA_ROLE"] = saved_role
 
 
+def _write_gate_registration(config: Path, targets: list[Path]) -> None:
+    config.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": f"python3 {target}", "timeout": 10}
+        for target in targets
+    ]}]}}), encoding="utf-8")
+
+
+def test_a_foreign_gate_registration_is_refused_with_its_actual_cause():
+    import os
+    saved = os.environ.get("HESTIA_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            config = _templated_member(repo, home, "alpha")
+            foreign = home / ".alpha" / "other-plugin" / "hooks" / "pre_tool_use.py"
+            _write_gate_registration(config, [foreign])
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(
+                repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "foreign", rows
+            reason = rows[0]["reason"]
+            assert str(foreign) in reason, reason
+            assert str(home / ".alpha" / "hooks") in reason, reason
+            assert "move the line under dest" in reason.lower(), reason
+            assert "delete it and let the deploy register" in reason.lower(), reason
+            assert "config.unbacked" not in reason, reason
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+
+
+def test_an_owned_and_foreign_duplicate_is_refused_not_probed_selectively():
+    import os
+    saved = os.environ.get("HESTIA_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            config = _templated_member(repo, home, "alpha")
+            owned = home / ".alpha" / "hooks" / "pre_tool_use.py"
+            foreign = home / ".alpha" / "other-plugin" / "hooks" / "pre_tool_use.py"
+            _write_gate_registration(config, [owned, foreign])
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(
+                repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "foreign", rows
+            assert str(foreign) in rows[0]["reason"], rows
+            assert "duplicate" in rows[0]["reason"], rows
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+
+
+def _write_gate_commands(config: Path, commands: list[str]) -> None:
+    config.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": command, "timeout": 10} for command in commands
+    ]}]}}), encoding="utf-8")
+
+
+def _preflight_rows(commands_for) -> list[dict]:
+    """Run the preflight on one templated member whose registration is `commands_for(home)`."""
+    import os
+    saved = os.environ.get("HESTIA_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            config = _templated_member(repo, home, "alpha")
+            _write_gate_commands(config, commands_for(home))
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(
+                repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert rows, "the member produced no row"
+            assert good == (rows[0]["status"] in ("ok", "not-registered")), (good, rows)
+            return rows
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+
+
+def test_a_quoted_foreign_path_is_still_foreign():
+    """The installer's whitespace rule does not see a quoted path; a shell runs it all the same."""
+    rows = _preflight_rows(lambda home: [
+        f'python3 "{home}/.alpha/other-plugin/hooks/pre_tool_use.py"'])
+    assert rows[0]["status"] == "foreign", rows
+    assert "other-plugin" in rows[0]["reason"], rows
+
+
+def test_a_registration_that_cannot_be_read_is_unknown_not_absent():
+    """Unparseable quoting, a wrapper, a relative path: each names the gate without giving a path
+    to compare. None may pass as "not registered", and none is probed as if it were the owned line."""
+    shapes = {
+        "unterminated quote": lambda home: [f"python3 '{home}/.alpha/other-plugin/hooks/pre_tool_use.py"],
+        "bash -c wrapper": lambda home: [f"bash -c 'cd {home}/.alpha/other-plugin/hooks && python3 pre_tool_use.py'"],
+        "relative path": lambda home: ["python3 hooks/pre_tool_use.py"],
+        "tilde path": lambda home: ["python3 ~/.alpha/other-plugin/hooks/pre_tool_use.py"],
+    }
+    for label, commands_for in shapes.items():
+        rows = _preflight_rows(commands_for)
+        assert rows[0]["status"] == "unmeasured", (label, rows)
+        assert "pre_tool_use.py" in rows[0]["reason"], (label, rows)
+        assert "not as an absolute path" in rows[0]["reason"], (label, rows)
+
+
+def test_ownership_is_the_reconcilers_text_rule_not_symlink_resolution():
+    """An alias that resolves to the owned file is still a line the reconciler will not rewrite, so
+    it is FOREIGN. A different spelling of the owned path itself (`hooks/../hooks`) is owned."""
+    def through_alias(home: Path) -> list[str]:
+        (home / ".alpha" / "hooks").mkdir(parents=True, exist_ok=True)
+        (home / ".alpha" / "alias").symlink_to(home / ".alpha" / "hooks")
+        return [f"python3 {home}/.alpha/alias/pre_tool_use.py"]
+    rows = _preflight_rows(through_alias)
+    assert rows[0]["status"] == "foreign", rows
+    assert "/alias/" in rows[0]["reason"], rows
+
+    rows = _preflight_rows(lambda home: [f"python3 {home}/.alpha/hooks/../hooks/pre_tool_use.py"])
+    assert rows[0]["status"] not in ("foreign", "unmeasured"), rows
+
+
+def test_an_owned_line_is_judged_as_the_install_will_rewrite_it():
+    """The reconciler rewrites the line it owns to the template, so a stray argument on today's
+    owned line (even one naming a foreign copy) is gone from what the preflight judges."""
+    rows = _preflight_rows(lambda home: [
+        f"python3 {home}/.alpha/hooks/pre_tool_use.py --then {home}/.alpha/other-plugin/hooks/pre_tool_use.py"])
+    assert rows[0]["status"] == "ok", rows
+
+
+def test_a_member_without_a_declared_dest_keeps_its_old_treatment():
+    """The new refusals apply only where the reconciler owns a destination. A member the install
+    never touches, registered with a relative path, is still reported not-registered."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo, home = root / "repo", root / "home"
+        make_member(repo, home, "alpha")
+        (home / ".alpha" / "settings.json").write_text(
+            json.dumps({"hooks": [{"command": "python3 hooks/pre_tool_use.py"}]}), encoding="utf-8")
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert good and rows == [{"member": "alpha", "status": "not-registered"}], rows
+
+
 if __name__ == "__main__":
+    test_a_quoted_foreign_path_is_still_foreign()
+    test_a_registration_that_cannot_be_read_is_unknown_not_absent()
+    test_ownership_is_the_reconcilers_text_rule_not_symlink_resolution()
+    test_an_owned_line_is_judged_as_the_install_will_rewrite_it()
+    test_a_member_without_a_declared_dest_keeps_its_old_treatment()
+    test_a_foreign_gate_registration_is_refused_with_its_actual_cause()
+    test_an_owned_and_foreign_duplicate_is_refused_not_probed_selectively()
     test_the_preflight_refuses_exactly_what_the_installer_refuses()
     test_the_preflight_judges_the_rendered_line_not_the_stale_registered_one()
     test_registered_candidate_must_allow_the_declared_probe()
@@ -489,4 +645,4 @@ if __name__ == "__main__":
     test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units()
     test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine()
     test_the_throwaway_projection_is_keyed_by_the_seat_id_not_the_plugin_dir()
-    print("ok: 15 gate-preflight checks")
+    print("ok: 17 gate-preflight checks")

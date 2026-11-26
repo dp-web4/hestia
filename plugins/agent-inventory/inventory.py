@@ -428,7 +428,7 @@ def find_launchers(launcher_re: str, units: list[Path]) -> tuple[list[dict], lis
         # `ExecStart=/usr/bin/env HESTIA_HOME=/x python3 -m ...` sets it too: assignments standing
         # BEFORE the entry point are environment; after it they are the being's own arguments.
         cmd_env = set().union(*(_env_names(c[:re.search(launcher_re, c).start()]) for c in starts))
-        members = sorted({m.group(1) for c in starts for m in [MEMBER_ARG.search(c)] if m})
+        members = sorted({m.group(1) for c in starts for m in MEMBER_ARG.finditer(c)})
         found.append({"unit": str(u), "member": members[0] if len(members) == 1 else None,
                       "members_in_unit": members,
                       # Replicated on two seats (agent-atlas PR #1): a launcher that sets none of
@@ -511,7 +511,58 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
         rec["findings"].append(
             "UNPROVISIONED: daemon executable present, and no service unit launches the being's "
             "gateway -- cognition may be running, but nothing acts as a governed member")
+    if len(rec["members"]) > 1 and all(l["member"] for l in launchers):
+        # One launcher per member is unambiguous: project each actor separately instead of
+        # collapsing all of them into an unknown aggregate. Multi-member units stay unknown.
+        rows = []
+        for member in rec["members"]:
+            own = [l for l in launchers if l["member"] == member]
+            units = {l["unit"] for l in own}
+
+            def local(items):
+                out = []
+                for text in items:
+                    if text.startswith("more than one being id launched here"):
+                        continue
+                    if text.startswith(("launcher ", "LAW-SOURCE:", "LAUNCHER-NOT-ENABLED:")):
+                        if any(names_unit(text, unit) for unit in units):
+                            out.append(text)
+                    else:
+                        out.append(text)
+                return out
+
+            row = dict(rec)
+            row.update({
+                "member": member,
+                "plugin": member,
+                "_expanded_member": True,
+                "members": [member],
+                "launchers": own,
+                "unknown": local(rec["unknown"]),
+                "findings": local(rec["findings"]),
+                "unprovisioned": False,
+            })
+            row["governed"] = bool(own) and gated and not row["unknown"]
+            rows.append(row)
+        rec["member_rows"] = rows
     return rec
+
+
+def names_unit(text: str, unit: str) -> bool:
+    """Whether a finding names this unit file as a WHOLE path, not as a prefix of another one.
+
+    Substring matching attached a finding about `com.web4.sage.mcnugget.plist.retired-2026-09-18`
+    to the live `com.web4.sage.mcnugget.plist` sitting beside it (McNugget's own LaunchAgents).
+    A path character on either side means the match is part of a longer name; a trailing full
+    stop that ends the sentence (`… .plist.`) does not.
+    """
+    return re.search(r"(?<![\w./-])" + re.escape(unit) + r"(?![\w-]|\.\w)", text) is not None
+
+
+def expand_being_record(rec: dict) -> list[dict]:
+    """Flatten per-member being projections; all other records are already singular."""
+    return rec.get("member_rows") or [rec]
+
 
 CONFIG_FILES = ("settings.json", "config.toml", "config.yaml", "config.json",
                 "settings.local.json", "config.yml")
@@ -1929,34 +1980,35 @@ def classify(recs: list[dict]) -> dict:
         "ungovernable": [], "dormant_plugin": [], "unknown": [], "unprovisioned_being": [],
         "windows_host": []}
     for r in recs:
+        summary_id = r["member"] if r.get("_expanded_member") else r["agent"]
         if r["unknown"]:
-            gaps["unknown"].append(r["agent"])
+            gaps["unknown"].append(summary_id)
         if r.get("kind") == "being":
             # A being is never "ungovernable: no plugin exists" -- it needs none. Its one gap
             # is its own, with its own remedy (mint, join, admit, launch).
             if r.get("unprovisioned"):
-                gaps["unprovisioned_being"].append(r["agent"])
+                gaps["unprovisioned_being"].append(summary_id)
             continue
         # Its own bucket, and NOT in the elif chain: a stranger's dead gate is a real
         # finding with a remedy in someone else's repo, so it must not consume the slot
         # that would otherwise report an actual hestia gap on the same agent.
         if r["installed"] and r["miswired_3p"]:
-            gaps["miswired_3p"].append(r["agent"])
+            gaps["miswired_3p"].append(summary_id)
         if r["installed"] and r["miswired"]:
-            gaps["miswired"].append(r["agent"])
+            gaps["miswired"].append(summary_id)
         elif r["installed"] and r["partial"]:
             # The state worth having: observation wired, enforcement absent. It is where
             # a machine sits while it LOOKS covered.
-            gaps["partial"].append(r["agent"])
+            gaps["partial"].append(summary_id)
         elif r["installed"] and not r["governed"]:
             key = "ungoverned" if r["plugin_available"] else "ungovernable"
-            gaps[key].append(r["agent"])
+            gaps[key].append(summary_id)
         if r.get("windows_host_executable"):
             # An independent Windows presence remains a gap even when a Linux executable is also
             # installed and governed: that other copy cannot be gated by this seat's Linux hooks.
-            gaps["windows_host"].append(r["agent"])
+            gaps["windows_host"].append(summary_id)
         elif r["plugin_available"] and not r["installed"]:
-            gaps["dormant_plugin"].append(r["agent"])
+            gaps["dormant_plugin"].append(summary_id)
     return gaps
 
 
@@ -2213,15 +2265,15 @@ def main() -> int:
             "ungoverned agent that neither list names — so 'nothing ungoverned' is still "
             f"undistinguishable from 'could not look' (workspace from {WORKSPACE_SOURCE}; "
             "pass --workspace PATH, re-run install.sh, or clone agent-atlas)")
-    recs = [inspect(a, roots) for a in known]
+    recs = [row for a in known for row in expand_being_record(inspect(a, roots))]
     periodic_state, periodic_platform, periodic_paths = periodic_trigger()
     installed_bin = HOME / ".local" / "bin" / INSTALLED_BIN_NAME
     available = REGISTRY.harnesses()
     installed = [r for r in recs if r["installed"]]
     governed = [r for r in installed if r["governed"]]
     gaps = classify(recs)
-    fragile = sorted({r["agent"] for r in installed
-                      if any(f.startswith("FRAGILE") for f in r["findings"])})
+    fragile = sorted({(r["member"] if r.get("_expanded_member") else r["agent"])
+                      for r in installed if any(f.startswith("FRAGILE") for f in r["findings"])})
 
     # Rule 4: report the scope achieved, so every number above is falsifiable by the
     # reader instead of trusted. `plugins_available` in particular is read from the
@@ -2349,13 +2401,15 @@ def main() -> int:
         "machine": platform.node(),
         "registry_known": len(known),
         # A. installed  B. available  C. governed
-        "installed": sorted(r["agent"] for r in installed),
+        "installed": sorted((r["member"] if r.get("_expanded_member") else r["agent"])
+                            for r in installed),
         "plugins_available": available,
-        "governed": sorted(r["agent"] for r in governed),
+        "governed": sorted((r["member"] if r.get("_expanded_member") else r["agent"])
+                           for r in governed),
         "gaps": gaps,
         **hook_qualification(recs),
         # The same verdicts keyed by MEMBER id -- what the dashboard's chips and every grant use.
-        # `gaps` and `governed` stay keyed by atlas id for their existing readers.
+        # Expanded rows use that id in summaries too; legacy rows keep their atlas-id fallback.
         "members": member_states(recs),
         "fragile": fragile,
         "unknown": unknowns,

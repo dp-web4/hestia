@@ -106,6 +106,8 @@ BLOCK
     fill();
     await el('sg-grant-btn').click();
     log.push({ step: 'the ordinary grant after it', sent: sent.length, flag: sent[1] && sent[1].body.grant_ahead_of_connect });
+  } else if (script === 'coverage') {
+    log.push({ html: el('sg-ok').innerHTML });
   }
   process.stdout.write(JSON.stringify(log));
 })();
@@ -135,6 +137,21 @@ def run(replies, script) -> list:
 REFUSED = {"status": 409, "body": {"error": "no member 'Claude-code' has ever connected", "member_known": False,
                                     "nearest": ["claude-code"]}}
 GRANTED = {"status": 200, "body": {"ok": True, "member_known": False, "plugin_id": "Claude-code", "path": "/w/repos"}}
+COVERAGE = {"status": 200, "body": {
+    "ok": True, "member_known": True, "plugin_id": "claude-code", "path": "/w/root/child",
+    "replaced_existing": True,
+    "replaced_terms": {"modes": "rwed", "recursive": True, "expires_at": 1767225600, "live": False},
+    "coverage_overlaps": [
+        {"path": "/w/root", "relation": "existing_path_covers_new", "modes": "r", "recursive": True,
+         "expires_at": 1798761600},
+        {"path": "/w/root/other", "relation": "new_path_covers_existing", "modes": "rwed", "recursive": False,
+         "expires_at": None},
+        {"path": "/w/root/third", "relation": "existing_path_covers_new", "modes": "rw", "recursive": True,
+         "expires_at": None},
+        {"path": "/w/root/fourth", "relation": "existing_path_covers_new", "modes": "rwed", "recursive": True,
+         "expires_at": None},
+    ],
+}}
 
 
 def source_contract() -> None:
@@ -192,6 +209,26 @@ def behaviour() -> None:
     check("...and is SPENT anyway: the next ordinary grant carries no flag",
           (step.get("the ordinary grant after it", {}).get("sent"), step.get("the ordinary grant after it", {}).get("flag")),
           (2, None))
+
+    html = next((row["html"] for row in run([COVERAGE], "coverage") if "html" in row), "")
+    check("replacement is rendered, not left only in the JSON response",
+          "Replaced the existing grant on this member and path" in html)
+    # WHAT was replaced: the same path with other terms is never an overlap, so the old row's
+    # own terms are shown, and a lapsed row is named as lapsed (NOVA, #1638).
+    check("the replaced row's terms are rendered",
+          "(was modes rwed, recursive, expires 2026-01-01T00:00Z, already lapsed)." in html)
+    check("the caveat says the comparison is lexical",
+          "symlinks are not resolved" in html)
+    # A PATH relation is labelled as one, with the existing grant's own modes/reach/expiry
+    # beside it -- never the bare "covers" that reads as authority redundancy (NOVA, #1638).
+    for fragment in ("existing path covers new: /w/root (modes r, recursive, expires 2027-01-01T00:00Z)",
+                     "new path covers existing: /w/root/other (modes rwed, exact, until revoked)",
+                     "existing path covers new: /w/root/third (modes rw, recursive, until revoked)",
+                     "(+1 more)", "a path overlap does not make either grant redundant",
+                     "modes, exact/recursive reach, and expiry can differ intentionally"):
+        check(f"coverage feedback includes {fragment!r}", fragment in html)
+    for bare in ("existing covers new", "new covers existing"):
+        check(f"no bare authority-sounding label {bare!r}", bare not in html)
 
 
 def test_grant_refusal_contract() -> None:

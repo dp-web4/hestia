@@ -408,14 +408,15 @@ def native_event(seat, act_tool, act_input, cwd, n):
 class _Env:
     """Point the mechanism at a stub (or a dead port) for one test; restore after."""
 
-    def __init__(self, m, url, home: pathlib.Path):
+    def __init__(self, m, url, home: pathlib.Path, workspace: pathlib.Path | None = None):
         self.m, self.url, self.home = m, url, home
+        self.workspace = workspace or REPO.parent
 
     def __enter__(self):
         self.saved = {k: os.environ.get(k) for k in ("HESTIA_ENDPOINT", "HESTIA_HOME", "HESTIA_WORKSPACE")}
         os.environ["HESTIA_ENDPOINT"] = self.url
         os.environ["HESTIA_HOME"] = str(self.home)
-        os.environ["HESTIA_WORKSPACE"] = str(REPO.parent)
+        os.environ["HESTIA_WORKSPACE"] = str(self.workspace)
         self.m._POLICY_SNAPSHOT_CACHE.clear()
         self.saved_disc = self.m._discover_endpoint
         self.m._discover_endpoint = lambda: self.url
@@ -469,6 +470,8 @@ def test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial(m, g, w
                 check(f"{tag}-denial-carries-rule", second.get("rule_id") == "gate.evidence_uncommitted", second)
                 check(f"{tag}-denial-names-what-it-replaced",
                       "supersedes uncommitted allow" in (second.get("attempted") or ""), second)
+                check(f"{tag}-synthetic-denial-is-not-the-exact-original-act",
+                      second.get("attempted_exact") is False, second)
             finally:
                 stub.close()
     # A PERMITTED read whose RECORD does not commit keeps C11's read posture and says so (C11 text).
@@ -1256,14 +1259,15 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
     finally:
         stub.close()
     # (7) device sinks and temp roots are never escalated.
-    stub = Stub(Policy())
-    try:
-        with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
-        check("scope-sinks-allowed", d.decision == "allow", d)
-        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
-    finally:
-        stub.close()
+    with tempfile.TemporaryDirectory(dir="/tmp") as sink, tempfile.TemporaryDirectory() as workspace:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home, workspace=pathlib.Path(workspace)):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"ls 2>/dev/null >{sink}/x"}, home)
+            check("scope-sinks-allowed", d.decision == "allow", d)
+            check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
+        finally:
+            stub.close()
 
 
 def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
@@ -1792,7 +1796,7 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
     stub = Stub()
     try:
         with _Env(m, stub.url, home):
-            sibling = REPO.parent / "decide-contract-ungranted-sibling"
+            sibling = REPO.parent / f"decide-contract-ungranted-sibling-{uuid.uuid4().hex}"
             sibling.mkdir(exist_ok=True)
             try:
                 raw = native_event("gemini", "mcp_fs_read", {"path": "x"}, str(REPO), 14)
@@ -1818,12 +1822,46 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
 #: multi-second stall was measured here under `cargo -j2`, the #423 jitter class) cannot turn a
 #: behaviour check into a timing flake. The real deadline is what the parity arm runs at.
 RELAXED_DEADLINE_SECONDS = 15.0
+def test_attempted_exact_preserves_raw_whitespace_identity(m, g, wc, home):
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            expected = (
+                ("printf 'alpha beta'", True),
+                ("printf 'alpha  beta'", False),
+                ("printf 'alpha beta' ", False),
+            )
+            for command, exact in expected:
+                d, _ = _decide(g, "codex", "Bash", {"command": command}, home)
+                check("whitespace-act-recorded", d.evidence_committed, d)
+                sent = stub.named("hestia_witness_decision")[-1][0]
+                check(f"raw-whitespace-exact-{exact}", sent.get("attempted_exact") is exact, sent)
+            first, second = [a for a, _ in stub.named("hestia_witness_decision")][:2]
+            check("whitespace-distinct-acts-share-only-a-normalized-summary",
+                  first.get("attempted") == second.get("attempted")
+                  and first.get("attempted_exact") is True
+                  and second.get("attempted_exact") is False,
+                  (first, second))
+            for tool, tool_input in (
+                ("Bash", {"command": ["printf", "a b"]}),
+                _act(IN_SCOPE_EDIT),
+            ):
+                d, _ = _decide(g, "codex", tool, tool_input, home)
+                check("non-string-act-recorded", d.evidence_committed, d)
+                sent = stub.named("hestia_witness_decision")[-1][0]
+                check("only-a-preserved-string-command-can-be-exact",
+                      sent.get("attempted_exact") is False, sent)
+    finally:
+        stub.close()
+
+
 DEADLINE_TESTS = {"test_one_deadline_bounds_the_whole_invocation",
                   "test_the_gate_owns_no_cache_no_client_and_one_recorder",
                   # The real daemon is where the cold-start caveat lives: it MUST run at 3 s.
                   "test_against_an_isolated_real_daemon"}
 
 CONTRACT_TESTS = [
+    test_attempted_exact_preserves_raw_whitespace_identity,
     test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
     test_the_key_from_the_raw_event_reaches_every_join,
     test_the_gate_owns_no_cache_no_client_and_one_recorder,
