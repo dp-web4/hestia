@@ -1939,7 +1939,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id =
         Uuid::parse_str(&action_id_str).map_err(|_| anyhow::anyhow!("invalid action_id"))?;
     // PHASE 1 (state lock, brief): the in-flight action and who it belongs to.
-    let (action, session_identity) = {
+    let (action, session_identity, delegation_snapshot) = {
         let s = state.lock().await;
         let action = match s.actions.get(&action_id) {
             Some(a) => a.clone(),
@@ -1955,7 +1955,13 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             .sessions
             .get(&action.session_id)
             .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()));
-        (action, who)
+        let delegation_snapshot = super::delegation_gate::Snapshot::build(
+            &s.vault,
+            &s.home,
+            &s.member_registry,
+            &s.role_registry,
+        );
+        (action, who, delegation_snapshot)
     };
 
     // Build a PolicyAction from the in-flight action + classify the tool.
@@ -2025,6 +2031,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // constellation-role overlay by STRICTEST verdict. A self-declared role can
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
     // declaring a permissive role can't be used to escape the base floor.
+    let actor_source = if session_identity.is_some() {
+        super::delegation_gate::ActorSource::Session
+    } else {
+        super::delegation_gate::ActorSource::CallerStated
+    };
     let (session_plugin_id, session_role) = session_identity.unwrap_or_else(|| {
         (
             "unknown".to_string(),
@@ -2040,6 +2051,19 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let policy_version = published.version;
     let evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
     let (plugin_id_for_chain, role_lct) = (session_plugin_id.clone(), session_role.clone());
+    let delegation_finding = super::delegation_gate::assess(
+        &delegation_snapshot,
+        &super::delegation_gate::Act {
+            plugin_id: &session_plugin_id,
+            role: &session_role,
+            tool_name: &action.tool_name,
+            category,
+            target,
+            actor_source,
+        },
+        chrono::Utc::now(),
+    );
+    let delegation_json = delegation_finding.to_json("query_policy");
 
     // PHASE 3 (state lock): only the writes this verdict needs — the scope tally, the decision
     // row and its charge.
@@ -2157,6 +2181,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // the row's display cut is still visible (NOVA's re-review of 7c73d48c9). Null with no attempt.
     let act_exact = full_command.zip(attempted_whole.as_deref()).map(|(raw, w)| act_exact_of(raw, w));
     let mut committed_feedback = None;
+    let mut committed_delegation = None;
     let mut feedback_recorded = false;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
         // An identical act already decided the same way under the same rule is answered by
@@ -2183,13 +2208,14 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             if feedback.repeat_of.as_deref() == Some(existing.as_str()) {
                 feedback.repeat_of = None;
             }
-            let committed = s
-                .chain_store
-                .read_by_hash(&existing)
-                .ok()
-                .flatten()
+            let committed_entry = s.chain_store.read_by_hash(&existing).ok().flatten();
+            let committed = committed_entry
+                .as_ref()
                 .and_then(|e| e.event_data.get("feedback").cloned())
                 .unwrap_or(Value::Null);
+            committed_delegation = Some(
+                committed_entry.and_then(|e| e.event_data.get("delegation").cloned()),
+            );
             let strip = |mut v: Value| {
                 if let Some(o) = v.as_object_mut() {
                     o.remove("repeat_of");
@@ -2245,6 +2271,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "act_exact": act_exact,
                 // The verdict as feedback: level, serves, act key, doors, repeat_of (above).
                 "feedback": feedback.to_value(),
+                "delegation": delegation_json.clone(),
             });
         if let Some(h) = &charge_held_by {
             own_data["charge_held_by"] = json!(h);
@@ -2344,6 +2371,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // An existing decision hash is paired only with the feedback committed in that row.
         "feedback": committed_feedback.unwrap_or_else(|| feedback.to_value()),
         "feedbackRecorded": feedback_recorded,
+        "delegation": committed_delegation.unwrap_or(Some(delegation_json)),
     }))
 }
 
@@ -5155,6 +5183,27 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     feedback.act = Some(act);
 
     let mut s = state.lock().await;
+    let delegation_snapshot = super::delegation_gate::Snapshot::build(
+        &s.vault,
+        &s.home,
+        &s.member_registry,
+        &s.role_registry,
+    );
+    let delegation_json = super::delegation_gate::assess(
+        &delegation_snapshot,
+        &super::delegation_gate::Act {
+            plugin_id: &plugin_id,
+            role: role_lct,
+            tool_name: &tool_name,
+            category: crate::policy::classify(&tool_name),
+            target: Some(target.as_str()),
+            // This path records the caller-stated plugin_id/role; the session_id it was
+            // handed is never resolved, so the match must not wear the session label.
+            actor_source: super::delegation_gate::ActorSource::CallerStated,
+        },
+        chrono::Utc::now(),
+    )
+    .to_json("witness_decision");
     // `serves`: as sent, else as the named action stated it at begin, else "unknown".
     feedback.serves = super::verdict_feedback::normalize_serves(
         serves_arg
@@ -5181,12 +5230,13 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         // recorded. Not a refusal: the existing row is often the daemon's own society-path verdict,
         // which a seat legitimately witnesses again with its own doors and level, and refusing would
         // turn that accepted receipt into an error the caller retries.
-        let committed = s
-            .chain_store
-            .read_by_hash(&hash)
-            .ok()
-            .flatten()
+        let committed_entry = s.chain_store.read_by_hash(&hash).ok().flatten();
+        let committed = committed_entry
+            .as_ref()
             .and_then(|e| e.event_data.get("feedback").cloned())
+            .unwrap_or(Value::Null);
+        let committed_delegation = committed_entry
+            .and_then(|e| e.event_data.get("delegation").cloned())
             .unwrap_or(Value::Null);
         // The same verdict delivered again for the same action is not a repeated ACT.
         feedback.repeat_of = earlier.filter(|h| *h != hash);
@@ -5200,6 +5250,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         return Ok(json!({
             "feedback": committed,
             "feedbackRecorded": !differed,
+            "delegation": committed_delegation,
             "doorsStripped": doors_stripped,
             "witnessEntryHash": hash,
             "eventType": verdict.event_type(),
@@ -5247,6 +5298,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     });
     feedback.repeat_of = earlier;
     row["feedback"] = feedback.to_value();
+    row["delegation"] = delegation_json.clone();
     // Join keys and the deployed-generation attestation ride the row only when SENT, so a
     // deployed refusal shim that sends none of them writes exactly the row it always wrote.
     // `core_digest` was sent by every shim since REPAIR 5 and dropped here until now.
@@ -5329,6 +5381,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         // Additive (verdict-as-feedback). `doorsStripped` counts doors the gate offered on an
         // invariant verdict, which the record does not carry.
         "feedback": feedback.to_value(),
+        "delegation": delegation_json,
         "doorsStripped": doors_stripped,
     }))
 }
@@ -11183,6 +11236,217 @@ fn optional_string(args: &Value, key: &str) -> Option<String> {
 /// Pinned by `a_session_id_moves_from_connect_to_a_consumer_under_one_name`.
 fn optional_session_id(args: &Value) -> Option<String> {
     optional_string(args, "session_id").or_else(|| optional_string(args, "sessionId"))
+}
+
+#[cfg(test)]
+mod delegation_gate_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+    use web4_core::crypto::KeyPair;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "test"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn seed_delegation(state: &SharedState, plugin: &str, actions: &[&str]) -> String {
+        let op = KeyPair::generate();
+        let mut s = state.lock().await;
+        std::fs::write(
+            s.home.join("operator.key"),
+            json!({"secret_key_hex": hex::encode(op.secret_key_bytes())}).to_string(),
+        )
+        .unwrap();
+        let member_lct = s.member_registry.get(plugin).unwrap().lct_id();
+        let mut store = crate::delegation::DelegationStore::load(&s.vault).unwrap();
+        let id = store
+            .create_delegation(
+                Uuid::new_v4(),
+                crate::delegation::agent_key_for_lct(&member_lct),
+                vec![],
+                actions.iter().map(|a| a.to_string()).collect(),
+                None,
+                &op,
+            )
+            .id
+            .to_string();
+        store.save(&mut s.vault).unwrap();
+        id
+    }
+
+    async fn revoke(state: &SharedState, id: &str) {
+        let mut s = state.lock().await;
+        let mut store = crate::delegation::DelegationStore::load(&s.vault).unwrap();
+        store.revoke(Uuid::parse_str(id).unwrap()).unwrap();
+        store.save(&mut s.vault).unwrap();
+    }
+
+    async fn begin_read(state: &SharedState, sid: &str, target: &str) -> String {
+        tool_begin_action(
+            state,
+            &json!({"tool_name": "Read", "target": target, "session_id": sid}),
+        )
+        .await
+        .unwrap()["actionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn query_and_witness_rows_record_authority_without_changing_verdict() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let delegation_id = seed_delegation(&state, "codex", &["act"]).await;
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config,
+            );
+        }
+        let action_id = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash", "target": "rm -rf /home/user/data",
+                "parameters": {"command": "rm -rf /home/user/data"}, "session_id": sid,
+            }),
+        )
+        .await
+        .unwrap()["actionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let query = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(query["decision"], "deny", "the safety fixture must still deny");
+        assert_eq!(query["delegation"]["status"], "match", "{query}");
+        assert_eq!(query["delegation"]["delegation_ids"], json!([delegation_id]), "{query}");
+        assert_eq!(query["delegation"]["verdict_changed"], false, "{query}");
+        let decision_row = state.lock().await.recent_chain(30).into_iter()
+            .find(|e| e.event_type == "policy_decision")
+            .expect("the deny is witnessed");
+        assert_eq!(
+            decision_row.event_data["delegation"]["status"], "match",
+            "the chain carries the same authority: {decision_row:?}"
+        );
+
+        revoke(&state, &delegation_id).await;
+        let repeated = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(
+            repeated["delegation"]["status"], "match",
+            "query must read the committed authority after revocation too: {repeated}"
+        );
+        assert_eq!(repeated["delegation"]["delegation_ids"], json!([delegation_id]), "{repeated}");
+        let witnessed = tool_witness_decision(
+            &state,
+            &json!({
+                "plugin_id": "codex", "decision": "deny", "adjudicator": "test",
+                "tool_name": "Bash", "target": "rm -rf /home/user/data",
+                "reason": "the committed decision is witnessed again",
+                "action_id": action_id,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(witnessed["recorded"], "existing", "{witnessed}");
+        assert_eq!(
+            witnessed["delegation"]["status"], "match",
+            "the committed row's authority must not be recomputed after revocation: {witnessed}"
+        );
+        assert_eq!(
+            witnessed["delegation"]["delegation_ids"], json!([delegation_id]),
+            "{witnessed}"
+        );
+
+        let allowed = tool_witness_decision(
+            &state,
+            &json!({
+                "plugin_id": "codex", "decision": "allow", "adjudicator": "test",
+                "tool_name": "Read", "target": "notes.md", "reason": "permit witness",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowed["delegation"]["status"], "revoked", "{allowed}");
+        let allow_row = state.lock().await.recent_chain(30).into_iter()
+            .find(|e| e.event_type == "policy_allow")
+            .expect("the permit is witnessed");
+        assert_eq!(allow_row.event_data["delegation"]["status"], "revoked", "{allow_row:?}");
+    }
+
+    #[tokio::test]
+    async fn handler_entry_points_label_the_actor_source_on_a_match() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let _ = seed_delegation(&state, "codex", &["act"]).await;
+
+        let action_id = begin_read(&state, &sid, "resolved.md").await;
+        let resolved = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(resolved["delegation"]["status"], "match", "{resolved}");
+        assert_eq!(
+            resolved["delegation"]["coverage_basis"],
+            json!("operator-signed act scope matched to the A1 session identity"),
+            "{resolved}"
+        );
+
+        let witnessed = tool_witness_decision(
+            &state,
+            &json!({
+                "plugin_id": "codex", "decision": "allow", "adjudicator": "test",
+                "tool_name": "Read", "target": "witness.md", "reason": "caller-stated actor",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(witnessed["delegation"]["status"], "match", "{witnessed}");
+        assert_eq!(
+            witnessed["delegation"]["coverage_basis"],
+            json!("operator-signed act scope matched to the caller-stated plugin_id (no session resolved)"),
+            "{witnessed}"
+        );
+
+        let _ = connect(&state, "unknown").await;
+        let _ = seed_delegation(&state, "unknown", &["act"]).await;
+        let missing_sid = Uuid::new_v4().to_string();
+        let action_id = begin_read(&state, &missing_sid, "unresolved.md").await;
+        let unresolved = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(unresolved["delegation"]["status"], "match", "{unresolved}");
+        assert_eq!(
+            unresolved["delegation"]["coverage_basis"],
+            json!("operator-signed act scope matched to the caller-stated plugin_id (no session resolved)"),
+            "{unresolved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_mode_reports_none_and_revoked_without_changing_verdict() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let first = begin_read(&state, &sid, "first.md").await;
+        let none = tool_query_policy(&state, &json!({"action_id": first})).await.unwrap();
+        assert_eq!(none["decision"], "allow", "record mode changes no verdict: {none}");
+        assert_eq!(none["delegation"]["status"], "none", "{none}");
+        assert_eq!(none["delegation"]["verdict_changed"], false, "{none}");
+
+        let delegation_id = seed_delegation(&state, "codex", &["act"]).await;
+        revoke(&state, &delegation_id).await;
+        let second = begin_read(&state, &sid, "second.md").await;
+        let revoked = tool_query_policy(&state, &json!({"action_id": second})).await.unwrap();
+        assert_eq!(revoked["decision"], "allow", "{revoked}");
+        assert_eq!(revoked["delegation"]["status"], "revoked", "{revoked}");
+        assert_eq!(revoked["delegation"]["delegation_ids"], json!([delegation_id]), "{revoked}");
+    }
 }
 
 #[cfg(test)]
