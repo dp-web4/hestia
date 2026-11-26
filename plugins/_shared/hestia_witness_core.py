@@ -309,7 +309,7 @@ def extract_target(tool_input: Any) -> Optional[str]:
 def derive_success(event: dict) -> tuple[bool, Optional[str]]:
     """Best-effort success flag across the harnesses' outcome shapes."""
     forced = OUTCOME_EVENTS.get(event.get("hook_event_name"))
-    if forced is False:  # kimi's PostToolUseFailure: the event IS the failure
+    if forced is False:  # PostToolUseFailure: the event IS the failure
         err = event.get("error")
         if isinstance(err, dict):
             err = err.get("message") or json.dumps(err)

@@ -121,6 +121,7 @@ UPDATE_STATUS="$HESTIA_HOME/deploy-status.tsv"
 UPDATE_REQUEST_ID=""
 UPDATE_TARGET=""
 LOCKD_OWNED=0
+DEPLOY_COMPLETED=0
 
 write_update_status() {
   [ -n "$UPDATE_REQUEST_ID" ] || return 0
@@ -183,7 +184,23 @@ cleanup_deploy() {
   if [ "$MODE" = "--check" ] && [ "$CHECK_WRITTEN" = 0 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
     write_check_result failed || true
   fi
-  finish_update_status "$rc"
+  local finalized=0
+  if finish_update_status "$rc"; then
+    finalized=1
+  else
+    log "WARN could not finalize the dashboard request status; leaving any follow-up to the timer"
+  fi
+  # Only a successful, fully finalized cycle re-enters for a request that arrived mid-run.
+  # Early exits (lock, hold, failure) leave the request to the timer instead of starting work.
+  if [ "$MODE" = full ] && [ "$rc" -eq 0 ] && [ "$DEPLOY_COMPLETED" = 1 ] && \
+     [ "$finalized" = 1 ] && [ "${HESTIA_DEPLOY_FOLLOWUP:-0}" != "1" ]; then
+    local claimed="$UPDATE_REQUEST_ID"
+    if read_update_request_id && [ "$UPDATE_REQUEST_ID" != "$claimed" ]; then
+      # The new request file stays queued: an exec failure or interruption cannot lose it.
+      trap - EXIT
+      HESTIA_DEPLOY_FOLLOWUP=1 exec "$SELF_INSTALL" full
+    fi
+  fi
 }
 
 # The parenthesised `git describe` string from a version line, e.g.
@@ -1308,7 +1325,7 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
     run_post_deploy "$target"
     log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats post_deploy=$post_deploy"
     case "$hooks" in
-      ok) exit 0 ;;
+      ok) DEPLOY_COMPLETED=1; exit 0 ;;
       *)  log "HALF-DEPLOYED $target: binary current, manifest still '${manifest:-none}' (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
     esac
   fi
@@ -1317,6 +1334,7 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
   if [ "$MODE" = "full" ]; then install_inventory; install_mesh; run_post_deploy "$target"; fi
   secret_hygiene
   log "CURRENT $target${inventory:+ inventory=$inventory}${mesh:+ mesh=$mesh}${post_deploy:+ post_deploy=$post_deploy}"
+  DEPLOY_COMPLETED=1
   exit 0
 fi
 if [ "$MODE" = "--check" ]; then
@@ -1397,7 +1415,7 @@ write_check_result up-to-date "$target"
 # (HESTIA_DEPLOY_HOOKS=0 -> hooks=skipped); an absent installer or an absent bash>=4 is a
 # missing primitive, and a missing primitive does not read as a pass.
 case "$hooks" in
-  ok|skipped) exit 0 ;;
+  ok|skipped) DEPLOY_COMPLETED=1; exit 0 ;;
   *) log "HALF-DEPLOYED $newv: binary current, manifest not written (hooks=$hooks); $(hooks_repair_hint)"
      exit 1 ;;
 esac
