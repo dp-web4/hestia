@@ -17,6 +17,14 @@ from staged_guards import (boundary_findings, check, exec_bit_offenders,
                             findings_on, repair_line, staged_paths)
 
 
+# fixture-git-isolation (hestia #1738): never act on the caller's repository. With
+# GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE exported (as inside a git hook), git honours
+# the variable over cwd=, so this fixture's `git config user.*` lands in the CALLER's
+# config. Every repo this test builds is under a tempdir; no inherited GIT_* is wanted.
+for _git_var in [k for k in os.environ if k.startswith("GIT_")]:
+    del os.environ[_git_var]
+
+
 def test_a_staged_script_at_100644_is_an_offender():
     off = exec_bit_offenders(["tools/x.py"], {"tools/x.py"}, {"tools/x.py": "100644"})
     assert off == ["tools/x.py"], off

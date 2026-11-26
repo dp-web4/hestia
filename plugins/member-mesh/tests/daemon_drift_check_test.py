@@ -71,6 +71,14 @@ WATCHER = HERE.parent / "hestia-watch-member.sh"
 TIMEOUT = 15.0
 
 
+# fixture-git-isolation (hestia #1738): never act on the caller's repository. With
+# GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE exported (as inside a git hook), git honours
+# the variable over cwd=, so this fixture's `git config user.*` lands in the CALLER's
+# config. Every repo this test builds is under a tempdir; no inherited GIT_* is wanted.
+for _git_var in [k for k in os.environ if k.startswith("GIT_")]:
+    del os.environ[_git_var]
+
+
 class StubDaemon:
     """Just enough MCP to carry serverInfo.version on initialize."""
 
