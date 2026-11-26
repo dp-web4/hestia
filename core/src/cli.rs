@@ -64,12 +64,36 @@ enum Command {
     /// Show hestia home + vault info
     Info,
 
-    /// Verify the witness chain: link integrity AND chain-witness signatures (#339).
-    ///
-    /// Reads an online-backup SNAPSHOT of witness.db (safe while the daemon runs; nothing is
-    /// written to the live chain). Prints both predicates, per-witness-key row counts, and
-    /// the first failures. Exits non-zero if the link breaks or any required signature fails.
-    ChainVerify,
+    /// Export an inclusive chain range and its public signature evidence for offline checking.
+    /// The local vault authorizes the read; the segment contains no vault secrets.
+    ChainExport {
+        /// First chain position to include.
+        #[arg(long)]
+        from: u64,
+        /// Last chain position to include.
+        #[arg(long)]
+        to: u64,
+    },
+
+    /// Verify the witness chain, or a portable segment without opening a vault or daemon.
+    /// With no segment, reads an online-backup SNAPSHOT of witness.db and checks the whole chain.
+    ChainVerify {
+        /// A hestia-chain-segment:v1 JSON file to verify offline.
+        #[arg(value_name = "SEGMENT")]
+        segment: Option<PathBuf>,
+        /// Externally trusted Ed25519 witness public key (hex). Repeat for each trusted key.
+        #[arg(long = "trusted-witness-key", value_name = "HEX")]
+        trusted_witness_key: Vec<String>,
+        /// Externally expected chain id (genesis hash), required for authenticated verification.
+        #[arg(long)]
+        expect_chain_id: Option<String>,
+        /// Externally expected hash before a non-genesis segment.
+        #[arg(long)]
+        expect_previous_hash: Option<String>,
+        /// Externally expected hash of the segment's terminal entry, required for completeness.
+        #[arg(long)]
+        expect_end_hash: Option<String>,
+    },
 
     /// Run the MCP server daemon
     Serve {
@@ -179,11 +203,14 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Governance-surface escalations — the remedy every gate deny already names.
+    /// Governance-write and scope escalations: escalate a refusal, then poll, approve or deny it.
     ///
-    /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
-    /// subcommand was never written (#116). This is a client over tools the daemon
-    /// already ships — it adds no authority and can only reach verdicts the daemon
+    /// A gate deny names a refusal id. The refused member escalates it deliberately with
+    /// `hestia gate escalate <refusal_id> --as <member> --reason '...'` (dp, 2026-11-05: the
+    /// gate opens none on its own); a scope refusal id is accepted too and goes to
+    /// `hestia_scope_escalate`, or scope is asked for up front with `hestia_request_scope`.
+    /// Deciders rule with approve, deny and corroborate. This is a client over tools the
+    /// daemon already ships — it adds no authority and can only reach verdicts the daemon
     /// would already permit.
     Gate {
         #[command(subcommand)]
@@ -281,6 +308,25 @@ enum GateCmd {
         /// Why. Optional against a peer's ask; REQUIRED to withdraw your own.
         #[arg(long)]
         reason: Option<String>,
+    },
+
+    /// Ratify the exact gate bytes the daemon just verified. With no --path this is the bulk
+    /// arm, accepted only when every discovered gate matches the deploy record. Repeated
+    /// --path selects individual gates for a per-gate merge.
+    Ratify {
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`) whose public
+        /// half is law-listed in `operator_access`. Read, never printed.
+        #[arg(long, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+        /// Why these bytes are the ones you reviewed (single line, <=512 bytes)
+        #[arg(long)]
+        reason: String,
+        /// Discovered gate path to ratify; repeat for a per-gate merge
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Emit the daemon's response as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Add evidence WITHOUT deciding (#122 — approval accumulates as factors)
@@ -1199,6 +1245,12 @@ enum VaultCmd {
         #[arg(long = "present-to")]
         present_to: Vec<String>,
 
+        /// Semantic presentation audience mode: `fixed` (the one verifier named at issuance) or
+        /// `any-of` (a presentation-time choice among the recorded verifiers). Required for
+        /// multiple verifiers; cardinality does not decide this.
+        #[arg(long = "present-audience")]
+        present_audience: Option<String>,
+
         /// What a presentation discloses: `nothing`, `derived` (a value derived from the secret,
         /// never the secret — the default when --present-to is given), or `full` (the secret
         /// itself; a bearer presented directly).
@@ -1226,7 +1278,12 @@ pub fn run() -> AnyResult<()> {
     match cli.command {
         Command::Init { force, ai } => cmd_init(&home, force, ai),
         Command::Info => cmd_info(&home),
-        Command::ChainVerify => cmd_chain_verify(&home),
+        Command::ChainExport { from, to } => cmd_chain_export(&home, from, to),
+        Command::ChainVerify { segment, trusted_witness_key, expect_chain_id,
+                               expect_previous_hash, expect_end_hash } => {
+            cmd_chain_verify(&home, segment.as_deref(), trusted_witness_key,
+                             expect_chain_id, expect_previous_hash, expect_end_hash)
+        }
         Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Scope(ScopeCmd::Arbitrate { request_id, grant, deny, reason, as_member, endpoint, target }) => {
@@ -1289,6 +1346,9 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Deny { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, false, reason, asserted_id, &role,
                 ),
+                GateCmd::Ratify { key, reason, paths, json } => {
+                    gate_cli::ratify(&endpoint, &key, &reason, &paths, json)
+                }
                 GateCmd::Corroborate { escalation_id, stance, argument } => {
                     gate_cli::corroborate(&endpoint, &escalation_id, &stance, argument, asserted_id, &role)
                 }
@@ -1320,11 +1380,12 @@ pub fn run() -> AnyResult<()> {
                 allowed_consumers,
                 consumer_only,
                 present_to,
+                present_audience,
                 present_disclose,
                 present_max_uses,
             } => cmd_vault_add(
                 &home, &name, scope, tag, allowed_consumers, consumer_only,
-                present_to, present_disclose, present_max_uses,
+                present_to, present_audience, present_disclose, present_max_uses,
             ),
             VaultCmd::Remove { name } => cmd_vault_remove(&home, &name),
         },
@@ -1542,9 +1603,41 @@ fn resolve_home(cli: &Cli) -> AnyResult<PathBuf> {
     default_hestia_home().context("could not resolve hestia home directory")
 }
 
+/// Read `$HESTIA_HOME/.passphrase` without putting its value in the daemon environment.
+fn read_passphrase_file(home: &std::path::Path) -> AnyResult<Option<String>> {
+    let path = home.join(".passphrase");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let pp = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if pp.is_empty() {
+        anyhow::bail!("{} is empty", path.display());
+    }
+    Ok(Some(pp))
+}
+
+/// The daemon's passphrase: `HESTIA_PASSPHRASE`, then `$HESTIA_HOME/.passphrase` read
+/// in-process, then the TTY. ONLY `cmd_serve` may call this. The file exists on every
+/// installed seat, so reading it in the shared `prompt_passphrase` let any same-UID
+/// CLI call (`vault get`, `vault remove`, `policy set`) unlock the vault with no env
+/// and no TTY (hestia#1587 hold; pinned by tests/passphrase_file_is_serve_only.rs).
+fn serve_passphrase(home: &std::path::Path, prompt: &str) -> AnyResult<String> {
+    if std::env::var_os("HESTIA_PASSPHRASE").is_none() {
+        if let Some(pp) = read_passphrase_file(home)? {
+            return Ok(pp);
+        }
+    }
+    prompt_passphrase(prompt)
+}
+
 /// Resolve a passphrase. Order:
 /// 1. `HESTIA_PASSPHRASE` env var (for automation; not recommended for daily use)
 /// 2. Prompt the TTY via rpassword
+///
+/// Never reads `.passphrase`: a CLI command needs env or a human (see `serve_passphrase`).
 fn prompt_passphrase(prompt: &str) -> AnyResult<String> {
     if let Ok(pp) = std::env::var("HESTIA_PASSPHRASE") {
         if pp.is_empty() {
@@ -1733,7 +1826,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
             path.display()
         );
     }
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let passphrase = serve_passphrase(home, "Vault passphrase: ")?;
     let vault = hestia::Vault::open(path, passphrase.clone())?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
 
@@ -1842,33 +1935,21 @@ fn cmd_vault_get(home: &std::path::Path, name: &str) -> AnyResult<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_vault_add(
-    home: &std::path::Path,
-    name: &str,
-    scope: Vec<String>,
-    tag: Vec<String>,
-    allowed_consumers: Vec<String>,
+fn vault_rules_for_add(
     consumer_only: bool,
-    present_to: Vec<String>,
-    present_disclose: Option<String>,
+    allowed_consumers: &[String],
+    present_to: &[String],
+    present_audience: Option<&str>,
+    present_disclose: Option<&str>,
     present_max_uses: Option<u32>,
-) -> AnyResult<()> {
+) -> AnyResult<(hestia::vault::rules::ReleaseRule, Option<hestia::vault::rules::PresentationRule>)> {
     use hestia::vault::rules::{Disclosure, PresentationAudience, PresentationRule, ReleaseRule};
 
-    // §7.1 axis 1 — release rule, recorded at issuance. `--consumer-only` is the default rule;
-    // `--consumer x` records an explicit holder set; neither leaves the legacy list to decide.
-    let release = if consumer_only {
-        Some(ReleaseRule::ConsumerOnly)
-    } else if !allowed_consumers.is_empty() {
-        Some(ReleaseRule::Holders { principals: allowed_consumers.clone() })
+    let release = if consumer_only || allowed_consumers.is_empty() {
+        ReleaseRule::ConsumerOnly
     } else {
-        None
+        ReleaseRule::Holders { principals: allowed_consumers.to_vec() }
     };
-
-    // §7.1 axis 2 — presentation rule. Built ONLY when --present-to is given; otherwise it stays
-    // unrecorded, which means "escalate on presentation", which is the safe default we do not
-    // silently overwrite.
     let presentation = if present_to.is_empty() {
         if present_disclose.is_some() || present_max_uses.is_some() {
             anyhow::bail!(
@@ -1878,13 +1959,26 @@ fn cmd_vault_add(
         }
         None
     } else {
-        let audience = if present_to.len() == 1 {
-            PresentationAudience::Fixed { verifier: present_to[0].clone() }
-        } else {
-            PresentationAudience::AnyOf { verifiers: present_to.clone() }
+        let audience = match present_audience {
+            Some("fixed") => {
+                if present_to.len() != 1 {
+                    anyhow::bail!("--present-audience fixed requires exactly one --present-to")
+                }
+                PresentationAudience::Fixed { verifier: present_to[0].clone() }
+            }
+            Some("any-of") => PresentationAudience::AnyOf { verifiers: present_to.to_vec() },
+            Some(other) => anyhow::bail!(
+                "--present-audience must be fixed|any-of, got '{other}'"
+            ),
+            None if present_to.len() == 1 => {
+                PresentationAudience::Fixed { verifier: present_to[0].clone() }
+            }
+            None => anyhow::bail!(
+                "multiple verifiers require --present-audience fixed|any-of; cardinality does not choose the audience mode"
+            ),
         };
-        let disclose = match present_disclose.as_deref() {
-            None | Some("derived") => Disclosure::Derived, // sensible default for a presentable
+        let disclose = match present_disclose {
+            None | Some("derived") => Disclosure::Derived,
             Some("nothing") => Disclosure::Nothing,
             Some("full") => Disclosure::FullSecret,
             Some(other) => anyhow::bail!(
@@ -1893,6 +1987,47 @@ fn cmd_vault_add(
         };
         Some(PresentationRule { audience, disclose, max_uses: present_max_uses })
     };
+    Ok((release, presentation))
+}
+
+/// The `release rule:` line `hestia vault add` prints.
+///
+/// `exposed` is the runtime read condition, not the recorded rule: `tool_vault_get` skips the
+/// consumer check for an empty `allowed_consumers` list (HST-001), and nothing reads `release`
+/// yet. A recorded rule on such a row is intent only, so the line must not read as protection.
+fn release_rule_line(recorded: bool, exposed: bool) -> String {
+    let rule = if recorded { "recorded" } else { "unrecorded (legacy consumer list decides)" };
+    if exposed {
+        format!(
+            "{rule} — NOT ENFORCED: the consumer list is empty, so this entry is EXPOSED \
+             (readable by ANY attributed caller, HST-001); pass --consumer to restrict it"
+        )
+    } else {
+        rule.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_vault_add(
+    home: &std::path::Path,
+    name: &str,
+    scope: Vec<String>,
+    tag: Vec<String>,
+    allowed_consumers: Vec<String>,
+    consumer_only: bool,
+    present_to: Vec<String>,
+    present_audience: Option<String>,
+    present_disclose: Option<String>,
+    present_max_uses: Option<u32>,
+) -> AnyResult<()> {
+    let (release, presentation) = vault_rules_for_add(
+        consumer_only,
+        &allowed_consumers,
+        &present_to,
+        present_audience.as_deref(),
+        present_disclose.as_deref(),
+        present_max_uses,
+    )?;
 
     let mut vault = open_vault(home)?;
     let secret = prompt_secret()?;
@@ -1900,25 +2035,86 @@ fn cmd_vault_add(
         .with_scope(scope)
         .with_tags(tag)
         .with_consumers(allowed_consumers);
-    if let Some(r) = release {
-        entry = entry.with_release_rule(r);
-    }
+    entry = entry.with_release_rule(release);
     if let Some(p) = presentation {
         entry = entry.with_presentation_rule(p);
     }
     let recorded_release = entry.release.is_some();
     let recorded_present = entry.presentation.is_some();
+    let exposed = entry.allowed_consumers.is_empty();
     vault.add(entry)?;
     println!("✓ Added '{name}' to vault");
-    println!(
-        "  release rule:      {}",
-        if recorded_release { "recorded" } else { "unrecorded (legacy consumer list decides)" }
-    );
+    println!("  release rule:      {}", release_rule_line(recorded_release, exposed));
     println!(
         "  presentation rule: {}",
         if recorded_present { "recorded" } else { "UNRECORDED — presenting escalates to you (§7.1)" }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod vault_add_tests {
+    use super::*;
+    use hestia::vault::rules::{PresentationAudience, ReleaseRule};
+
+    #[test]
+    fn no_explicit_consumer_or_presenter_records_consumer_only_without_changing_exposed_runtime() {
+        let (release, presentation) = vault_rules_for_add(false, &[], &[], None, None, None).unwrap();
+        assert_eq!(release, ReleaseRule::ConsumerOnly);
+        assert!(presentation.is_none(), "an unstated presenter escalates rather than publishing");
+        let entry = VaultEntry::new("k", "s")
+            .with_release_rule(release)
+            .with_consumers(Vec::new());
+        assert!(!entry.allows("claude-code"));
+        assert!(!entry.allows("kimi-code"),
+                "allows is deny-all for an empty list, but tool_vault_get releases that row as exposed; the real read control pins the distinction");
+    }
+
+    #[test]
+    fn explicit_consumers_keep_their_exact_legacy_list_outcome() {
+        let consumers = vec!["claude-code".to_string()];
+        let (release, presentation) = vault_rules_for_add(false, &consumers, &[], None, None, None).unwrap();
+        assert_eq!(release, ReleaseRule::Holders { principals: consumers.clone() });
+        assert!(presentation.is_none());
+        let entry = VaultEntry::new("k", "s")
+            .with_release_rule(release)
+            .with_consumers(consumers);
+        assert!(entry.allows("claude-code"));
+        assert!(!entry.allows("kimi-code"));
+    }
+
+    #[test]
+    fn audience_mode_is_explicit_and_capped_fixed_is_not_self_sufficient() {
+        let verifiers = vec!["hub-a".to_string(), "hub-b".to_string()];
+        assert!(vault_rules_for_add(false, &[], &verifiers, None, None, None).is_err());
+        let (_, any_of) = vault_rules_for_add(
+            false, &[], &verifiers, Some("any-of"), None, None,
+        ).unwrap();
+        let any_of = any_of.unwrap();
+        assert!(matches!(any_of.audience, PresentationAudience::AnyOf { .. }));
+        assert!(!any_of.is_self_sufficient());
+
+        let verifier = vec!["github.com".to_string()];
+        let (_, capped) = vault_rules_for_add(
+            false, &[], &verifier, Some("fixed"), None, Some(1),
+        ).unwrap();
+        assert!(!capped.unwrap().is_self_sufficient());
+        let (_, uncapped) = vault_rules_for_add(
+            false, &[], &verifier, Some("fixed"), None, None,
+        ).unwrap();
+        assert!(uncapped.unwrap().is_self_sufficient());
+    }
+
+    #[test]
+    fn an_exposed_add_does_not_report_its_release_rule_as_protection() {
+        let exposed = release_rule_line(true, true);
+        assert!(exposed.contains("EXPOSED"), "an empty consumer list must be named: {exposed}");
+        assert!(exposed.contains("NOT ENFORCED"), "a recorded rule nothing reads is intent only: {exposed}");
+        assert!(release_rule_line(false, true).contains("EXPOSED"));
+        // Negative control: a restricted row gets no exposure warning.
+        assert_eq!(release_rule_line(true, false), "recorded");
+        assert!(!release_rule_line(false, false).contains("EXPOSED"));
+    }
 }
 
 fn cmd_vault_remove(home: &std::path::Path, name: &str) -> AnyResult<()> {
@@ -2377,7 +2573,7 @@ fn cmd_lct_relay(
     let payload = hestia::lct_publish::relay_payload(&value, published_by, chrono::Utc::now())
         .map_err(|e| anyhow::anyhow!("relay refused: {e}"))?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
     println!(
         "Relaying {} to {} (hub {hub_id}) as {published_by} ...",
@@ -2483,7 +2679,7 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
     }
     let conn = conn_snapshot.expect("send path always has a connection");
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
 
     println!(
@@ -2951,7 +3147,7 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
     let hub_id = conn.hub_lct_id;
     let our_lct = conn.our_lct_id;
     let url = conn.url.clone();
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
 
     println!("Pushing {} field(s) to {} ...", fields.len(), url);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -2990,14 +3186,8 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
 }
 
 /// Resolve a possibly-relative rest endpoint against the connection base URL.
-fn abs_rest(base_url: &str, rest: &str) -> String {
-    if rest.starts_with("http://") || rest.starts_with("https://") {
-        rest.to_string()
-    } else if rest.is_empty() {
-        format!("{}/v1", base_url.trim_end_matches('/'))
-    } else {
-        format!("{}{}", base_url.trim_end_matches('/'), rest)
-    }
+fn abs_rest(base_url: &str, rest: &str) -> AnyResult<String> {
+    hestia::hub::absolute_rest_endpoint(base_url, rest)
 }
 
 /// Resolve the hub connection to operate on (sole connection, or by url/uuid).
@@ -3030,7 +3220,7 @@ fn cmd_hub_pair_request(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3078,7 +3268,7 @@ fn cmd_hub_pair_confirm(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3147,7 +3337,7 @@ fn cmd_hub_pair_revoke(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3208,7 +3398,7 @@ fn cmd_hub_send_secret(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3270,7 +3460,7 @@ fn cmd_hub_recv_secrets(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -3528,15 +3718,19 @@ fn cmd_hub_notify(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
-    // Peer: accept a raw LCT uuid, else resolve the display name via the hub roster.
+    let channel = rt
+        .block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
+        .context("opening sealed channel to hub")?;
+
+    // Peer: accept a raw LCT uuid, else resolve the display name through the sealed hub roster.
     let peer_lct: uuid::Uuid = match uuid::Uuid::parse_str(peer) {
         Ok(u) => u,
         Err(_) => rt
-            .block_on(client.resolve_member_by_name(&conn.url, peer))
+            .block_on(client.resolve_member_by_name(&rest, &channel, &keypair, conn.our_lct_id, peer))
             .with_context(|| format!("resolving peer '{peer}' via hub roster"))?,
     };
 
@@ -3550,11 +3744,8 @@ fn cmd_hub_notify(
         "content_hash": content_hash,
     });
 
-    // Seal {tool: referenced_act, args} on a fresh channel and POST. channel_query
+    // Seal {tool: referenced_act, args} on the same channel and POST. channel_query
     // adds the nonce + issued_at freshness fields and opens the sealed response.
-    let channel = rt
-        .block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
-        .context("opening sealed channel to hub")?;
     let out = rt
         .block_on(client.channel_query(
             &rest, &channel, &keypair, conn.our_lct_id, "referenced_act", args,
@@ -3603,7 +3794,7 @@ fn cmd_hub_notifications(home: &std::path::Path, target: &str) -> AnyResult<()> 
         // Per-hub isolation: one unreachable hub must not drop the others' notices.
         let drained = (|| -> AnyResult<serde_json::Value> {
             let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-            let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+            let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
             let channel = rt.block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))?;
             rt.block_on(client.channel_query(
                 &rest, &channel, &keypair, conn.our_lct_id, "notifications", serde_json::json!({}),
@@ -3692,7 +3883,7 @@ fn cmd_receiver_bind(
         .context("resolving receiver mailbox credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint)?;
 
     // Verify both halves NOW; drain re-verifies them every pass.
     let discovered = rt.block_on(client.discover(&template.url))
@@ -3809,7 +4000,7 @@ fn cmd_receiver_router_join(
 
     let hubs = HubStore::load(&vault)?;
     let template = pick_connection(&hubs, target)?;
-    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint)?;
 
     let mut memberships = RouterMembershipStore::load(&vault)?;
     let existing = memberships
@@ -4010,7 +4201,7 @@ fn cmd_receiver_router_bind(
         .context("resolving router interface credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint)?;
     let discovered = rt.block_on(client.discover(&template.url))
         .context("re-discovering Hub before router interface bind")?;
     anyhow::ensure!(
@@ -4157,7 +4348,7 @@ fn cmd_receiver_router_certify(
         "router certificate endpoint advertises Hub {}, expected {}",
         discovered.hub_lct_id, membership.hub_lct_id
     );
-    let rest = abs_rest(&membership.hub_url, &membership.rest_endpoint);
+    let rest = abs_rest(&membership.hub_url, &membership.rest_endpoint)?;
     let pinned = rt.block_on(client.resolve_member_pubkey(
         &rest,
         membership.hub_lct_id,
@@ -4266,7 +4457,7 @@ fn cmd_receiver_neighbor(
         .context("resolving local router interface credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+    let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint)?;
     let ours = rt.block_on(
         client.resolve_member_pubkey(&rest, iface.hub_lct_id, iface.hub_member_lct)
     ).with_context(|| format!("resolving local Hub pin for {}", iface.hub_member_lct))?;
@@ -4448,7 +4639,7 @@ fn receiver_cutover_preflight(
                                 table.router_ingress_by_id(n.interface_binding_id)
                             {
                                 let client = HubClient::new();
-                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint)?;
                                 let runtime = tokio::runtime::Runtime::new();
 
                                 // Peer proof: dual signatures + exact routing
@@ -5108,25 +5299,95 @@ fn open_witnessed_chain(
     Ok(chain)
 }
 
-fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
+fn chain_snapshot(home: &std::path::Path) -> AnyResult<(Vault, tempfile::TempDir, hestia::storage::SqliteChainStore)> {
     let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let key = hestia::storage::storage_key(home, &passphrase)
         .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
     // An exclusively created, owner-only directory (Codex review of #1322): never adopt a
     // predictable pre-existing path, which a planted symlink could point at the live chain.
-    // Dropping `tmp` removes only the directory this call created.
     let tmp = tempfile::Builder::new()
         .prefix("hestia-chain-verify-")
         .tempdir()
         .context("creating private snapshot dir")?;
     let copy = tmp.path().join("witness.db");
-    let v = (|| -> AnyResult<hestia::storage::ChainVerification> {
-        hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
-            .context("snapshotting the witness chain")?;
-        let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
-        store.verify_chain()
-    })()?;
-    drop(tmp);
+    hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
+        .context("snapshotting the witness chain")?;
+    let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
+    Ok((vault, tmp, store))
+}
+
+fn cmd_chain_export(home: &std::path::Path, from: u64, to: u64) -> AnyResult<()> {
+    let (vault, _snapshot, store) = chain_snapshot(home)?;
+    let society = hestia::sovereign::Sovereign::persisted_lct_id(&vault)
+        .context("cannot export a segment without a persisted society LCT")?;
+    let segment = store.export_segment(from, to, &society)?;
+    println!("{}", serde_json::to_string_pretty(&segment)?);
+    Ok(())
+}
+
+const MAX_CHAIN_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn cmd_chain_verify(
+    home: &std::path::Path,
+    segment: Option<&std::path::Path>,
+    trusted_witness_key: Vec<String>,
+    expect_chain_id: Option<String>,
+    expect_previous_hash: Option<String>,
+    expect_end_hash: Option<String>,
+) -> AnyResult<()> {
+    if let Some(path) = segment {
+        let bytes = std::fs::metadata(path)
+            .with_context(|| format!("reading chain segment metadata {}", path.display()))?
+            .len();
+        anyhow::ensure!(
+            bytes <= MAX_CHAIN_SEGMENT_BYTES,
+            "chain segment is {bytes} bytes, exceeding the {MAX_CHAIN_SEGMENT_BYTES}-byte limit"
+        );
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading chain segment {}", path.display()))?;
+        let segment: hestia::storage::ChainSegment = match serde_json::from_str(&raw) {
+            Ok(segment) => segment,
+            Err(e) => {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "unverifiable",
+                    "checked_entries": 0,
+                    "tampered": [],
+                    "unverifiable": [format!("invalid segment JSON: {e}")],
+                    "limitations": [
+                        "complete capture and non-bypass of the gate are not established",
+                        "truthful event semantics and key custody are not established (A1)",
+                    ],
+                }))?);
+                anyhow::bail!("chain segment is unverifiable");
+            }
+        };
+        let anchor = hestia::storage::ChainSegmentTrustAnchor {
+            chain_id: expect_chain_id,
+            previous_hash: expect_previous_hash,
+            end_hash: expect_end_hash,
+            trusted_witness_keys: trusted_witness_key.into_iter().collect(),
+        };
+        let has_anchor = anchor.chain_id.is_some()
+            || anchor.previous_hash.is_some()
+            || anchor.end_hash.is_some()
+            || !anchor.trusted_witness_keys.is_empty();
+        let report = hestia::storage::verify_chain_segment_with_anchor(
+            &segment,
+            has_anchor.then_some(&anchor),
+        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        anyhow::ensure!(
+            report.is_valid(),
+            "chain segment verification FAILED (status={:?}, tampered={}, unverifiable={})",
+            report.status,
+            report.tampered.len(),
+            report.unverifiable.len()
+        );
+        return Ok(());
+    }
+
+    let (vault, _snapshot, store) = chain_snapshot(home)?;
+    let v = store.verify_chain()?;
     let sovereign = hestia::sovereign::Sovereign::persisted_lct_id(&vault);
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "link_intact": v.link_intact(),
@@ -5287,7 +5548,7 @@ fn cmd_constellation_add_remote(
     // the peer's acts against, and the same one `cosign-serve` signs with. Taking
     // it from here rather than from the peer means the peer publishes nothing —
     // there is no CLI that prints a member's own pubkey.
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let pubkey = rt
@@ -5404,7 +5665,7 @@ fn cmd_constellation_enroll(
     let hub_store = HubStore::load(&vault)?;
     let conn = pick_connection(&hub_store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -5430,7 +5691,7 @@ fn cmd_constellation_revoke_device(
     let hub_store = HubStore::load(&vault)?;
     let conn = pick_connection(&hub_store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(client.revoke_device(&rest, conn.hub_lct_id, conn.our_lct_id, &keypair, device))
@@ -5444,7 +5705,7 @@ fn cmd_constellation_enrolled(home: &std::path::Path, target: &str) -> AnyResult
     let vault = open_vault(home)?;
     let hub_store = HubStore::load(&vault)?;
     let conn = pick_connection(&hub_store, target)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let resp = rt.block_on(client.list_enrolled_devices(&rest, conn.hub_lct_id, conn.our_lct_id))
@@ -5524,7 +5785,7 @@ fn cmd_constellation_present(
         }
     }
 
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let pair_id = uuid::Uuid::new_v4();
@@ -5588,7 +5849,7 @@ fn cmd_constellation_present_remote(home: &std::path::Path, target: &str) -> Any
         store.save(&mut vault)?;
     }
     let roster: Vec<uuid::Uuid> = store.members.iter().map(|m| m.lct_id).collect();
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
@@ -5721,7 +5982,7 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
     let conn = pick_connection(&hub_store, target)?;
     let member_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
     let my_lct = conn.our_lct_id; // the identity the owner enrolled + pairs against
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
@@ -6093,7 +6354,7 @@ fn cmd_hub_connect(home: &std::path::Path, url: &str) -> AnyResult<()> {
         api_version,
         // Discovery may advertise a relative rest path (e.g. "/v1"); store it
         // absolute so request builders always have a base.
-        rest_endpoint: abs_rest(url, &info.endpoints.rest),
+        rest_endpoint: abs_rest(url, &info.endpoints.rest)?,
         hubs_joined: vec![],
         member_key_source: Default::default(),
     };
@@ -6180,25 +6441,7 @@ fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
 fn ensure_member_identity(
     vault: &mut Vault,
 ) -> AnyResult<(uuid::Uuid, web4_core::crypto::KeyPair)> {
-    if let (Some(lct_e), Some(sec_e)) = (vault.get("ai_identity_lct_id"), vault.get("ai_identity_secret")) {
-        let lct = uuid::Uuid::parse_str(&lct_e.secret)
-            .context("ai_identity_lct_id is not a UUID")?;
-        let bytes = hex_to_32(&sec_e.secret)
-            .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
-        return Ok((lct, web4_core::crypto::KeyPair::from_secret_bytes(&bytes)));
-    }
-
-    // Provision a fresh member identity.
-    let kp = web4_core::crypto::KeyPair::generate();
-    let lct = uuid::Uuid::new_v4();
-    let secret_hex: String = kp.secret_key_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    vault.add(VaultEntry::new("ai_identity_lct_id", lct.to_string())
-        .with_tags(vec!["identity".into()]))?;
-    vault.add(VaultEntry::new("ai_identity_pubkey", kp.verifying_key().to_hex())
-        .with_tags(vec!["identity".into()]))?;
-    vault.add(VaultEntry::new("ai_identity_secret", secret_hex)
-        .with_tags(vec!["identity".into(), "secret".into()]))?;
-    Ok((lct, kp))
+    hestia::hub::ensure_member_identity(vault)
 }
 
 fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> AnyResult<()> {
@@ -6213,7 +6456,7 @@ fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> A
             "not connected to {target} — run `hestia hub connect <url>` first"
         ))?;
         let c = &store.connections[pos];
-        (pos, c.hub_lct_id, abs_rest(&c.url, &c.rest_endpoint), c.url.clone())
+        (pos, c.hub_lct_id, abs_rest(&c.url, &c.rest_endpoint)?, c.url.clone())
     };
 
     let (member_lct, keypair) = ensure_member_identity(&mut vault)?;
@@ -6552,4 +6795,65 @@ mod member_key_source_tests {
 
     // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
+}
+
+#[cfg(test)]
+mod passphrase_file_tests {
+    use super::read_passphrase_file;
+
+    #[test]
+    fn a_missing_file_is_not_a_source_and_crlf_is_only_a_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_passphrase_file(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join(".passphrase"), " value with spaces \r\n").unwrap();
+        assert_eq!(
+            read_passphrase_file(dir.path()).unwrap().as_deref(),
+            Some(" value with spaces ")
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".passphrase"), "\r\n").unwrap();
+        let error = read_passphrase_file(dir.path()).unwrap_err().to_string();
+        assert!(error.contains(".passphrase") && error.contains("empty"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod gate_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn gate_help_distinguishes_governance_escalations_from_scope_requests() {
+        let mut gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let mut bytes = Vec::new();
+        gate.write_long_help(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("governance-write"), "{text}");
+        assert!(text.contains("hestia_request_scope"), "{text}");
+        assert!(!text.contains("on every refusal"), "{text}");
+        // Since dp 2026-11-05 the deny names a refusal id and the refused member's
+        // remedy is `gate escalate`; approve is the decider's verb, and it exists.
+        assert!(text.contains("hestia gate escalate <refusal_id>"), "{text}");
+        assert!(!text.contains("never written"), "{text}");
+    }
+
+    #[test]
+    fn gate_short_about_does_not_claim_every_deny_names_it() {
+        // `hestia --help` prints the `about` line in the command list, so the
+        // every-refusal claim must be absent there too, not only in long help.
+        let gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let about = gate.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(!about.contains("every gate deny"), "{about}");
+        assert!(about.contains("escalate"), "{about}");
+    }
 }

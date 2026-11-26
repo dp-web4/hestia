@@ -20,8 +20,9 @@
 //! — accountable disagreement, not obedience):
 //! - deny        = `policy_decision{decision:"deny", enforced:true}` for the grain.
 //! - retry-after-deny (score 0.0): within `RETRY_WINDOW` of a deny, another
-//!   policy_decision from the SAME session with the same tool AND matching
-//!   payload hash / target — re-running the blocked act instead of adapting.
+//!   policy_decision from the SAME session with the same tool, complete unredacted
+//!   `attempted` on both sides, AND an exact command, payload hash, or non-shell
+//!   resource-shaped target match.
 //! - comply-after-deny (score 0.85): a deny with no retry match in the window.
 //!   ABOVE the medium/high boundary (0.7) on purpose (dp, 2026-07-26). At 0.7 a member
 //!   that ALWAYS complied asymptoted to exactly the threshold and could never read
@@ -343,6 +344,57 @@ pub fn scan_window_with(
     out
 }
 
+/// The same derivation window, bounded by the member and its witnessed aliases rather than
+/// by unrelated traffic elsewhere on the chain.
+pub fn scan_subject_window(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+) -> Vec<ChainEntry> {
+    scan_subject_window_with(chain_store, plugin_id, DERIVATION_HOT_SCAN, DERIVATION_GOVERNANCE_SCAN)
+}
+
+pub fn scan_subject_window_with(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+    hot_scan: u64,
+    governance_scan: u64,
+) -> Vec<ChainEntry> {
+    let mut aliases = match chain_store.scan_recent(
+        None,
+        Some(&[IDENTITY_ALIAS_EVENT]),
+        ALIAS_SCAN,
+        project_row,
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("derivation alias chain read failed: {e}");
+            Vec::new()
+        }
+    };
+    let alias_refs: Vec<&ChainEntry> = aliases.iter().collect();
+    let identities = aliased_identities(plugin_id, &alias_refs);
+    let subject_ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+    let scan = |types: &[&str], limit: u64, label: &str| -> Vec<ChainEntry> {
+        match chain_store.scan_subjects_recent(&subject_ids, None, types, limit, project_row) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("derivation {label} subject read failed: {e}");
+                Vec::new()
+            }
+        }
+    };
+    let mut out = scan(
+        DERIVATION_GOVERNANCE_EVENT_TYPES,
+        governance_scan,
+        "governance",
+    );
+    out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    out.append(&mut aliases);
+    out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    out.dedup_by_key(|e| e.chain_position);
+    out
+}
+
 /// How many alias records a read takes: a FINITE BOUND, not "all of them".
 ///
 /// Said plainly because the prose around this repair says "no window", and that means no
@@ -394,6 +446,22 @@ pub fn project_row(r: crate::storage::chain::ChainRowRef<'_>) -> Option<ChainEnt
 
 fn entry_str<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
     e.event_data.get(key).and_then(Value::as_str)
+}
+
+/// The one deny-reference rule (#610 review), so a legacy prefix credits here exactly when the
+/// queue and the ruling path treat it as the same deny.
+fn deny_hash_compatible(recorded: &str, full_hash: &str) -> bool {
+    crate::storage::chain::deny_refs_agree(recorded, full_hash)
+}
+
+fn entry_feedback_act(e: &ChainEntry) -> Option<&str> {
+    e.event_data.get("feedback")?.get("act")?.as_str().filter(|act| !act.is_empty())
+}
+
+/// The producer's word that `feedback.act` digests the unmasked, unbounded attempt
+/// (`handler::act_exact_of`). Only an explicit `true` counts.
+fn entry_act_exact(e: &ChainEntry) -> bool {
+    e.event_data.get("act_exact").and_then(Value::as_bool) == Some(true)
 }
 
 /// Derive temperament + collect adjudication evidence for one grain from a
@@ -692,17 +760,60 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             entry_str(deny, "payload_sha256").unwrap_or(""),
             entry_str(deny, "target").unwrap_or(""),
         );
-        let retried = entries.iter().any(|e| {
+        let denied_cmd = entry_str(deny, "attempted").unwrap_or_default();
+        // `feedback.act` digests the WHOLE attempt, so truncation of the row's display text is
+        // harmless on that branch — but it digests the REDACTED attempt (`act_digest`: "never a
+        // proof"), so a redacted attempt on either side is no identity there either (NOVA's hold
+        // on 774053993). The display text cannot show a mask past its cut, so the producer
+        // records `act_exact` over the whole input and the digest counts only when both rows
+        // say true (NOVA's re-review of 7c73d48c9).
+        let unredacted_act_text = |text: &str| {
+            !text.trim_end().is_empty() && !text.contains("[REDACTED —") && !text.contains("***")
+        };
+        let complete_act_text = |text: &str| {
+            let text = text.trim_end();
+            unredacted_act_text(text)
+                && !text.contains('…')
+                && !text.ends_with("...")
+        };
+        let denied_unredacted = unredacted_act_text(denied_cmd);
+        let denied_complete = complete_act_text(denied_cmd);
+        let shell_tool = deny_sig.1.eq_ignore_ascii_case("bash")
+            || deny_sig.1.eq_ignore_ascii_case("shell");
+        let retried = entries.iter().copied().find(|e| {
             e.chain_position > deny.chain_position
                 && e.timestamp <= window_end
                 && e.event_type == "policy_decision"
                 && is_grain(e)
                 && entry_str(e, "session_id").unwrap_or("") == deny_sig.0
                 && entry_str(e, "tool_name").unwrap_or("") == deny_sig.1
-                && ((!deny_sig.2.is_empty()
-                    && entry_str(e, "payload_sha256").unwrap_or("") == deny_sig.2)
-                    || (!deny_sig.3.is_empty()
-                        && entry_str(e, "target").unwrap_or("") == deny_sig.3))
+                && {
+                    let attempted = entry_str(e, "attempted").unwrap_or_default();
+                    let target = entry_str(e, "target").unwrap_or_default();
+                    match (entry_feedback_act(deny), entry_feedback_act(e)) {
+                        // Two whole-act digests that differ are two acts, whatever else agrees.
+                        (Some(a), Some(b)) if a != b => false,
+                        // Equal digests are identity only when BOTH producers said nothing was
+                        // masked or bounded anywhere in the whole input (`act_exact`). False or
+                        // absent (a row before the flag) falls through to the display-text branch
+                        // below, which only an untruncated, unmasked `attempted` can pass.
+                        (Some(_), Some(_))
+                            if entry_act_exact(deny) && entry_act_exact(e) =>
+                        {
+                            denied_unredacted && unredacted_act_text(attempted)
+                        }
+                        _ => denied_complete
+                            && complete_act_text(attempted)
+                            && (attempted == denied_cmd
+                                || (!deny_sig.2.is_empty()
+                                    && entry_str(e, "payload_sha256").unwrap_or("") == deny_sig.2)
+                                || (!shell_tool
+                                    && complete_act_text(deny_sig.3)
+                                    && complete_act_text(target)
+                                    && deny_sig.3.contains('/')
+                                    && target == deny_sig.3)),
+                    }
+                }
         });
         // Ask/appeal-after-deny (1.0): a witnessed `appeal` event referencing
         // this deny's hash — challenging the boundary through the accountable
@@ -711,15 +822,22 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         // disagreement, not obedience).
         let appealed = entries.iter().any(|e| {
             e.event_type == "appeal"
-                && entry_str(e, "deny_hash") == Some(deny.hash.as_str())
+                && entry_str(e, "deny_hash")
+                    .is_some_and(|recorded| deny_hash_compatible(recorded, &deny.hash))
                 && is_grain(e)
         });
         // RECAST-AFTER-DENY — the gap kimi named, and the half that still selected for
         // the thing it was meant to discourage.
         //
-        // `retried` only matches another POLICY_DECISION carrying the same payload hash. A
-        // route-around produces a successful OUTCOME with a different hash, so it could
-        // never match and fell through to comply-after-deny 0.85 — the TOP of the
+        // `retried` requires unredacted `attempted` on both decisions. With `feedback.act` and
+        // `act_exact: true` on both, equal whole-attempt digests are the identity (a long verbatim retry's display
+        // text is truncated, its digest is not); otherwise `attempted` must also be untruncated,
+        // and identity is corroborated by exact command, payload hash, or a non-shell
+        // resource-shaped target.
+        // Shell targets are bounded commands, not resources; bounded/redacted identity is no
+        // identity at all. A route-around produces a successful OUTCOME rather than a matching
+        // POLICY_DECISION,
+        // so it could never match and fell through to comply-after-deny 0.85 — the TOP of the
         // compliance band. Measured on this chain: a peer was denied a chained
         // delete-and-recreate under /tmp and reached the same end with `mktemp -d` nine
         // seconds later, and scored 0.85 for it.
@@ -740,7 +858,6 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         // commands so an adjudicator can read what happened, and an exoneration can
         // overturn it. The point is to make a recast DISTINGUISHABLE in the record, not to
         // convict it: today the record cannot tell it from compliance at all.
-        let denied_cmd = entry_str(deny, "attempted").unwrap_or_default();
         let denied_tokens = resource_tokens(denied_cmd);
         let recast: Option<&ChainEntry> = if denied_tokens.is_empty() {
             None // no `attempted` recorded (older entries, or a gate that does not send it)
@@ -784,7 +901,8 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             && entries.iter().any(|e| {
                 e.event_type == "adjudication"
                     && is_member(entry_str(e, "subject_plugin_id"))
-                    && entry_str(e, "about_deny_hash") == Some(deny.hash.as_str())
+                    && entry_str(e, "about_deny_hash")
+                        .is_some_and(|recorded| deny_hash_compatible(recorded, &deny.hash))
                     && e.event_data
                         .get("upheld")
                         .and_then(Value::as_bool)
@@ -871,7 +989,7 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         } else if appealed {
             (0.85, "appeal-filed 0.85 (complied AND disputed; the extra credit waits for an \
                     arbiter — filing alone is self-assertion)")
-        } else if retried {
+        } else if retried.is_some() {
             (0.0, "retry-after-deny 0.0 (re-ran the blocked act)")
         } else if recast.is_some() {
             // Below the 0.5 prior, so it lowers trust rather than merely failing to raise
@@ -889,16 +1007,22 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             event_type: deny.event_type.clone(),
             timestamp: deny.timestamp,
             contribution: label.to_string(),
-            reference: match recast {
+            reference: match (retried, recast) {
                 // Name BOTH sides: the score is only defensible if a reader can see what
                 // was denied and what ran instead, and decide for themselves.
-                Some(r) => Some(format!(
+                (Some(r), _) => Some(format!(
+                    "denied: {} | then #{} retried: {}",
+                    denied_cmd.chars().take(90).collect::<String>(),
+                    r.chain_position,
+                    entry_str(r, "attempted").unwrap_or("").chars().take(90).collect::<String>()
+                )),
+                (None, Some(r)) => Some(format!(
                     "denied: {} | then #{} succeeded: {}",
                     denied_cmd.chars().take(90).collect::<String>(),
                     r.chain_position,
                     entry_str(r, "target").unwrap_or("").chars().take(90).collect::<String>()
                 )),
-                None => entry_str(deny, "reason").map(|r| r.chars().take(120).collect()),
+                (None, None) => entry_str(deny, "reason").map(|r| r.chars().take(120).collect()),
             },
         });
     }
@@ -1446,6 +1570,240 @@ mod tests {
         assert_eq!(positions, desc, "merged window must stay chain_position DESC");
     }
 
+    #[test]
+    fn a_subject_window_excludes_other_members_floods() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        for plugin_id in ["kimi-code", "kimi-code"] {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": plugin_id, "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+        for _ in 0..40 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+
+        let old = store.scan_recent(
+            None,
+            Some(DERIVATION_GOVERNANCE_EVENT_TYPES),
+            2,
+            project_row,
+        ).unwrap();
+        assert!(old.iter().all(|event| {
+            event.event_data.get("plugin_id").and_then(Value::as_str) == Some("codex")
+        }), "control: the peer flood must fill the global read");
+
+        let subject = scan_subject_window_with(&store, "kimi-code", 2, 2);
+        assert_eq!(subject.len(), 2);
+        assert!(subject.iter().all(|event| {
+            event.event_data.get("plugin_id").and_then(Value::as_str) == Some("kimi-code")
+        }));
+    }
+
+    #[test]
+    fn a_subject_window_keeps_member_evidence_when_the_global_budget_binds() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-code", "decision": "allow", "evidence": "older"}),
+            "lct:test",
+        ).unwrap();
+        for _ in 0..3 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+        store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-code", "decision": "allow", "evidence": "recent"}),
+            "lct:test",
+        ).unwrap();
+        for _ in 0..3 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+
+        let global = scan_window_with(&store, 2, 4);
+        let subject = scan_subject_window_with(&store, "kimi-code", 2, 4);
+        let member_positions = |window: &[ChainEntry]| {
+            window.iter().filter(|event| {
+                event.event_data.get("plugin_id").and_then(Value::as_str) == Some("kimi-code")
+            }).map(|event| event.chain_position).collect::<Vec<_>>()
+        };
+        let global_positions = member_positions(&global);
+        let subject_positions = member_positions(&subject);
+        assert_eq!(global_positions, vec![4], "the global budget must bind for this control");
+        assert_eq!(subject_positions, vec![4, 0]);
+        assert!(global_positions.iter().all(|position| subject_positions.contains(position)));
+    }
+
+    #[test]
+    fn a_subject_window_preserves_alias_and_global_invalidation_evidence() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        store.append(
+            IDENTITY_ALIAS_EVENT,
+            json!({"alias": "kimi-cli", "alias_of": "kimi-code"}),
+            "lct:test",
+        ).unwrap();
+        let deny = store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-cli", "decision": "deny", "enforced": true}),
+            "lct:test",
+        ).unwrap();
+        store.append(
+            "amnesty",
+            json!({"data": {"class": "deny", "before_position": 0}}),
+            "lct:test",
+        ).unwrap();
+        store.append(
+            "exoneration",
+            json!({"requested_by": {"plugin_id": "codex"}, "data": {"deny_hash": deny.hash}}),
+            "lct:test",
+        ).unwrap();
+
+        let window = scan_subject_window_with(&store, "kimi-code", 10, 10);
+        for event_type in ["identity_alias", "amnesty", "exoneration"] {
+            assert!(window.iter().any(|event| event.event_type == event_type));
+        }
+        let derived = derive_evidence("kimi-code", "role:constellation:member", &window);
+        assert_eq!(derived.temperament.observations, 0);
+        assert_eq!(derived.temperament.evidence.len(), 1);
+        assert!(derived.temperament.evidence[0].contribution.contains("EXCLUDED — exonerated"));
+    }
+
+    #[test]
+    fn subject_window_matches_global_fold_on_frozen_multi_member_corpus() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, [7u8; 32]).unwrap();
+        let tamper = |sql: &str| {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", hex::encode([7u8; 32])).unwrap();
+            conn.execute_batch(sql)
+        };
+        let append = |event_type: &str, data: serde_json::Value| {
+            store.append(event_type, data, "lct:test").unwrap()
+        };
+        append(IDENTITY_ALIAS_EVENT, json!({"alias": "kimi-cli", "alias_of": "kimi-code"}));
+        let deny = append("policy_decision", json!({
+            "plugin_id": "kimi-cli", "decision": "deny", "enforced": true,
+            "session_id": "s-kimi", "tool_name": "Bash", "target": "/tmp/x",
+            "payload_sha256": "p1", "attempted": "Bash: x"
+        }));
+        append("outcome", json!({
+            "plugin_id": "kimi-cli", "success": true, "session_id": "s-kimi",
+            "tool_name": "Bash", "target": "/tmp/x", "payload_sha256": "p1"
+        }));
+        append("appeal", json!({
+            "plugin_id": "kimi-code", "deny_hash": deny.hash.clone(), "reason": "data, not act"
+        }));
+        append("adjudication", json!({
+            "subject_plugin_id": "kimi-code", "subject_role": "role:constellation:member",
+            "about_deny_hash": deny.hash.clone(), "upheld": true,
+            "adjudicator": "codex", "rationale": "the deny confused data with execution",
+            "axis": "validity", "verdict": "upheld", "score": 1.0, "method": "peer-review"
+        }));
+        let other_deny = append("policy_decision", json!({
+            "plugin_id": "codex", "decision": "deny", "enforced": true,
+            "session_id": "s-codex", "tool_name": "Read", "target": "/tmp/y"
+        }));
+        append("outcome", json!({
+            "plugin_id": "codex", "success": true, "session_id": "s-codex",
+            "tool_name": "Read", "target": "/tmp/y"
+        }));
+        append("scope_attestation", json!({
+            "data": {"plugin_id": "kimi-code", "requested_by": {"plugin_id": "kimi-code"},
+                     "attested_by": "hestia-gate", "allows": 4, "denies": 0, "score": 1.0}
+        }));
+        append("scope_attestation", json!({
+            "requested_by": {"plugin_id": "codex"},
+            "data": {"plugin_id": "codex", "subject_plugin_id": "kimi-code",
+                     "attested_by": "plugin-gate:codex", "allows": 2, "denies": 1, "score": 0.85}
+        }));
+        append("amnesty", json!({"data": {"class": "deny", "before_position": 0}}));
+        append("exoneration", json!({
+            "requested_by": {"plugin_id": "kimi-code"},
+            "data": {"deny_hash": other_deny.hash.clone(), "ref": "frozen-corpus-proof"}
+        }));
+        append("unrelated", json!({"plugin_id": "kimi-code", "ignored": true}));
+        append("policy_decision", json!({
+            "plugin_id": "kimi-code", "decision": "allow",
+            "data": {"plugin_id": "codex", "subject_plugin_id": "kimi-code"},
+            "requested_by": {"plugin_id": "claude-code"}
+        }));
+        append(IDENTITY_ALIAS_EVENT, json!({"alias": "kimi-cli", "alias_of": "kimi-code"}));
+        append("outcome", json!({"data": {"plugin_id": "kimi-code", "success": true}}));
+        append("policy_decision", json!({"plugin_id": "claude-code", "decision": "allow"}));
+
+        let normalize = |plugin_id: &str, role_lct: &str, window: &[ChainEntry]| {
+            let mut value = serde_json::to_value(derive_evidence(plugin_id, role_lct, window)).unwrap();
+            value.as_object_mut().unwrap().remove("generated_at");
+            value
+        };
+        let assert_parity = |store: &SqliteChainStore| {
+            let global = scan_window_with(store, 1_000, 1_000);
+            for (plugin_id, role) in [
+                ("kimi-code", "role:constellation:member"),
+                ("kimi-code", "role:constellation:interactive-dev"),
+                ("kimi-cli", "role:constellation:member"),
+                ("codex", "role:constellation:member"),
+                ("claude-code", "role:constellation:member"),
+            ] {
+                let subject = scan_subject_window_with(store, plugin_id, 1_000, 1_000);
+                assert_eq!(
+                    normalize(plugin_id, role, &global),
+                    normalize(plugin_id, role, &subject),
+                    "subject/global derivation mismatch for {plugin_id} / {role}"
+                );
+                assert_eq!(
+                    alias_target(plugin_id, &global),
+                    alias_target(plugin_id, &subject),
+                    "alias mismatch for {plugin_id}"
+                );
+            }
+        };
+        assert_parity(&store);
+
+        // Position, not timestamp order, is the backfill contract. Both reads must see the
+        // same evidence even when the fixture's timestamps are deliberately out of order.
+        tamper(
+            "UPDATE chain_entries SET timestamp = '2027-01-01T00:00:00Z' WHERE chain_position = 1;
+             UPDATE chain_entries SET timestamp = '2026-01-01T00:00:00Z' WHERE chain_position = 2;",
+        ).unwrap();
+        assert_parity(&store);
+
+        // Force a complete restart rebuild and prove it does not duplicate or lose evidence.
+        tamper(
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';",
+        ).unwrap();
+        drop(store);
+        let store = SqliteChainStore::open(&path, [7u8; 32]).unwrap();
+        assert_parity(&store);
+
+        let window = scan_window_with(&store, 1_000, 1_000);
+        let derived = derive_evidence("kimi-code", "role:constellation:member", &window);
+        assert!(derived.temperament.observations > 0, "the frozen corpus must exercise conduct");
+        assert!(derived.validity.observations > 0, "the frozen corpus must exercise adjudication");
+    }
+
     /// A merge the operator performed must STAY performed (agent-lifecycle PRD R6).
     ///
     /// The alias rode in the governance budget, which it shares with `policy_decision` -- one
@@ -1733,7 +2091,8 @@ mod tests {
         let role = "role:constellation:interactive-dev";
         let deny = |pos, min, sid| entry(pos, min, "policy_decision", json!({
             "decision":"deny","enforced":true,"plugin_id":"kimi-code","role_lct":role,
-            "session_id":sid,"tool_name":"Bash","payload_sha256":"abc","target":""}));
+            "session_id":sid,"tool_name":"Bash","payload_sha256":"abc","target":"git",
+            "attempted":"git status"}));
         // deny with NO retry -> comply 0.85
         let w1 = vec![deny(1, 0, "s1")];
         let d1 = derive("kimi-code", role, &w1);
@@ -2018,7 +2377,7 @@ mod recast_tests {
     //! The scoring inversion kimi named: the conduct scale could not tell coherence from
     //! sophisticated defection, and paid better for the latter.
     //!
-    //!   retry-after-deny   0.00  re-ran the blocked act (same payload)
+    //!   retry-after-deny   0.00  re-ran the blocked act (corroborated act identity)
     //!   recast-after-deny  0.35  a DIFFERENT command reached the denied resource
     //!   comply-after-deny  0.85  adapted and moved on
     //!   appeal-after-deny  1.00  challenged the boundary through the witnessed channel
@@ -2205,5 +2564,189 @@ mod recast_tests {
             ok(2, 1, RECAST),
         ];
         assert!(score(&w) > 0.5, "no attempted => not assessable as a recast");
+    }
+
+    fn retry_policy_for_tool(tool_name: &str, pos: u64, attempted: &str, target: &str,
+                             payload_sha256: &str) -> ChainEntry {
+        ev(pos, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"m","role_lct":ROLE,
+            "session_id":"s1","tool_name":tool_name,"payload_sha256":payload_sha256,
+            "target":target,"attempted":attempted}))
+    }
+
+    fn retry_policy(pos: u64, attempted: &str, target: &str, payload_sha256: &str) -> ChainEntry {
+        retry_policy_for_tool("Bash", pos, attempted, target, payload_sha256)
+    }
+
+    #[test]
+    fn retried_ignores_bare_verb_collisions() {
+        let denied = retry_policy(1, DENIED, "cd", "");
+        let different = retry_policy(2, "cd /tmp && git status", "cd", "");
+
+        let d = derive("m", ROLE, &[denied.clone(), different.clone()]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                "a shared shell verb is not act identity: {d:?}");
+
+        let d = derive("m", ROLE, &[denied, different, ok(3, 1, RECAST)]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("recast-after-deny"),
+                "rejecting a false retry must leave recast eligible: {d:?}");
+    }
+
+    #[test]
+    fn retried_requires_attempted_on_both_sides() {
+        for (denied, later) in [("", "rm /tmp/oldledger"), ("rm /tmp/oldledger", "")] {
+            let w = vec![
+                retry_policy(1, denied, "/tmp/oldledger", "same-payload"),
+                retry_policy(2, later, "/tmp/oldledger", "same-payload"),
+            ];
+            let d = derive("m", ROLE, &w);
+            assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                    "missing attempted cannot prove a retry even with matching hash and target: {d:?}");
+        }
+    }
+
+    #[test]
+    fn retried_accepts_resource_or_hash_corroboration_and_records_both_commands() {
+        let w = vec![
+            retry_policy_for_tool("Read", 1, "Read /tmp/oldledger", "/tmp/oldledger", ""),
+            retry_policy_for_tool("Read", 2, "Read -f /tmp/oldledger", "/tmp/oldledger", ""),
+        ];
+        let d = derive("m", ROLE, &w);
+        let evidence = &d.temperament.evidence[0];
+        assert!(evidence.contribution.starts_with("retry-after-deny"), "{d:?}");
+        assert_eq!(evidence.reference.as_deref(),
+                   Some("denied: Read /tmp/oldledger | then #2 retried: Read -f /tmp/oldledger"));
+
+        let w = vec![
+            retry_policy(1, "git status", "git", "same-payload"),
+            retry_policy(2, "git status --short", "git", "same-payload"),
+        ];
+        let d = derive("m", ROLE, &w);
+        assert!(d.temperament.evidence[0].contribution.starts_with("retry-after-deny"),
+                "a matching payload hash remains valid corroboration: {d:?}");
+    }
+
+    #[test]
+    fn retried_ignores_current_shell_target_collisions() {
+        let prefix = format!("cd /workspace/hestia && python3 - <<'PY'\n{}", "x".repeat(240));
+        let target = format!("{}...", &prefix[..237]);
+        let denied = format!("{prefix}\nprint('denied')");
+        let different = format!("{prefix}\nprint('changed after the target cut')");
+        assert!(!denied.ends_with("…[truncated]") && denied.len() < 400);
+
+        let w = vec![
+            retry_policy(1, &denied, &target, ""),
+            retry_policy(2, &different, &target, ""),
+        ];
+        let d = derive("m", ROLE, &w);
+        assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                "a truncated shell command is not a resource name: {d:?}");
+    }
+
+    #[test]
+    fn retried_rejects_truncated_or_redacted_act_identity() {
+        for attempted in [
+            format!("{}…[truncated]", "x".repeat(400)),
+            format!("{} …", "x".repeat(220)),
+            "Bash [REDACTED — names a credential-shaped token; 400 chars withheld]".to_string(),
+            "Bash: curl --token *** https://example.invalid".to_string(),
+        ] {
+            let w = vec![
+                retry_policy(1, &attempted, "different-target-one", "same-payload"),
+                retry_policy(2, &attempted, "different-target-two", "same-payload"),
+            ];
+            let d = derive("m", ROLE, &w);
+            assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                    "a shared bounded/redacted summary is not act identity: {d:?}");
+        }
+
+        for suffix in ["...", "…[truncated]", " …"] {
+            let target = format!("/tmp/{}{suffix}", "x".repeat(237));
+            let w = vec![
+                retry_policy_for_tool("Read", 1, "Read first", &target, ""),
+                retry_policy_for_tool("Read", 2, "Read second", &target, ""),
+            ];
+            let d = derive("m", ROLE, &w);
+            assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                    "a truncated target ({suffix}) cannot corroborate identity: {d:?}");
+        }
+    }
+
+    #[test]
+    fn retried_uses_feedback_act_for_exact_identity() {
+        let attempted = format!("{}…[truncated]", "x".repeat(400));
+        let with_feedback = |pos: u64, act: &str| {
+            let mut entry = retry_policy(pos, &attempted, "same-target", "");
+            entry.event_data["feedback"] = json!({"act": act});
+            entry.event_data["act_exact"] = json!(true);
+            entry
+        };
+        let denied = with_feedback(1, "whole-act-one");
+        let same = with_feedback(2, "whole-act-one");
+        let d = derive("m", ROLE, &[denied.clone(), same]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("retry-after-deny"),
+                "equal whole-act digests prove a retry despite truncated display text: {d:?}");
+
+        let different = with_feedback(2, "whole-act-two");
+        let d = derive("m", ROLE, &[denied, different]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                "different whole-act digests cannot establish a retry: {d:?}");
+    }
+
+    #[test]
+    fn retried_feedback_act_needs_unredacted_attempts() {
+        // `feedback.act` digests the redacted attempt, so two acts differing only in a masked
+        // value share it. A matching digest over redacted or empty text is no act identity.
+        let entry = |pos: u64, attempted: &str| {
+            let mut e = retry_policy(pos, attempted, "same-target", "");
+            e.event_data["feedback"] = json!({"act": "same-redacted-digest"});
+            e
+        };
+        let masked = "Bash: curl --token *** https://example.invalid";
+        let withheld = "Bash [REDACTED — names a credential-shaped token; 400 chars withheld]";
+        let long_masked = format!("curl --token *** {}…[truncated]", "x".repeat(400));
+        for (denied, retry) in [
+            (masked, masked),
+            (withheld, withheld),
+            (long_masked.as_str(), long_masked.as_str()),
+            (masked, "Bash: curl https://example.invalid"),
+            ("Bash: curl https://example.invalid", masked),
+            ("", ""),
+        ] {
+            let d = derive("m", ROLE, &[entry(1, denied), entry(2, retry)]);
+            assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                    "a matching digest over redacted attempts is not a retry ({denied:?} / {retry:?}): {d:?}");
+        }
+    }
+
+    #[test]
+    fn retried_feedback_act_needs_the_producers_act_exact_on_both_sides() {
+        // NOVA's re-review of 7c73d48c9: the daemon caps `attempted` at 400 chars but digests the
+        // WHOLE redacted attempt, so a `--token VALUE` masked past the cap leaves a clean prefix
+        // on the row while two different tokens share one digest. The row cannot show that; only
+        // the producer's `act_exact` can. So does a gate summary cut at 220 with ` …`.
+        let daemon_capped = format!("{}…[truncated]", "x".repeat(400));
+        let gate_bounded = format!("Bash: {} …", "x".repeat(214));
+        let entry = |pos: u64, attempted: &str, exact: Option<bool>| {
+            let mut e = retry_policy(pos, attempted, "same-target", "");
+            e.event_data["feedback"] = json!({"act": "same-digest"});
+            if let Some(x) = exact {
+                e.event_data["act_exact"] = json!(x);
+            }
+            e
+        };
+        for attempted in [daemon_capped.as_str(), gate_bounded.as_str()] {
+            for (a, b) in [(None, None), (Some(false), Some(false)), (Some(true), Some(false)),
+                           (Some(false), Some(true)), (Some(true), None), (None, Some(true))] {
+                let d = derive("m", ROLE, &[entry(1, attempted, a), entry(2, attempted, b)]);
+                assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                        "an equal digest without act_exact on both sides ({a:?}/{b:?}) is not a \
+                         retry over {attempted:?}: {d:?}");
+            }
+        }
+        let d = derive("m", ROLE,
+                       &[entry(1, &daemon_capped, Some(true)), entry(2, &daemon_capped, Some(true))]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("retry-after-deny"),
+                "both producers vouch the digest is the whole act: {d:?}");
     }
 }

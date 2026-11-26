@@ -1344,6 +1344,42 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         "let Some(arbiter_lct_id) = s.member_registry.get(&arb.plugin_id).map(|l| l.lct_id()) else {",
         "let Some(lct) = s.member_registry.get(&arb.plugin_id) else {",
     ]),
+    // ADDED 2026-11-23 (hub-claude second pass on #1710, closing mcnugget-claude's census hold at
+    // `d2a9c4df`; reading drafted by mcnugget-claude, corrected against the code where noted).
+    // Delegation EVIDENCE (#1320, record-only slice) is a new reader of presence, at three sites:
+    //
+    // * `delegation_gate.rs::build` enumerates the registry to derive each member's agent key
+    //   (`agent_key_for_lct`) so an operator-signed `act` scope can be matched to the session.
+    // * `tool_query_policy` and `tool_witness_decision` hand the registry to `build` and record
+    //   the resulting finding on the decision row.
+    //
+    // READING, against the question this table schedules — is this a safety use of presence?
+    // NOT TODAY. Every finding is serialized with `mode: record` and `verdict_changed: false`,
+    // and nothing on the decision path reads it: the verdict is computed before and without it.
+    //
+    // DEGRADATION DIRECTION, stated exactly because the short version is wrong in two places:
+    // * A registry that is empty or lacks the member yields no MEMBER key. That is `unkeyed`
+    //   only when there is also no role key, or no delegation names the role key. A session
+    //   absent from the registry whose role has an LCT can still record `match` with
+    //   `matched_via: role`. Absence removes member coverage; it does not remove role coverage.
+    // * Fillers are NOT excluded. `build` keys every row of `iter_sorted()`, fillers included
+    //   (compare `cmd_delegate_grant`, which filters them from its suggestions). A filler is
+    //   keyed like any member and would match a delegation granted to its key.
+    //
+    // THIS READING EXPIRES with #1320's enforcement slice. The day a verdict reads the finding,
+    // `build`'s use of presence decides whether an act is covered and becomes a SAFETY use. The
+    // enforcement PR must redo this entry rather than inherit "evidence-only", and must answer
+    // the two points above on purpose: may a role key cover a session the registry does not
+    // hold, and may a filler be keyed at all.
+    ("server/delegation_gate.rs::build", &[
+        "for (id, lct) in members.iter_sorted() {",
+    ]),
+    ("server/handler.rs::tool_query_policy", &[
+        "&s.member_registry,",
+    ]),
+    ("server/handler.rs::tool_witness_decision", &[
+        "&s.member_registry,",
+    ]),
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
     ]),

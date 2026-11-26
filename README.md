@@ -174,6 +174,22 @@ This is the part that runs every day and has the scars to prove it.
 | **Delegation** | Measured | Scoped by role+action, signed, revocable. |
 | **Plugin SDK** | Measured | Rust, TypeScript, Python — same interface. |
 
+**Portable chain segments (#1449):** an operator can export an inclusive range with
+`hestia chain-export --from 0 --to 42 > segment.json`. `hestia chain-verify segment.json` checks
+structural self-consistency without a vault, database, passphrase or daemon, but reports
+`unverifiable` with `provenance: unanchored` and `complete: false`: embedded public keys alone do
+not authenticate society provenance. Authenticated verification requires externally supplied
+`--expect-chain-id`, `--expect-end-hash`, and one or more `--trusted-witness-key` values;
+non-genesis ranges also require `--expect-previous-hash`. Only then can the report be `valid` with
+`provenance: anchored` and `complete: true`. Structural damage, reordered or duplicated rows,
+missing evidence, mismatched anchors, and untrusted keys remain distinguishable from a valid
+segment. Segment input is capped at 16 MiB, and malformed or deeply nested JSON is rejected.
+The report still does not establish complete capture, non-bypass of the gate, truthful event
+semantics, authorized witness membership beyond the supplied anchor, or key custody.
+`fixtures/chain-segment/` carries valid, altered, swapped and missing-key examples. Regenerate them
+against a disposable daemon with `python3 tools/chain_segment_smoke.py --binary /path/to/hestia
+--fixtures-dir fixtures/chain-segment --write`; check them without the daemon by omitting `--write`.
+
 **Assurance ceiling, stated with it:** all of the above is profile **A1** — a cooperative
 gate running as the same UID as the operator. Tamper-**evident**, not tamper-proof.
 [`docs/GATE_BYPASS_CATALOG.md`](docs/GATE_BYPASS_CATALOG.md) catalogues the ways around it,

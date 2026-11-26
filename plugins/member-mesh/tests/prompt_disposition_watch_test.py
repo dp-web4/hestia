@@ -46,10 +46,14 @@ def check(cond, label, detail=""):
 
 # The stub CLI prints whatever $STUB_PEEK holds and exits $STUB_RC, like the real peek.
 STUB = '''#!/usr/bin/env python3
-import os, sys
-if sys.argv[1:] != ["peek"]:
+import json, os, sys
+if sys.argv[1:] != ["sweep"]:
     sys.exit(9)
-sys.stdout.write(open(os.environ["STUB_PEEK"]).read())
+inbox = json.loads(open(os.environ["STUB_PEEK"]).read())
+pending = json.loads(open(os.environ["STUB_PENDING"]).read())
+if int(os.environ.get("STUB_PENDING_RC", "0")):
+    pending = {"_hestia_error": {"code": "stub.pending_refused"}}
+sys.stdout.write(json.dumps({"inbox": inbox, "pending": pending}))
 sys.exit(int(os.environ.get("STUB_RC", "0")))
 '''
 
@@ -61,6 +65,7 @@ with open(WATCH) as a, open(script, "w") as b:
 with open(os.path.join(hooks, "hestia-mesh.py"), "w") as fh:
     fh.write(STUB)
 peek_file = os.path.join(state, "peek.json")
+pending_file = os.path.join(state, "pending.json")
 
 
 def stamp(age_s):
@@ -74,13 +79,25 @@ def inbox(*notices, raw=None):
             {"total": len(notices), "notices": list(notices), "peeked": True}))
 
 
+def pending(*rows):
+    with open(pending_file, "w") as fh:
+        fh.write(json.dumps({"pending": list(rows)}))
+
+
+def petition(esc, member="claude-code", session="parent", reason="governed half is held"):
+    return {"escalation_id": esc, "asked_by": member, "host_session_id": session,
+            "tool_name": "Bash", "marker": "plugins/_shared", "secs_remaining": 1899,
+            "stated_reason": reason}
+
+
 def n(i, kind, ptr=None, age=30):
     return {"id": i, "kind": kind, "from_plugin": "hestia",
             "pointer_uri": ptr or f"hestia://escalation/e{i}", "queued_at": stamp(age)}
 
 
-def run(member="kimi-code", session="s-main", rc=0, event=None):
-    env = {**os.environ, "HESTIA_MESH_STATE": state, "STUB_PEEK": peek_file, "STUB_RC": str(rc)}
+def run(member="kimi-code", session="s-main", rc=0, event=None, pending_rc=0):
+    env = {**os.environ, "HESTIA_MESH_STATE": state, "STUB_PEEK": peek_file,
+           "STUB_PENDING": pending_file, "STUB_RC": str(rc), "STUB_PENDING_RC": str(pending_rc)}
     env.pop("HESTIA_MESH_PLUGIN", None)
     if member is not None:
         env["HESTIA_MESH_PLUGIN"] = member
@@ -93,6 +110,7 @@ def run(member="kimi-code", session="s-main", rc=0, event=None):
 
 
 OLD = 3 * 3600      # well outside the look-back
+pending()
 
 print("A. a new session's first prompt")
 inbox(n(5, "disposition", age=OLD), n(7, "reply", age=OLD))
@@ -142,6 +160,7 @@ for label, ev in (("no session_id", {"hook_event_name": "UserPromptSubmit"}),
     if env_ev is None:
         p = subprocess.run(["sh", script], input=ev, capture_output=True, text=True, timeout=30,
                            env={**os.environ, "HESTIA_MESH_STATE": state, "STUB_PEEK": peek_file,
+                                "STUB_PENDING": pending_file, "STUB_PENDING_RC": "0",
                                 "HESTIA_MESH_PLUGIN": "codex"})
     else:
         p = run(member="codex", event=env_ev)
@@ -189,6 +208,30 @@ if os.path.exists(stale):
     os.utime(stale, (time.time() - 8 * 86400,) * 2)
 run(member="claude-code", session="asker")
 check(bool(after) and not os.path.exists(stale), "H3. a per-session file past the 7-day TTL is pruned")
+
+print("I. a subagent's pending petition reaches its parent session")
+inbox()
+pending(petition("subagent-open"), petition("sibling-open", session="sibling"),
+        petition("other-member", member="codex", session="parent"))
+p = run(member="claude-code", session="parent")
+check("subagent-open" in p.stdout, "I1. the parent sees the subagent's pending id", repr(p.stdout))
+check("sibling-open" not in p.stdout and "other-member" not in p.stdout,
+      "I2. co-seat and other-member rows stay out", repr(p.stdout))
+check("pending" in p.stdout and "1899" in p.stdout and "governed half is held" in p.stdout,
+      "I3. the row says it is pending and carries deadline and reason", repr(p.stdout))
+p = run(member="claude-code", session="parent")
+check(p.stdout == "", "I4. the same pending row is not repeated on every prompt", repr(p.stdout))
+p = run(member="claude-code", session="sibling")
+check("sibling-open" in p.stdout and "subagent-open" not in p.stdout,
+      "I5. another session has its own pending view and watermark", repr(p.stdout))
+pending(petition("subagent-open"))
+p = run(member="claude-code", session=None)
+check("subagent-open" not in p.stdout, "I6. no session id means no ownership guess", repr(p.stdout))
+pending()
+inbox(n(90, "disposition", "hestia://escalation/still-delivered", age=5))
+p = run(member="claude-code", session="pending-read-failed", pending_rc=1)
+check("still-delivered" in p.stdout,
+      "I7. a failed pending read does not suppress disposition delivery", repr(p.stdout))
 
 if failures:
     print(f"\n{len(failures)} failure(s): {failures}")
