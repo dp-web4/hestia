@@ -2023,6 +2023,9 @@ pub async fn serve_with_callback(
                 // immediate). Before this the daemon checked its gates only when an operator
                 // asked (#1085); dp, 2026-09-21: the daemon verifies, the installer reads.
                 let gates = super::gate_watch::check(&mut s, discovered);
+                // Gated-resource probes that stopped answering (#1548/#1551): reported on the
+                // clock, not only when another consuming act happens to arrive.
+                super::resource_remedy::health_pass(&mut s, now);
                 if gates["status"] != "VERIFIED" {
                     tracing::warn!(status = %gates["status"], "gate integrity: not verified");
                 }

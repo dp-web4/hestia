@@ -23,6 +23,7 @@ pub mod gate_watch;
 pub mod gate_bypass;
 pub mod seat_config;
 mod public_identity;
+pub mod resource_remedy;
 pub mod retirement;
 pub mod standing_scope;
 pub mod transport_binding;

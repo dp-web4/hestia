@@ -908,6 +908,7 @@ dependencies = [
  "globset",
  "hestia-wire",
  "hex",
+ "libc",
  "rand 0.8.6",
  "ratatui",
  "regex",
