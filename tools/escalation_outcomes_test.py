@@ -11,6 +11,7 @@ from unittest.mock import patch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import chain_walk  # noqa: E402
+from chain_walk import terminal_escalation_ids  # noqa: E402
 import factor_attribution_census as factor  # noqa: E402
 
 FAILS = []
@@ -63,6 +64,41 @@ def main():
     retired = load_retired_without_a_daemon()
     check("retired-before-review imports the one terminal set",
           retired["TERMINAL"] is chain_walk.ESCALATION_TERMINAL_EVENTS)
+
+    def event(kind, escalation_id="esc-1"):
+        return {"eventType": kind, "eventData": {"escalation_id": escalation_id}}
+
+    check("a claim without a decision is not terminal",
+          terminal_escalation_ids([event("gate_escalation_opened"),
+                                   event("gate_escalation_claimed")]) == set())
+    check("a corroboration without a ruling is not terminal",
+          terminal_escalation_ids([event("gate_escalation_opened"),
+                                   event("gate_escalation_corroborated")]) == set())
+    check("a decision is terminal even with later claims",
+          terminal_escalation_ids([event("gate_escalation_opened"),
+                                   event("gate_escalation_decided"),
+                                   event("gate_escalation_claimed")]) == {"esc-1"})
+    check("expiry is terminal", terminal_escalation_ids([event("gate_escalation_expired")]) == {"esc-1"})
+    check("withdrawal is terminal",
+          terminal_escalation_ids([event("gate_escalation_withdrawn")]) == {"esc-1"})
+    lifecycle = [
+        event("gate_escalation_opened"),
+        event("gate_escalation_coalesced"),
+        event("gate_escalation_corroborated"),
+        event("gate_escalation_claimed"),
+        event("gate_escalation_decided"),
+        event("gate_escalation_claimed"),
+        event("gate_escalation_expired"),
+        event("gate_escalation_withdrawn"),
+    ]
+    check("one escalation counts once across the full lifecycle",
+          terminal_escalation_ids(lifecycle) == {"esc-1"})
+    check("replayed evidence cannot inflate the terminal count",
+          terminal_escalation_ids(lifecycle + lifecycle) == {"esc-1"})
+    legacy = {"eventType": "gate_escalation_decided",
+              "eventData": {"escalation_id": "esc-legacy", "status": "approved"}}
+    check("pre-request-key rows remain valid census inputs",
+          terminal_escalation_ids([legacy]) == {"esc-legacy"})
     if FAILS:
         print(f"{len(FAILS)} FAILURE(S): {FAILS}")
         return 1

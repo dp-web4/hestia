@@ -29,7 +29,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -132,6 +132,159 @@ const MAX_LISTED_FAILURES: usize = 50;
 /// external verifier from the chain alone. Two chains share it only if they share genesis.
 pub fn chain_id_for_genesis(genesis_hash: &str) -> String {
     format!("{CHAIN_ID_PREFIX}{genesis_hash}")
+}
+
+const META_SUBJECTS_BACKFILLED_THROUGH: &str = "subjects_backfilled_through";
+const META_SUBJECTS_DEFINITION_SHA256: &str = "subjects_definition_sha256";
+/// Bump this on ANY change to what `derivation_subjects` extracts that the lists below do not
+/// express: the digest covers the type and key lists, not the extraction logic (the `data.`
+/// nesting and the `requested_by.plugin_id` paths). Without a bump, rows indexed under the old
+/// logic keep a current watermark and are never re-indexed, so they silently drop out of
+/// subject windows. `subject_index_definition_digest_is_a_versioned_ratchet` pins both.
+const SUBJECT_INDEX_DEFINITION_VERSION: u64 = 1;
+const DERIVATION_SUBJECT_KEYS: &[&str] = &["plugin_id", "subject_plugin_id"];
+const DERIVATION_GLOBAL_EVENT_TYPES: &[&str] = &["identity_alias", "amnesty", "exoneration"];
+
+fn subject_index_definition_digest() -> String {
+    let definition = serde_json::to_vec(&(
+        SUBJECT_INDEX_DEFINITION_VERSION,
+        crate::derivation::DERIVATION_EVENT_TYPES,
+        DERIVATION_SUBJECT_KEYS,
+        DERIVATION_GLOBAL_EVENT_TYPES,
+    ))
+    .expect("static subject-index definition serializes");
+    hex::encode(Sha256::digest(&definition))
+}
+
+fn derivation_subjects(event_data: &serde_json::Value) -> Vec<String> {
+    let mut subjects = Vec::new();
+    let mut push = |value: Option<&serde_json::Value>| {
+        if let Some(id) = value.and_then(serde_json::Value::as_str).filter(|id| !id.is_empty()) {
+            if !subjects.iter().any(|subject| subject == id) {
+                subjects.push(id.to_string());
+            }
+        }
+    };
+    for key in DERIVATION_SUBJECT_KEYS {
+        push(event_data.get(*key));
+        push(event_data.get("data").and_then(|data| data.get(*key)));
+    }
+    push(event_data.get("requested_by").and_then(|who| who.get("plugin_id")));
+    push(event_data
+        .get("data")
+        .and_then(|data| data.get("requested_by"))
+        .and_then(|who| who.get("plugin_id")));
+    subjects
+}
+
+fn index_chain_subjects(
+    tx: &rusqlite::Transaction<'_>,
+    chain_position: u64,
+    event_type: &str,
+    event_data: &serde_json::Value,
+) -> Result<()> {
+    if !crate::derivation::DERIVATION_EVENT_TYPES.contains(&event_type) {
+        return Ok(());
+    }
+    for plugin_id in derivation_subjects(event_data) {
+        tx.execute(
+            "INSERT OR IGNORE INTO chain_subjects (chain_position, plugin_id) VALUES (?1, ?2)",
+            params![chain_position as i64, plugin_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_chain_subjects(conn: &Connection) -> Result<()> {
+    let definition_digest = subject_index_definition_digest();
+    let previous_definition = conn
+        .query_row(
+            "SELECT value FROM chain_meta WHERE key = ?1",
+            params![META_SUBJECTS_DEFINITION_SHA256],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if previous_definition.as_deref() != Some(definition_digest.as_str()) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM chain_subjects", [])?;
+        tx.execute(
+            "DELETE FROM chain_meta WHERE key = ?1",
+            params![META_SUBJECTS_BACKFILLED_THROUGH],
+        )?;
+        tx.execute(
+            "INSERT INTO chain_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_SUBJECTS_DEFINITION_SHA256, definition_digest],
+        )?;
+        tx.commit()?;
+    }
+    let backfilled_through = conn
+        .query_row(
+            "SELECT value FROM chain_meta WHERE key = ?1",
+            params![META_SUBJECTS_BACKFILLED_THROUGH],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(-1);
+    let latest = conn.query_row(
+        "SELECT COALESCE(MAX(chain_position), -1) FROM chain_entries",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if latest <= backfilled_through {
+        return Ok(());
+    }
+
+    let placeholders = vec!["?"; crate::derivation::DERIVATION_EVENT_TYPES.len()].join(",");
+    let sql = format!(
+        "SELECT chain_position, event_type, event_data FROM chain_entries
+         WHERE chain_position > ? AND chain_position <= ? AND event_type IN ({placeholders})
+         ORDER BY chain_position LIMIT 1000"
+    );
+    let mut through = backfilled_through;
+    loop {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(through), Box::new(latest)];
+        binds.extend(
+            crate::derivation::DERIVATION_EVENT_TYPES
+                .iter()
+                .map(|event_type| Box::new(event_type.to_string()) as Box<dyn rusqlite::ToSql>),
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next()? {
+            pending.push((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ));
+        }
+        drop(rows);
+        drop(stmt);
+        let Some(last_position) = pending.last().map(|row| row.0) else { break };
+
+        let tx = conn.unchecked_transaction()?;
+        for (chain_position, event_type, event_json) in pending {
+            let event_data: serde_json::Value = serde_json::from_str(&event_json)
+                .with_context(|| format!("parsing chain row {chain_position} for subject backfill"))?;
+            index_chain_subjects(&tx, chain_position, &event_type, &event_data)?;
+        }
+        tx.execute(
+            "INSERT INTO chain_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_SUBJECTS_BACKFILLED_THROUGH, last_position.to_string()],
+        )?;
+        tx.commit()?;
+        through = last_position as i64;
+    }
+    conn.execute(
+        "INSERT INTO chain_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_SUBJECTS_BACKFILLED_THROUGH, latest.to_string()],
+    )?;
+    Ok(())
 }
 
 /// The chain witness: who attests a row's ordering and inclusion (decision 0014 §6.1's
@@ -357,6 +510,83 @@ impl ChainVerification {
     /// Predicate 2: every row that should carry a signature carries a valid one.
     pub fn signatures_authentic(&self) -> bool {
         self.signature_failures == 0 && self.orphan_signatures == 0 && self.meta_mismatch.is_none()
+    }
+}
+
+pub const CHAIN_SEGMENT_FORMAT: &str = "hestia-chain-segment:v1";
+
+/// One chain row as stored. `event_data_json` preserves the exact bytes the legacy hash covers;
+/// `event_data` makes the export convenient to read. Offline verification checks they agree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSegmentEntry {
+    pub hash: String,
+    pub prev_hash: String,
+    pub timestamp: String,
+    pub event_type: String,
+    pub event_data: serde_json::Value,
+    pub event_data_json: String,
+    pub signer_lct: String,
+    pub chain_position: u64,
+}
+
+/// A portable proof object. Public keys ride inside each signature record; no vault or daemon is
+/// needed to check them. `society_lct` is exporter context, not a replacement for key custody.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSegment {
+    pub format: String,
+    pub chain_id: String,
+    pub society_lct: String,
+    pub previous_hash: Option<String>,
+    pub signed_from_position: Option<u64>,
+    pub entries: Vec<ChainSegmentEntry>,
+    pub signatures: Vec<ChainSignatureRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSegmentStatus {
+    Valid,
+    Tampered,
+    Unverifiable,
+}
+
+/// The offline verdict, including cases where absence of evidence must not read as either a pass
+/// or proof of tampering. Every failure string names its chain position when one is available.
+#[derive(Debug, Clone, Default)]
+pub struct ChainSegmentTrustAnchor {
+    pub chain_id: Option<String>,
+    pub previous_hash: Option<String>,
+    pub end_hash: Option<String>,
+    pub trusted_witness_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSegmentProvenance {
+    Anchored,
+    Unanchored,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSegmentVerification {
+    pub status: ChainSegmentStatus,
+    pub provenance: ChainSegmentProvenance,
+    pub complete: bool,
+    pub checked_entries: u64,
+    pub signed_valid: u64,
+    pub legacy_unsigned: u64,
+    pub link_intact: bool,
+    pub tampered: Vec<String>,
+    pub unverifiable: Vec<String>,
+    pub witnesses: BTreeMap<String, WitnessKeyUse>,
+    pub limitations: Vec<String>,
+}
+
+impl ChainSegmentVerification {
+    pub fn is_valid(&self) -> bool {
+        self.status == ChainSegmentStatus::Valid
+            && self.complete
+            && self.provenance == ChainSegmentProvenance::Anchored
     }
 }
 
@@ -666,6 +896,16 @@ impl SqliteChainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);
+             CREATE INDEX IF NOT EXISTS idx_chain_escalation_id
+                 ON chain_entries(json_extract(event_data, '$.escalation_id'));
+
+             CREATE TABLE IF NOT EXISTS chain_subjects (
+                chain_position INTEGER NOT NULL,
+                plugin_id      TEXT NOT NULL,
+                PRIMARY KEY (chain_position, plugin_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_chain_subject_member_position
+                 ON chain_subjects(plugin_id, chain_position);
 
              -- Idempotency metadata is deliberately OUTSIDE the hashed witness row.
              -- The mapping commits in the same transaction as its row, but changing
@@ -696,6 +936,7 @@ impl SqliteChainStore {
                 value TEXT NOT NULL
              );",
         )?;
+        backfill_chain_subjects(&conn)?;
         let genesis: Option<String> = conn
             .query_row(
                 "SELECT hash FROM chain_entries ORDER BY chain_position ASC LIMIT 1",
@@ -1092,6 +1333,7 @@ impl SqliteChainStore {
                 timestamp.to_rfc3339(),
             ],
         )?;
+        index_chain_subjects(&tx, chain_position, event_type, &event_data)?;
         if let Some(key) = event_key {
             tx.execute(
                 "INSERT INTO chain_event_keys (event_key, chain_position, entry_hash)
@@ -1390,6 +1632,73 @@ impl SqliteChainStore {
             };
             if let Some(v) = project(row_ref) {
                 out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read derivation rows addressed to any of `subject_plugin_ids`, plus the global
+    /// records that can change how those rows are interpreted.
+    pub fn scan_subjects_recent<T>(
+        &self,
+        subject_plugin_ids: &[&str],
+        cutoff_rfc3339: Option<&str>,
+        event_types: &[&str],
+        limit: u64,
+        mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
+    ) -> Result<Vec<T>> {
+        if subject_plugin_ids.is_empty() || event_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.observed(&self.read_conn)?;
+        let type_placeholders = vec!["?"; event_types.len()].join(",");
+        let subject_placeholders = vec!["?"; subject_plugin_ids.len()].join(",");
+        let global_placeholders = vec!["?"; DERIVATION_GLOBAL_EVENT_TYPES.len()].join(",");
+        let mut sql = format!(
+            "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                    e.signer_lct, e.timestamp
+               FROM chain_entries e
+              WHERE e.event_type IN ({type_placeholders})
+                AND (e.chain_position IN (
+                        SELECT chain_position FROM chain_subjects
+                         WHERE plugin_id IN ({subject_placeholders})
+                    )
+                    OR e.event_type IN ({global_placeholders}))"
+        );
+        if cutoff_rfc3339.is_some() {
+            sql.push_str(" AND e.timestamp >= ?");
+        }
+        sql.push_str(" ORDER BY e.chain_position DESC LIMIT ?");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for event_type in event_types {
+            binds.push(Box::new(event_type.to_string()));
+        }
+        for plugin_id in subject_plugin_ids {
+            binds.push(Box::new(plugin_id.to_string()));
+        }
+        for event_type in DERIVATION_GLOBAL_EVENT_TYPES {
+            binds.push(Box::new(event_type.to_string()));
+        }
+        if let Some(cutoff) = cutoff_rfc3339 {
+            binds.push(Box::new(cutoff.to_string()));
+        }
+        binds.push(Box::new(limit as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_ref = ChainRowRef {
+                chain_position: row.get::<_, i64>(0)? as u64,
+                hash: row.get_ref(1)?.as_str()?,
+                prev_hash: row.get_ref(2)?.as_str()?,
+                event_type: row.get_ref(3)?.as_str()?,
+                event_data: row.get_ref(4)?.as_str()?,
+                signer_lct: row.get_ref(5)?.as_str()?,
+                timestamp: row.get_ref(6)?.as_str()?,
+            };
+            if let Some(value) = project(row_ref) {
+                out.push(value);
             }
         }
         Ok(out)
@@ -1824,31 +2133,50 @@ impl SqliteChainStore {
         Ok(out)
     }
 
-    /// Every witnessed entry about ONE gate escalation, oldest first, with no recency window
-    /// (#1014): its `gate_escalation_opened`, any decided / withdrawn / expired settlement, and
-    /// any `gate_escalation_claimed` spend.
-    ///
-    /// The escalation pointer used to page backward over the newest 1,000 chain entries, and
-    /// escalation events are under 1% of the chain, so a real ask became unreadable a median of
-    /// 7.3 hours after it opened (measured on CBP 2026-09-09) while the invitations and
-    /// disposition notices that carry its pointer live for days. Index-restricted to the five
-    /// event types, like `appeal_rows_for_pointer`; on the read connection, so a reader never
-    /// waits on the writer.
+    pub const ESCALATION_HISTORY_MAX_ROWS: i64 = 256;
+
+    /// The open and terminal rows about ONE gate escalation, plus only its newest spend,
+    /// oldest first (#1014, #1725). The exact id index keeps lookup proportional to this
+    /// escalation's history rather than the whole chain. More than 256 matching rows is an
+    /// error, never a partial answer that could omit the open or newest ruling. Spend-heavy
+    /// approvals do not overflow the bound: recovery needs only the latest claim.
     pub fn escalation_rows(&self, escalation_id: &str) -> Result<Vec<ChainEntry>> {
         let conn = self.observed(&self.read_conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
-             FROM chain_entries
-             WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
-                                  'gate_escalation_withdrawn', 'gate_escalation_expired',
-                                  'gate_escalation_claimed')
-               AND json_extract(event_data, '$.escalation_id') = ?1
-             ORDER BY chain_position ASC",
+             FROM (
+                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                 FROM chain_entries INDEXED BY idx_chain_escalation_id
+                 WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                      'gate_escalation_withdrawn', 'gate_escalation_expired')
+                   AND json_extract(event_data, '$.escalation_id') = ?1
+                 UNION ALL
+                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                 FROM (
+                     SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                     FROM chain_entries INDEXED BY idx_chain_escalation_id
+                     WHERE event_type = 'gate_escalation_claimed'
+                       AND json_extract(event_data, '$.escalation_id') = ?1
+                     ORDER BY chain_position DESC LIMIT 1
+                 )
+             )
+             ORDER BY chain_position ASC
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![escalation_id], row_to_entry)?;
+        let rows = stmt.query_map(
+            params![escalation_id, Self::ESCALATION_HISTORY_MAX_ROWS + 1],
+            row_to_entry,
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r??);
+        }
+        if out.len() as i64 > Self::ESCALATION_HISTORY_MAX_ROWS {
+            anyhow::bail!(
+                "escalation '{}' exceeds {} history rows; refusing a partial or unbounded recovery",
+                escalation_id,
+                Self::ESCALATION_HISTORY_MAX_ROWS
+            );
         }
         Ok(out)
     }
@@ -2053,6 +2381,84 @@ impl SqliteChainStore {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Export one inclusive range and its signature evidence from a single read snapshot.
+    /// `from == 0` anchors at the genesis sentinel; any other range anchors at the preceding
+    /// row's hash, so an offline reader can check the first link too.
+    pub fn export_segment(&self, from: u64, to: u64, society_lct: &str) -> Result<ChainSegment> {
+        anyhow::ensure!(from <= to, "segment start {from} is after end {to}");
+        anyhow::ensure!(!society_lct.trim().is_empty(), "segment society LCT is empty");
+        let conn = self.observed(&self.read_conn)?;
+        let previous_hash = if from == 0 {
+            GENESIS_PREV_HASH.to_string()
+        } else {
+            conn.query_row(
+                "SELECT hash FROM chain_entries WHERE chain_position = ?1",
+                params![(from - 1) as i64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("segment anchor at position {} is absent", from - 1))?
+        };
+        let signed_from_position = signing_boundary(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                    e.signer_lct, e.timestamp,
+                    s.chain_position, s.row_hash, s.signature_version, s.chain_id, s.witness_lct,
+                    s.witness_public_key, s.policy_generation, s.signature
+               FROM chain_entries e
+               LEFT JOIN chain_signatures s ON s.chain_position = e.chain_position
+              WHERE e.chain_position BETWEEN ?1 AND ?2
+              ORDER BY e.chain_position ASC",
+        )?;
+        let mut rows = stmt.query(params![from as i64, to as i64])?;
+        let mut entries = Vec::new();
+        let mut signatures = Vec::new();
+        while let Some(row) = rows.next()? {
+            let chain_position = row.get::<_, i64>(0)? as u64;
+            let event_data_json: String = row.get(4)?;
+            let event_data = serde_json::from_str(&event_data_json)
+                .with_context(|| format!("position {chain_position}: malformed stored event JSON"))?;
+            entries.push(ChainSegmentEntry {
+                hash: row.get(1)?,
+                prev_hash: row.get(2)?,
+                event_type: row.get(3)?,
+                event_data,
+                event_data_json,
+                signer_lct: row.get(5)?,
+                timestamp: row.get(6)?,
+                chain_position,
+            });
+            if row.get::<_, Option<i64>>(7)?.is_some() {
+                signatures.push(ChainSignatureRecord {
+                    chain_position,
+                    row_hash: row.get(8)?,
+                    signature_version: row.get::<_, i64>(9)?.try_into().unwrap_or(u32::MAX),
+                    chain_id: row.get(10)?,
+                    witness_lct: row.get(11)?,
+                    witness_public_key: row.get(12)?,
+                    policy_generation: row.get(13)?,
+                    signature: row.get(14)?,
+                });
+            }
+        }
+        let expected = to - from + 1;
+        anyhow::ensure!(
+            entries.len() as u64 == expected,
+            "segment range {from}..={to} is not fully present (expected {expected} rows, got {})",
+            entries.len()
+        );
+        let chain_id = self.chain_id().context("cannot identify a segment without a genesis row")?;
+        Ok(ChainSegment {
+            format: CHAIN_SEGMENT_FORMAT.to_string(),
+            chain_id,
+            society_lct: society_lct.to_string(),
+            previous_hash: Some(previous_hash),
+            signed_from_position,
+            entries,
+            signatures,
+        })
     }
 
     /// Both predicates — link integrity and signature authenticity (#339) — over one read
@@ -2337,13 +2743,223 @@ fn compute_hash(
     event_type: &str,
     event_data_json: &str,
 ) -> String {
+    compute_hash_stored(prev_hash, &timestamp.to_rfc3339(), event_type, event_data_json)
+}
+
+fn compute_hash_stored(
+    prev_hash: &str,
+    timestamp: &str,
+    event_type: &str,
+    event_data_json: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
-    hasher.update(timestamp.to_rfc3339().as_bytes());
+    hasher.update(timestamp.as_bytes());
     hasher.update(event_type.as_bytes());
     hasher.update(event_data_json.as_bytes());
     let digest = hasher.finalize();
     digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Verify a portable segment without opening a vault, database or daemon. Absent anchors,
+/// signatures or keys are UNVERIFIABLE; altered rows, ordering and invalid signatures are TAMPERED.
+pub fn verify_chain_segment(segment: &ChainSegment) -> ChainSegmentVerification {
+    verify_chain_segment_with_anchor(segment, None)
+}
+
+pub fn verify_chain_segment_with_anchor<'a>(
+    segment: &ChainSegment,
+    anchor: impl Into<Option<&'a ChainSegmentTrustAnchor>>,
+) -> ChainSegmentVerification {
+    let anchor = anchor.into();
+    let mut out = ChainSegmentVerification {
+        status: ChainSegmentStatus::Valid,
+        provenance: ChainSegmentProvenance::Unanchored,
+        complete: false,
+        checked_entries: 0,
+        signed_valid: 0,
+        legacy_unsigned: 0,
+        link_intact: true,
+        tampered: Vec::new(),
+        unverifiable: Vec::new(),
+        witnesses: BTreeMap::new(),
+        limitations: vec![
+            "complete capture and non-bypass of the gate are not established".into(),
+            "truthful event semantics and key custody are not established (A1)".into(),
+            "the society LCT is context; it does not prove this witness was authorised".into(),
+        ],
+    };
+    if let Some(anchor) = anchor {
+        out.provenance = ChainSegmentProvenance::Anchored;
+        if anchor.chain_id.as_deref() != Some(segment.chain_id.as_str()) {
+            out.unverifiable.push("external chain-id anchor does not match the segment".into());
+        }
+        if segment.entries.first().is_some_and(|e| e.chain_position != 0)
+            && anchor.previous_hash != segment.previous_hash
+        {
+            out.unverifiable.push(
+                "a non-genesis segment needs an external pre-segment hash anchor".into(),
+            );
+        }
+        if anchor.end_hash.as_deref() != segment.entries.last().map(|e| e.hash.as_str()) {
+            out.unverifiable.push("external terminal hash does not match the segment".into());
+        }
+        if anchor.trusted_witness_keys.is_empty() {
+            out.unverifiable.push("external anchor names no trusted witness keys".into());
+        }
+    }
+    if segment.format != CHAIN_SEGMENT_FORMAT {
+        out.unverifiable.push(format!("unsupported segment format {:?}", segment.format));
+    }
+    if segment.chain_id.is_empty() {
+        out.unverifiable.push("segment chain_id is absent".into());
+    }
+    if segment.society_lct.trim().is_empty() {
+        out.unverifiable.push("segment society_lct is absent".into());
+    }
+    if segment.entries.is_empty() {
+        out.unverifiable.push("segment contains no entries".into());
+    }
+    if !segment.entries.iter().any(|e| e.chain_position == 0) {
+        out.limitations.push(
+            "a non-genesis segment cannot recompute its chain id or prove pre-segment history".into(),
+        );
+    }
+
+    let mut signatures: BTreeMap<u64, Vec<&ChainSignatureRecord>> = BTreeMap::new();
+    for rec in &segment.signatures {
+        let pos = rec.chain_position;
+        let records = signatures.entry(pos).or_default();
+        if !records.is_empty() {
+            out.tampered.push(format!("position {pos}: duplicate signature records"));
+        }
+        records.push(rec);
+        if rec.witness_public_key.trim().is_empty() {
+            out.unverifiable.push(format!("position {pos}: signing key is absent"));
+        }
+    }
+
+    let mut expected_position = segment.entries.first().map(|e| e.chain_position);
+    let mut previous_hash = segment.previous_hash.clone();
+    let mut seen_signed = false;
+    for entry in &segment.entries {
+        let pos = entry.chain_position;
+        out.checked_entries += 1;
+        if expected_position != Some(pos) {
+            out.tampered.push(format!(
+                "position {pos}: ordering mismatch (expected {})",
+                expected_position.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+            ));
+        }
+        expected_position = Some(pos.saturating_add(1));
+        match previous_hash.as_deref() {
+            Some(expected) if entry.prev_hash != expected => {
+                out.link_intact = false;
+                out.tampered.push(format!("position {pos}: prev_hash mismatch"));
+            }
+            None if pos == 0 => {
+                if entry.prev_hash != GENESIS_PREV_HASH {
+                    out.link_intact = false;
+                    out.tampered.push(format!("position {pos}: prev_hash is not the genesis sentinel"));
+                }
+            }
+            None => out.unverifiable.push(format!(
+                "position {pos}: preceding anchor hash is absent; the first link cannot be checked"
+            )),
+            _ => {}
+        }
+        let recomputed = compute_hash_stored(
+            &entry.prev_hash,
+            &entry.timestamp,
+            &entry.event_type,
+            &entry.event_data_json,
+        );
+        if recomputed != entry.hash {
+            out.link_intact = false;
+            out.tampered.push(format!("position {pos}: hash mismatch"));
+        }
+        match serde_json::from_str::<serde_json::Value>(&entry.event_data_json) {
+            Ok(raw) if raw != entry.event_data => out.tampered.push(format!(
+                "position {pos}: event_data and event_data_json describe different content"
+            )),
+            Err(e) => out.tampered.push(format!("position {pos}: malformed event_data_json: {e}")),
+            _ => {}
+        }
+        if pos == 0 {
+            let derived = chain_id_for_genesis(&entry.hash);
+            if segment.chain_id != derived {
+                out.tampered.push(format!(
+                    "position 0: chain_id {:?} does not match genesis-derived {derived}",
+                    segment.chain_id
+                ));
+            }
+        }
+
+        let records = signatures.remove(&pos).unwrap_or_default();
+        if records.is_empty() {
+            if seen_signed || segment.signed_from_position.is_some_and(|from| pos >= from) {
+                out.unverifiable.push(format!(
+                    "position {pos}: signature is absent at or after signing began"
+                ));
+            } else {
+                out.legacy_unsigned += 1;
+            }
+        }
+        for rec in records {
+            seen_signed = true;
+            if rec.witness_public_key.trim().is_empty() {
+                continue;
+            }
+            match verify_row_signature(
+                &segment.chain_id,
+                pos,
+                &entry.hash,
+                &entry.signer_lct,
+                rec,
+            ) {
+                Ok(()) => {
+                    out.signed_valid += 1;
+                    if anchor.is_some_and(|a| !a.trusted_witness_keys.contains(&rec.witness_public_key)) {
+                        out.unverifiable.push(format!(
+                            "position {pos}: signing key is not externally trusted"
+                        ));
+                    }
+                    let witness = out.witnesses.entry(rec.witness_public_key.clone()).or_insert_with(|| {
+                        WitnessKeyUse {
+                            witness_lct: rec.witness_lct.clone(),
+                            rows: 0,
+                            first_position: pos,
+                            last_position: pos,
+                        }
+                    });
+                    witness.rows += 1;
+                    witness.last_position = pos;
+                }
+                Err(reason) => out.tampered.push(format!("position {pos}: {reason}")),
+            }
+        }
+        previous_hash = Some(entry.hash.clone());
+    }
+    for pos in signatures.keys() {
+        out.tampered.push(format!("position {pos}: signature has no corresponding chain entry"));
+    }
+    if out.checked_entries > 0 && out.signed_valid == 0 && out.tampered.is_empty() {
+        out.unverifiable.push("segment contains no valid signature evidence".into());
+    }
+    if !out.tampered.is_empty() {
+        out.status = ChainSegmentStatus::Tampered;
+    } else if !out.unverifiable.is_empty() {
+        out.status = ChainSegmentStatus::Unverifiable;
+    } else if anchor.is_none() {
+        out.limitations.push(
+            "unanchored cryptographic self-consistency only; authenticated society provenance and range completeness require an external chain-id, trusted-key, and terminal-hash anchor".into(),
+        );
+        out.status = ChainSegmentStatus::Unverifiable;
+    } else {
+        out.complete = true;
+        out.status = ChainSegmentStatus::Valid;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2785,6 +3401,262 @@ mod tests {
     }
 
     #[test]
+    fn subject_index_reads_member_rows_and_global_interpretation_events() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let signer = "lct:test";
+        store.append("policy_decision", json!({"plugin_id": "alpha"}), signer).unwrap();
+        store.append("outcome", json!({"data": {"plugin_id": "beta"}}), signer).unwrap();
+        store.append("adjudication", json!({"data": {"subject_plugin_id": "alpha"}}), signer).unwrap();
+        store.append("scope_attestation", json!({"data": {"requested_by": {"plugin_id": "requester"}}}), signer).unwrap();
+        store.append("policy_decision", json!({"requested_by": {"plugin_id": "requester"}}), signer).unwrap();
+        store.append("amnesty", json!({"data": {"class": "deny"}}), signer).unwrap();
+        store.append("exoneration", json!({"data": {"deny_hash": "abc"}}), signer).unwrap();
+        store.append("identity_alias", json!({"alias": "old-alpha", "alias_of": "alpha"}), signer).unwrap();
+        store.append("unrelated", json!({"plugin_id": "alpha"}), signer).unwrap();
+
+        let positions = |store: &SqliteChainStore, plugin_id: &str| {
+            store.scan_subjects_recent(
+                &[plugin_id],
+                None,
+                crate::derivation::DERIVATION_EVENT_TYPES,
+                100,
+                |row| Some(row.chain_position),
+            )
+            .unwrap()
+        };
+        assert_eq!(positions(&store, "alpha"), vec![7, 6, 5, 2, 0]);
+        assert_eq!(positions(&store, "beta"), vec![7, 6, 5, 1]);
+        assert_eq!(positions(&store, "requester"), vec![7, 6, 5, 4, 3]);
+        assert_eq!(derivation_subjects(&json!({
+            "plugin_id": "alpha",
+            "data": {"plugin_id": "alpha", "subject_plugin_id": "nested"},
+            "requested_by": {"plugin_id": "author"}
+        })), vec!["alpha", "nested", "author"]);
+
+        store.conn.lock().unwrap().execute_batch(
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';",
+        ).unwrap();
+        drop(store);
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(positions(&reopened, "alpha"), vec![7, 6, 5, 2, 0]);
+        assert_eq!(positions(&reopened, "requester"), vec![7, 6, 5, 4, 3]);
+    }
+
+    #[test]
+    fn subject_index_definition_digest_is_a_versioned_ratchet() {
+        assert_eq!(SUBJECT_INDEX_DEFINITION_VERSION, 1);
+        assert_eq!(
+            subject_index_definition_digest(),
+            "7235e9785b54b461d8cd2815434d1ae2d33e2ff1e2afd7128c5e6b79ef753d5f"
+        );
+        // The digest cannot see the extraction logic, so pin it here: one distinct id on each
+        // path `derivation_subjects` reads, plus ids on paths it must NOT read. If this assert
+        // has to change, bump SUBJECT_INDEX_DEFINITION_VERSION (and the two pins above) so
+        // existing chains re-index.
+        assert_eq!(
+            derivation_subjects(&json!({
+                "plugin_id": "top-plugin",
+                "subject_plugin_id": "top-subject",
+                "requested_by": {"plugin_id": "top-requester", "subject_plugin_id": "not-read-a"},
+                "other": {"plugin_id": "not-read-b"},
+                "data": {
+                    "plugin_id": "data-plugin",
+                    "subject_plugin_id": "data-subject",
+                    "requested_by": {"plugin_id": "data-requester"},
+                    "data": {"plugin_id": "not-read-c"}
+                }
+            })),
+            vec![
+                "top-plugin",
+                "data-plugin",
+                "top-subject",
+                "data-subject",
+                "top-requester",
+                "data-requester"
+            ]
+        );
+    }
+
+    #[test]
+    fn subject_backfill_rebuilds_when_the_definition_changes_at_a_current_watermark() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let entry = store.append(
+            "adjudication",
+            json!({"data": {"subject_plugin_id": "new-key-subject"}}),
+            "lct:test",
+        ).unwrap();
+        assert_eq!(entry.chain_position, 0);
+        store.conn.lock().unwrap().execute_batch(
+            "DELETE FROM chain_subjects;
+             INSERT INTO chain_subjects (chain_position, plugin_id) VALUES (0, 'stale-subject');
+             INSERT INTO chain_meta (key, value) VALUES ('subjects_definition_sha256', 'previous-definition')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+        ).unwrap();
+        drop(store);
+
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let positions = |plugin_id: &str| {
+            reopened.scan_subjects_recent(
+                &[plugin_id],
+                None,
+                crate::derivation::DERIVATION_EVENT_TYPES,
+                100,
+                |row| Some(row.chain_position),
+            ).unwrap()
+        };
+        assert_eq!(positions("new-key-subject"), vec![0]);
+        assert!(positions("stale-subject").is_empty());
+        let conn = raw(&path);
+        let digest: String = conn.query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_definition_sha256'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(digest, subject_index_definition_digest());
+        let through: String = conn.query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_backfilled_through'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(through, "0");
+    }
+
+    #[test]
+    fn subject_backfill_resumes_after_batch_failure_without_loss_or_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        for i in 0..1_002u64 {
+            let member = format!("member-{}", i % 3);
+            let data = if i % 101 == 0 {
+                json!({
+                    "plugin_id": member,
+                    "data": {"plugin_id": member, "subject_plugin_id": format!("alias-{i}")},
+                    "requested_by": {"plugin_id": format!("author-{}", i % 2)}
+                })
+            } else {
+                json!({"plugin_id": member})
+            };
+            store.append("policy_decision", data, "lct:test").unwrap();
+        }
+        let expected: std::collections::BTreeSet<(u64, String)> = store
+            .read_recent(1_002)
+            .unwrap()
+            .iter()
+            .flat_map(|entry| {
+                let position = entry.chain_position;
+                derivation_subjects(&entry.event_data)
+                    .into_iter()
+                    .map(move |plugin_id| (position, plugin_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected_partial: std::collections::BTreeSet<(u64, String)> = expected
+            .iter()
+            .filter(|(position, _)| *position < 1_000)
+            .cloned()
+            .collect();
+        drop(store);
+        tamper(&path,
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';
+             CREATE TRIGGER fail_second_subject_batch BEFORE INSERT ON chain_subjects
+             WHEN NEW.chain_position = 1000
+             BEGIN SELECT RAISE(ABORT, 'injected second batch failure'); END;");
+
+        let failed = SqliteChainStore::open(&path, TEST_KEY);
+        let error = failed.err().expect("the second backfill batch must fail");
+        assert!(format!("{error:#}").contains("injected second batch failure"), "{error:#}");
+        let conn = raw(&path);
+        let through: String = conn.query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_backfilled_through'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(through, "999", "only the first complete batch may advance the watermark");
+        let (count, oldest, newest): (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), MIN(chain_position), MAX(chain_position) FROM chain_subjects",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(count, expected_partial.len() as i64);
+        assert_eq!((oldest, newest), (0, 999), "the partial index is exactly positions 0..999");
+        let leaked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chain_subjects WHERE chain_position >= 1000",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(leaked, 0, "the failed second batch must roll back all of its mappings");
+        drop(conn);
+
+        tamper(&path, "DROP TRIGGER fail_second_subject_batch;");
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let through: String = raw(&path).query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_backfilled_through'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(through, "1001", "restart resumes after the committed first batch");
+        let conn = raw(&path);
+        let mut stmt = conn
+            .prepare("SELECT chain_position, plugin_id FROM chain_subjects")
+            .unwrap();
+        let actual: std::collections::BTreeSet<(u64, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(actual, expected, "resume must lose nothing and duplicate nothing");
+
+        let appended = reopened.append(
+            "policy_decision",
+            json!({"data": {"plugin_id": "new-member"}}),
+            "lct:test",
+        ).unwrap();
+        assert_eq!(appended.chain_position, 1_002);
+        let indexed: i64 = raw(&path).query_row(
+            "SELECT COUNT(*) FROM chain_subjects WHERE chain_position = 1002 AND plugin_id = 'new-member'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, 1, "ordinary appends keep indexing after recovery");
+    }
+
+    #[test]
+    fn append_rolls_back_the_chain_row_when_subject_indexing_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        store.append("policy_decision", json!({"plugin_id": "seed"}), "lct:test").unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_subject_index BEFORE INSERT ON chain_subjects
+             WHEN NEW.plugin_id = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'injected subject index failure'); END;",
+        ).unwrap();
+
+        let failed = store.append("policy_decision", json!({"plugin_id": "boom"}), "lct:test");
+        assert!(failed.is_err(), "the subject-index failure must reach the append caller");
+        assert_eq!(store.len().unwrap(), 1, "the cached length must not move");
+        let (entries, subjects): (i64, i64) = raw(&path).query_row(
+            "SELECT (SELECT COUNT(*) FROM chain_entries), (SELECT COUNT(*) FROM chain_subjects)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((entries, subjects), (1, 1), "the failed row and its index must roll back together");
+
+        tamper(&path, "DROP TRIGGER fail_subject_index;");
+        let recovered = store.append("policy_decision", json!({"plugin_id": "boom"}), "lct:test").unwrap();
+        assert_eq!(recovered.chain_position, 1);
+        assert_eq!(store.len().unwrap(), 2);
+        let indexed: i64 = raw(&path).query_row(
+            "SELECT COUNT(*) FROM chain_subjects WHERE chain_position = 1 AND plugin_id = 'boom'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, 1);
+    }
+
+    #[test]
     fn timeframe_pages_are_capped_projected_and_cursor_complete_488() {
         let dir = TempDir::new().unwrap();
         let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
@@ -2841,6 +3713,67 @@ mod tests {
             Some(&cutoff), Some(&[]), None, ROUTINE_CHAIN_PAGE, |_| Some(()),
         ).unwrap();
         assert_eq!(empty, ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
+    }
+
+    #[test]
+    fn escalation_history_bounds_terminal_rows_without_counting_every_spend() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
+        store.append(
+            "gate_escalation_opened",
+            json!({"escalation_id": "crowded", "plugin_id": "codex"}),
+            "lct:test",
+        )
+        .unwrap();
+        for i in 0..50 {
+            store.append("outcome", json!({"filler": i}), "lct:test").unwrap();
+        }
+        assert_eq!(store.escalation_rows("crowded").unwrap().len(), 1);
+
+        let conn = store.observed(&store.read_conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT chain_position FROM chain_entries INDEXED BY idx_chain_escalation_id
+                 WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                      'gate_escalation_withdrawn', 'gate_escalation_expired',
+                                      'gate_escalation_claimed')
+                   AND json_extract(event_data, '$.escalation_id') = ?1
+                 ORDER BY chain_position ASC LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params!["crowded", 2], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(plan.join(" | ").contains("idx_chain_escalation_id"), "{plan:?}");
+        drop(conn);
+
+        for _ in 0..=SqliteChainStore::ESCALATION_HISTORY_MAX_ROWS {
+            store.append(
+                "gate_escalation_claimed",
+                json!({"escalation_id": "crowded", "plugin_id": "codex"}),
+                "lct:test",
+            )
+            .unwrap();
+        }
+        let recovered = store.escalation_rows("crowded").unwrap();
+        assert_eq!(recovered.len(), 2, "frequent spends collapse to the latest one");
+        assert_eq!(recovered[0].event_type, "gate_escalation_opened");
+        assert_eq!(recovered[1].event_type, "gate_escalation_claimed");
+
+        for _ in 0..=SqliteChainStore::ESCALATION_HISTORY_MAX_ROWS {
+            store.append(
+                "gate_escalation_decided",
+                json!({"escalation_id": "crowded", "plugin_id": "codex", "status": "denied",
+                       "decided_by": "operator"}),
+                "lct:test",
+            )
+            .unwrap();
+        }
+        let err = store.escalation_rows("crowded").unwrap_err();
+        assert!(err.to_string().contains("256 history rows"), "{err}");
+        assert!(err.to_string().contains("partial"), "{err}");
     }
 
     /// #1555: the bounded liveness scan stays on the rowid range. If the planner took the
@@ -3653,5 +4586,211 @@ mod tests {
             "dbfb719edc9ccc95830dd8cf0e37bff4bb05f700f099e73acb942ec6f176bbab\
              6eb7b9e9bb0b72c66fe933ccaa40b65df3e9ef1c9cf9992478a2f083d03d4a0c"
         );
+    }
+
+    fn smoke_segment(dir: &TempDir) -> ChainSegment {
+        let (_path, store, witness) = signed_store(dir);
+        witness.set_policy_generation("policy:sha256:segment-fixture");
+        store.append("scope_granted", json!({"request_id": "scope-smoke", "path": "/fixture"}), witness.witness_lct()).unwrap();
+        store.append("policy_allow", json!({"tool_name": "Read", "target": "/fixture"}), witness.witness_lct()).unwrap();
+        store.append("policy_decision", json!({"decision": "deny", "rule_id": "mrh.path", "target": "/outside"}), witness.witness_lct()).unwrap();
+        store.append("outcome", json!({"success": false, "target": "/outside"}), witness.witness_lct()).unwrap();
+        store.export_segment(0, 3, "lct:web4:mb32:bsociety").unwrap()
+    }
+
+    fn anchor_for(segment: &ChainSegment) -> ChainSegmentTrustAnchor {
+        ChainSegmentTrustAnchor {
+            chain_id: Some(segment.chain_id.clone()),
+            previous_hash: segment.previous_hash.clone(),
+            end_hash: segment.entries.last().map(|e| e.hash.clone()),
+            trusted_witness_keys: segment
+                .signatures
+                .iter()
+                .map(|s| s.witness_public_key.clone())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_signed_segment_round_trips_and_verifies_offline() {
+        let dir = TempDir::new().unwrap();
+        let segment = smoke_segment(&dir);
+        let encoded = serde_json::to_string_pretty(&segment).unwrap();
+        let decoded: ChainSegment = serde_json::from_str(&encoded).unwrap();
+        let report = verify_chain_segment_with_anchor(&decoded, &anchor_for(&decoded));
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!((report.checked_entries, report.signed_valid, report.legacy_unsigned), (4, 4, 0));
+        assert!(report.link_intact);
+        assert_eq!(report.witnesses.values().map(|w| w.rows).sum::<u64>(), 4);
+        assert!(report.limitations.iter().any(|s| s.contains("non-bypass")));
+    }
+
+    #[test]
+    fn altered_segment_content_fails_and_names_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.entries[1].event_data["target"] = json!("/altered");
+        segment.entries[1].event_data_json = serde_json::to_string(&segment.entries[1].event_data).unwrap();
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(report.tampered.iter().any(|s| s.contains("position 1: hash mismatch")), "{report:?}");
+    }
+
+    #[test]
+    fn swapped_segment_entries_fail_ordering() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.entries.swap(1, 2);
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(report.tampered.iter().any(|s| s.contains("ordering mismatch")), "{report:?}");
+    }
+
+    #[test]
+    fn an_absent_signing_key_is_unverifiable_not_valid_or_tampered() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.signatures[0].witness_public_key.clear();
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(report.tampered.is_empty(), "{report:?}");
+        assert!(report.unverifiable.iter().any(|s| s.contains("position 0: signing key is absent")));
+    }
+
+    #[test]
+    fn a_missing_signature_or_anchor_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, witness) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), witness.witness_lct()).unwrap();
+        store.append("evt", json!({"i": 1}), witness.witness_lct()).unwrap();
+        let mut missing = store.export_segment(0, 1, "lct:web4:mb32:bsociety").unwrap();
+        missing.signatures.remove(0);
+        let report = verify_chain_segment(&missing);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(report.unverifiable.iter().any(|s| s.contains("signature is absent")));
+
+        let mut no_anchor = store.export_segment(1, 1, "lct:web4:mb32:bsociety").unwrap();
+        no_anchor.previous_hash = None;
+        let report = verify_chain_segment(&no_anchor);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(report.tampered.is_empty(), "{report:?}");
+        assert!(report.unverifiable.iter().any(|s| s.contains("anchor hash is absent")));
+    }
+
+    #[test]
+    fn a_non_genesis_segment_verifies_its_supplied_anchor() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, witness) = signed_store(&dir);
+        for i in 0..3 {
+            store.append("evt", json!({"i": i}), witness.witness_lct()).unwrap();
+        }
+        let segment = store.export_segment(1, 2, "lct:web4:mb32:bsociety").unwrap();
+        let report = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert!(report.is_valid(), "{report:?}");
+        assert!(report.limitations.iter().any(|s| s.contains("non-genesis")));
+    }
+
+    #[test]
+    fn unanchored_self_consistency_is_not_authenticated_provenance() {
+        let dir = TempDir::new().unwrap();
+        let segment = smoke_segment(&dir);
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert_eq!(report.provenance, ChainSegmentProvenance::Unanchored);
+        assert!(!report.complete && !report.is_valid());
+        assert!(report.limitations.iter().any(|s| s.contains("unanchored cryptographic self-consistency")));
+        let anchored = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert!(anchored.is_valid(), "{anchored:?}");
+        assert!(anchored.complete);
+    }
+
+    #[test]
+    fn a_substituted_key_and_resigned_chain_is_not_the_original_witness() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        let original = anchor_for(&segment);
+        let kp = KeyPair::generate();
+        let public_key = hex::encode(kp.verifying_key().to_bytes());
+        let witness_lct = web4_core::derive_lct_id(&kp.verifying_key());
+        for rec in &mut segment.signatures {
+            rec.witness_lct = witness_lct.clone();
+            rec.witness_public_key = public_key.clone();
+            let entry = &segment.entries[rec.chain_position as usize];
+            let pre = signature_preimage(
+                &segment.chain_id,
+                rec.chain_position,
+                &entry.hash,
+                &entry.signer_lct,
+                &rec.witness_lct,
+                &rec.witness_public_key,
+                &rec.policy_generation,
+            );
+            rec.signature = kp.sign(&pre).to_hex();
+        }
+        let report = verify_chain_segment_with_anchor(&segment, &original);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+        assert!(report.unverifiable.iter().any(|s| s.contains("not externally trusted")));
+        let substituted = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert!(substituted.is_valid(), "{substituted:?}");
+    }
+
+    #[test]
+    fn non_genesis_omissions_and_anchor_mismatches_never_read_as_complete() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, witness) = signed_store(&dir);
+        for i in 0..3 {
+            store.append("evt", json!({"i": i}), witness.witness_lct()).unwrap();
+        }
+        let segment = store.export_segment(1, 2, "lct:web4:mb32:bsociety").unwrap();
+        let mut missing = anchor_for(&segment);
+        missing.previous_hash = None;
+        let report = verify_chain_segment_with_anchor(&segment, &missing);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+
+        let mut wrong_chain = anchor_for(&segment);
+        wrong_chain.chain_id = Some("0".repeat(64));
+        let report = verify_chain_segment_with_anchor(&segment, &wrong_chain);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+
+        let anchor = anchor_for(&segment);
+        let mut truncated = segment.clone();
+        truncated.entries.pop();
+        let report = verify_chain_segment_with_anchor(&truncated, &anchor);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+
+        let mut headless = segment.clone();
+        headless.entries.remove(0);
+        let report = verify_chain_segment_with_anchor(&headless, &anchor);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+    }
+
+    #[test]
+    fn pretty_event_data_cannot_substitute_for_different_raw_bytes() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.entries[0].event_data["target"] = json!("/pretty-only-change");
+        let report = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(report.tampered.iter().any(|s| s.contains("describe different content")));
+        assert!(!report.complete && !report.is_valid());
+    }
+
+    #[test]
+    fn a_wholly_unsigned_segment_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        store.append("evt", json!({"legacy": true}), "lct:a").unwrap();
+        let segment = store.export_segment(0, 0, "lct:web4:mb32:bsociety").unwrap();
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert_eq!(report.legacy_unsigned, 1);
+        assert!(report.link_intact);
+        assert!(report.unverifiable.iter().any(|s| s.contains("no valid signature evidence")));
     }
 }
