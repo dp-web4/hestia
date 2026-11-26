@@ -132,16 +132,38 @@ def _commands_from_toml_text(text: str) -> list[tuple[str | None, str]]:
     tomllib on operator hosts. A line that purports to declare `command = ...` but
     cannot be read by the supported quoted-string grammar is UNPARSEABLE, never
     silently ignored.
+
+    `command` and `args` are keys of ONE table, in either order (TOML key order is
+    not significant). They are collected per table and flushed at the next table
+    header or EOF, so `args` can never attach to a command from another table.
     """
     out: list[tuple[str | None, str]] = []
     event = None
+    # The current table's own command/args; None means "not assigned here".
+    command: str | None = None
+    args: list[str] | None = None
+
+    def flush() -> None:
+        nonlocal command, args
+        if args is not None and command is None:
+            raise ValueError("command args have no command in their table")
+        if command is not None:
+            out.append((event, _command_with_args(command, args)))
+        command = None
+        args = None
+
     lines = text.splitlines()
     index = 0
     while index < len(lines):
         raw = lines[index]
         index += 1
+        if re.match(r"^\s*\[[^\[\]]+\]\s*(?:#.*)?$", raw):
+            # A standard `[table]` header also ends the previous table.
+            flush()
+            continue
         table = re.match(r"^\s*\[\[([^\]]+)\]\]\s*$", raw)
         if table:
+            flush()
             name = table.group(1)
             if name == "hooks":
                 event = "unparsed"
@@ -159,18 +181,19 @@ def _commands_from_toml_text(text: str) -> list[tuple[str | None, str]]:
             event = assigned_event.group(2)
             continue
         if re.match(r"^\s*args\s*=", raw):
-            if not out:
-                raise ValueError("command args have no preceding command")
+            if args is not None:
+                raise ValueError("duplicate command args in one table")
             args, index = _toml_args(lines, index - 1)
-            previous_event, command = out[-1]
-            out[-1] = (previous_event, _command_with_args(command, args))
             continue
         if not re.match(r"^\s*command\s*=", raw):
             continue
         m = _TOML_COMMAND.match(raw)
         if not m:
             raise ValueError(f"unparseable command assignment: {raw!r}")
-        out.append((event, m.group(2)))
+        if command is not None:
+            raise ValueError("duplicate command in one table")
+        command = m.group(2)
+    flush()
     return out
 
 
