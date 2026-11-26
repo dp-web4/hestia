@@ -36,7 +36,18 @@ def check(name, condition, detail):
     print(f"ok  {name}")
 
 
+def _isolate_from_caller_repo():
+    # Run from a git hook (or any shell that exported GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE),
+    # every `git` below would act on the CALLER's repository, not the fixture: `git config`
+    # wrote user.name/user.email=probe into the shared hestia repo's local config, and every
+    # commit from every worktree was then authored by probe (59 commits from 2026-11-24 on).
+    # The fixture repos are all under the tempdir, so no inherited GIT_* variable is wanted.
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        del os.environ[key]
+
+
 def main():
+    _isolate_from_caller_repo()
     with tempfile.TemporaryDirectory(prefix="build-lock-manifest-") as raw:
         parent = Path(raw).resolve()  # macOS: /var/folders -> /private/var/folders
         home = parent / "home"
@@ -58,10 +69,9 @@ def main():
         main_repo = parent / "main"
         main_repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=main_repo, check=True)
-        subprocess.run(["git", "config", "user.email", "probe@example.invalid"],
-                       cwd=main_repo, check=True)
-        subprocess.run(["git", "config", "user.name", "probe"], cwd=main_repo, check=True)
-        subprocess.run(["git", "commit", "--allow-empty", "-qm", "fixture"], cwd=main_repo, check=True)
+        # Identity per command (-c), never written to any config file.
+        subprocess.run(["git", "-c", "user.email=probe@example.invalid", "-c", "user.name=probe",
+                        "commit", "--allow-empty", "-qm", "fixture"], cwd=main_repo, check=True)
         worktree = parent / "worktree"
         subprocess.run(["git", "worktree", "add", "-q", str(worktree)],
                        cwd=main_repo, check=True)
