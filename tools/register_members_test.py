@@ -7,7 +7,8 @@ no codex act ever reached the chain. Case A reproduces that file shape and asser
 adds exactly the missing hook, that install-members.sh's own line-scan reader then SEES it, and
 that a second run changes nothing. The rest are the ways this could go wrong quietly: a harness
 that is not here must not be minted a registration (#1130), an unrendered placeholder must
-refuse, a broken result must restore, and DRY_RUN must write nothing.
+refuse, a prepared write must re-check its source before it commits, a broken result must restore,
+and DRY_RUN must write nothing.
 
 Run: python3 tools/register_members_test.py   (bare; exit 1 on failure; pytest-collectable)
 """
@@ -22,6 +23,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -2323,11 +2325,117 @@ def test_unregistration_refuses_a_stale_target_set_and_dry_run_writes_nothing():
         assert cfg.read_text() == before
 
 
+def test_unregistration_refuses_to_overwrite_an_intervening_edit_and_backup_keeps_bytes():
+    """A prepare/write interleaving must not lose an unrelated edit, and the exact-byte backup
+    includes the source's CRLF endings rather than a text-normalized copy."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp, ("claude-code",))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        assert _run(tmp, plugins, "--member", "claude-code").returncode == 0
+        cfg = tmp / ".claude" / "settings.json"
+        data = json.loads(cfg.read_text())
+        data["unrelated"] = {"keep": [1, 2, 3]}
+        original = (json.dumps(data, indent=2).replace("\n", "\r\n") + "\r\n").encode()
+        cfg.write_bytes(original)
+        targets = _desired_targets(tmp, plugins, "claude-code")
+        spec = json.loads((plugins / "claude-code" / "expects.json").read_text())["install"]
+        template = json.loads((plugins / "claude-code" / "hooks" / "hooks.json").read_text())
+        prepared = RM.prepare_unregistration(
+            "claude-code", spec, template, str(tmp), owned_targets=targets,
+            env={"HESTIA_HOME": _hh(tmp)}, source=str(plugins / "claude-code"))
+        assert isinstance(prepared, RM.Prepared), prepared
+
+        intervening_data = json.loads(original.decode("utf-8"))
+        intervening_data["concurrent_user_setting"] = True
+        intervening = (json.dumps(intervening_data, indent=2).replace("\n", "\r\n")
+                       + "\r\n").encode()
+        cfg.write_bytes(intervening)
+        refused = RM._commit_unregistration(prepared, False, lock_timeout=0.2)
+        assert refused["status"] == "refused", refused
+        assert refused["hooks_removed"] == 0 and "changed since the removal was prepared" in refused["error"]
+        assert refused["backup"] is None and cfg.read_bytes() == intervening
+        assert not list(cfg.parent.glob(".settings.json.hestia-unregister.*"))
+
+        r = _remove(tmp, plugins, "claude-code", targets)
+        removed = json.loads(r.stdout)
+        assert r.returncode == 0 and removed["status"] == "unregistered", (r.returncode, r.stdout)
+        after = json.loads(cfg.read_text())
+        assert after["concurrent_user_setting"] is True
+        remaining = {os.path.normpath(reg.target) for reg in RM.index_hooks(after["hooks"], False)
+                     if reg.target}
+        assert not remaining.intersection(map(os.path.normpath, targets)), remaining
+        backup = Path(removed["backup"]).read_bytes()
+        assert backup == intervening
+        assert b"\r\n" in backup
+
+
+def test_unregistration_lock_timeout_leaves_config_and_backup_untouched():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp, ("claude-code",))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        assert _run(tmp, plugins, "--member", "claude-code").returncode == 0
+        cfg = tmp / ".claude" / "settings.json"
+        before = cfg.read_bytes()
+        targets = _desired_targets(tmp, plugins, "claude-code")
+        spec = json.loads((plugins / "claude-code" / "expects.json").read_text())["install"]
+        template = json.loads((plugins / "claude-code" / "hooks" / "hooks.json").read_text())
+        prepared = RM.prepare_unregistration(
+            "claude-code", spec, template, str(tmp), owned_targets=targets,
+            env={"HESTIA_HOME": _hh(tmp)}, source=str(plugins / "claude-code"))
+        assert isinstance(prepared, RM.Prepared), prepared
+
+        ready = tmp / "registrar-lock-ready"
+        release = tmp / "registrar-lock-release"
+        child = """
+import pathlib
+import runpy
+import sys
+import time
+
+module = runpy.run_path(sys.argv[1])
+with module["_ConfigLock"](sys.argv[2], timeout=1.0):
+    pathlib.Path(sys.argv[3]).write_text("ready")
+    deadline = time.monotonic() + 5.0
+    while not pathlib.Path(sys.argv[4]).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child, str(SCRIPT), str(cfg), str(ready), str(release)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 2.0
+            while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready.exists():
+                proc.terminate()
+                out, err = proc.communicate(timeout=2.0)
+                raise AssertionError(f"the lock holder did not start\n{out}{err}")
+            result = RM._commit_unregistration(prepared, False, lock_timeout=0.05)
+            assert result["status"] == "failed", result
+            assert "another registrar operation holds the config lock" in result["error"]
+            assert result["hooks_removed"] == 0 and result["backup"] is None
+            assert cfg.read_bytes() == before
+            assert not list(cfg.parent.glob(".settings.json.hestia-unregister.*"))
+        finally:
+            release.write_text("release")
+            try:
+                out, err = proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                raise AssertionError(f"the lock holder did not exit\n{out}{err}")
+        assert proc.returncode == 0, out + err
+
+
 TESTS = [
     test_unregistration_removes_only_owned_json_hooks_and_backs_up_the_exact_bytes,
     test_unregistration_refuses_a_named_target_the_template_does_not_own,
     test_unregistration_proves_nested_and_flat_toml_and_preserves_foreign_hooks,
     test_unregistration_refuses_a_stale_target_set_and_dry_run_writes_nothing,
+    test_unregistration_refuses_to_overwrite_an_intervening_edit_and_backup_keeps_bytes,
+    test_unregistration_lock_timeout_leaves_config_and_backup_untouched,
     test_thor_case_registers_only_the_missing_witness,
     test_kimi_flat_layout_registers_the_failure_witness_and_reconciles_owned_lines,
     test_ensure_adds_the_feature_flag_when_absent,
