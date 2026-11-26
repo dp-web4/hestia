@@ -16,10 +16,10 @@ caller-supplied at connect (any probe mints a member), the registry accumulates 
 residue, and every escalation re-invites all of it.
 
 Why that is not merely untidy: `peer_participation()` retains the peer conjunct AS
-EVIDENCE — `invited` vs who answered, so that "three invited seats that all declined to
-look is a finding". An invited id whose mailbox nobody reads lands in `absent` exactly
+EVIDENCE — `invited` vs who answered. Before the reader exclusions and #757's explicit
+`unanswered` state, an invited id whose mailbox nobody reads landed in `absent` exactly
 like a peer who read the ask and ignored it. The statistic the invitation exists to
-produce is the one the residue corrupts.
+produce is the one the residue corrupts; current `absent` is only a no-factor count.
 
 TWO POPULATIONS, kept apart, because they answer different questions and only the first
 is complete:

@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
-# hestia-gt-sha256: 23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0  (published ground truth; manifest: hooks-gt)
-# UserPromptSubmit hook (any member): surface NEW disposition notices mid-session (#366).
+# hestia-gt-sha256: 02463f52fa051805a2dd56b72853bc79d8c5aca2284ce05279da0942cd858c94  (published ground truth; manifest: hooks-gt)
+# UserPromptSubmit hook (any member): surface NEW dispositions and this session's pending petitions.
 #
 # PROVENANCE. Built by kimi-code on 2026-08-27 for #366 and run from its own hooks dir for a
 # month; hestia never shipped it. Upstreamed here on 2026-09-28 (findings/per-harness-witness-
@@ -44,6 +44,13 @@
 #
 # Per-session files older than TTL days (default 7) are pruned on each run.
 #
+# PENDING PETITIONS (#1182). A subagent shares its parent's session id, so its refusal can be
+# invisible to the parent until its final prose. The same prompt hook also reads
+# hestia_gate_pending_escalations, which does NOT mark observed or start a claim window, and
+# shows rows whose asked_by is this member and host_session_id is THIS session. Each petition is
+# shown once per session, independently of the disposition watermark. No session id means no
+# ownership guess and no pending read. A pending-read failure never suppresses a disposition.
+#
 # THE ADVICE. It never says "hestia gate poll <id>": poll arms the asker's claim fuse by
 # plugin-id equality (#732, #707), so on a shared id it burns a sibling's window. Measured
 # 2026-09-18: 6 of 6 dispositions delivered to claude-code belonged to a co-seat. The notice
@@ -62,6 +69,7 @@ member = os.environ["HESTIA_MESH_PLUGIN"]
 state = os.environ.get("HESTIA_MESH_STATE") or os.path.join(
     os.path.expanduser("~"), ".local", "state", "hestia-mesh")
 seen_dir = os.path.join(state, "disposition-seen", member)
+petition_seen_dir = os.path.join(state, "petition-seen", member)
 
 def num(name, default):
     try:
@@ -80,14 +88,34 @@ except Exception:
 sid = event.get("session_id") if isinstance(event, dict) else None
 sid = sid if isinstance(sid, str) and sid.strip() else None
 
+petition_wm = None
+seen_petitions = set()
+if sid:
+    petition_wm = os.path.join(petition_seen_dir, hashlib.sha256(sid.encode()).hexdigest()[:24])
+    try:
+        seen_petitions = {x for x in json.loads(open(petition_wm).read()) if isinstance(x, str)}
+    except Exception:
+        pass
+
+sweep = {}
 try:
     r = subprocess.run([sys.executable, os.path.join(os.environ["DISPWATCH_DIR"], "hestia-mesh.py"),
-                        "peek"], capture_output=True, text=True, timeout=5)
-    if r.returncode != 0 or not r.stdout.strip():
-        sys.exit(0)
-    notices = json.loads(r.stdout).get("notices") or []
+                        "sweep"], capture_output=True, text=True, timeout=5)
+    if r.returncode == 0 and r.stdout.strip():
+        sweep = json.loads(r.stdout)
 except Exception:
-    sys.exit(0)
+    pass
+pending_rows = (sweep.get("pending") or {}).get("pending") or []
+new_petitions = []
+for row in pending_rows:
+    if not isinstance(row, dict) or row.get("asked_by") != member or row.get("host_session_id") != sid:
+        continue
+    esc = row.get("escalation_id")
+    if isinstance(esc, str) and esc and esc not in seen_petitions:
+        new_petitions.append(row)
+new_petitions = new_petitions[:10]
+
+notices = (sweep.get("inbox") or {}).get("notices") or []
 notices = [n for n in notices if isinstance(n, dict) and isinstance(n.get("id"), int)]
 
 def age_s(n):
@@ -108,10 +136,11 @@ def recent(n):
 
 try:
     now = time.time()
-    for f in os.listdir(seen_dir):
-        p = os.path.join(seen_dir, f)
-        if now - os.path.getmtime(p) > ttl:
-            os.remove(p)
+    for directory in (seen_dir, petition_seen_dir):
+        for f in os.listdir(directory):
+            p = os.path.join(directory, f)
+            if now - os.path.getmtime(p) > ttl:
+                os.remove(p)
 except OSError:
     pass
 
@@ -134,6 +163,28 @@ if wm_file:
                 f.write(str(top))
         except OSError:
             pass
+if new_petitions:
+    print("=== HESTIA: %d pending escalation(s) opened in this session (#1182) ===" % len(new_petitions))
+    for row in new_petitions:
+        reason = re.sub(r"[\x00-\x1f\x7f]+", " ", str(row.get("stated_reason") or "")).strip()[:240]
+        label = re.sub(r"[\x00-\x1f\x7f]+", " ", "%s %s" % (
+            row.get("tool_name") or "tool", row.get("marker") or "marker unknown")).strip()[:160]
+        secs = row.get("secs_remaining")
+        secs_text = str(secs) if isinstance(secs, (int, float)) else "unknown"
+        print("  %s | %s | %ss remaining%s" % (
+            row["escalation_id"], label, secs_text, (" | " + reason) if reason else ""))
+    print("A tool call in THIS session opened the petition(s) above, possibly in a subagent.")
+    print("They are still awaiting review: tell the operator a ruling is needed, or withdraw only")
+    print("work this session no longer needs. Do not rephrase a refused act to evade review.")
+    if petition_wm:
+        seen_petitions.update(row["escalation_id"] for row in new_petitions)
+        try:
+            os.makedirs(petition_seen_dir, exist_ok=True)
+            with open(petition_wm, "w") as f:
+                f.write(json.dumps(sorted(seen_petitions)))
+        except OSError:
+            pass
+
 if not new:
     sys.exit(0)
 
