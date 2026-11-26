@@ -1,4 +1,4 @@
-# hestia-gt-sha256: f682169711ffd340b4b58b5652914c6cb892469c20e0eb8e48d149cf43ea0cac  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 6dbcf822669f25a08715f4f4f81ab6903f84baf24ed3082e289e867b664f3587  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -781,6 +781,9 @@ def _client_name(profile: GateProfile) -> str:
 # ── the record: ONE call, every final verdict ────────────────────────────────────────────────
 
 def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
+    command = inv.event.tool_input.get("command")
+    attempted_exact = (attempted is None and isinstance(command, str)
+                       and " ".join(command.split()) == command)
     return mechanism.record_decision(
         None,
         plugin_id=inv.profile.member_id,
@@ -794,6 +797,7 @@ def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
         action_id=d.action_id,
         correlation_key=inv.key,
         deadline=inv.deadline,
+        attempted_exact=attempted_exact,
     )
 
 
@@ -1120,7 +1124,7 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         try:
             claimed = _bounded(
                 inv.phase_deadline, mechanism.claim_self_write,
-                marker, ev.tool, inv.attempted, plugin_id=prof.member_id, role=_role(inv),
+                marker, ev.tool, inv.attempted_full or inv.attempted, plugin_id=prof.member_id, role=_role(inv),
                 client_name=_client_name(prof), host_session_id=ev.session_id,
                 invocation_key=inv.key,
                 # THIS module stops a superseded invocation in every rollout mode (step 5), so it

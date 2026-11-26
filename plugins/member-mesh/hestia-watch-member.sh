@@ -21,7 +21,7 @@ IVL="${WATCH_INTERVAL:-60}"
 # primer as its authoritative work list.
 STATE="${HESTIA_MESH_STATE:-$HOME/.local/state/hestia-mesh}"
 # PER-MEMBER NAMESPACE (2026-07-31). Primers used to live in ONE directory for every
-# member on the host, named `notice-XXXXXX.json` by mktemp and recording `from_plugin`
+# member on the host, named `notice-<random>.json` (mkstemp, #1606) and recording `from_plugin`
 # on each notice and the recipient NOWHERE. The stale-retry loop below then globbed that
 # whole directory and re-fired whatever it found through its own $FIRE — so which member
 # received a retained work list was decided by whichever watcher's glob got there first.
@@ -1023,7 +1023,16 @@ retire_discharged_primers() {
 # lands in the woken session's own prompt). What is NOT done: firing a member
 # because it owes a response. Auto-waking a CLI is a consequential act; debt is
 # not a reason to spend one.
-UNANSWERED_EVERY="${UNANSWERED_EVERY:-3600}"   # journal cadence, seconds
+LEVEL_EVERY="${LEVEL_EVERY:-600}"              # artifact/daemon gauge; ~3 level lines in a ~1900s retention window
+UNANSWERED_EVERY="${UNANSWERED_EVERY:-3600}"   # per-row debt announcements stay hourly
+for CADENCE_NAME in LEVEL_EVERY UNANSWERED_EVERY; do
+  CADENCE_VALUE="${!CADENCE_NAME}"
+  if ! [[ "$CADENCE_VALUE" =~ ^[0-9]+$ ]] || [ "$CADENCE_VALUE" -le 0 ]; then
+    echo "[hestia-watch] invalid $CADENCE_NAME=$CADENCE_VALUE — positive integer seconds required" >&2
+    exit 2
+  fi
+done
+unset CADENCE_NAME CADENCE_VALUE
 STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 
 # THE WATCHER IS NOT THE MEMBER (F3, CBP notice 699/701/702 thread, 2026-08-03).
@@ -1952,19 +1961,23 @@ print(live+(" — "+note if note else ""))' 2>/dev/null)
 }
 
 announce_unanswered
-LAST_ANNOUNCE=$(date +%s)
-LAST_SWEEP=$LAST_ANNOUNCE
+LAST_LEVEL_ANNOUNCE=$(date +%s)
+LAST_UNANSWERED_ANNOUNCE=$LAST_LEVEL_ANNOUNCE
+LAST_SWEEP=$LAST_LEVEL_ANNOUNCE
 
 while true; do
   check_artifact_drift
   maybe_self_deploy
   check_daemon_drift
   NOW=$(date +%s)
-  if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
+  if [ $((NOW - LAST_LEVEL_ANNOUNCE)) -ge "$LEVEL_EVERY" ]; then
     announce_artifact
     announce_daemon
+    LAST_LEVEL_ANNOUNCE=$NOW
+  fi
+  if [ $((NOW - LAST_UNANSWERED_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
     announce_unanswered
-    LAST_ANNOUNCE=$NOW
+    LAST_UNANSWERED_ANNOUNCE=$NOW
   fi
   if [ $((NOW - LAST_SWEEP)) -ge "$DISCHARGE_SWEEP_EVERY" ]; then
     retire_discharged_primers
@@ -1977,7 +1990,12 @@ while true; do
   fi
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
-    PRIMER=$(mktemp "$PRIMERS/notice-XXXXXX.json")
+    # #1606: NOT `mktemp "$PRIMERS/notice-XXXXXX.json"`. That suffix form is GNU-only: BSD
+    # mktemp (macOS without coreutils first on PATH) replaces only TRAILING Xs, so it creates
+    # the literal `notice-XXXXXX.json` once and fails "File exists" on every later wake.
+    # mkstemp is atomic, keeps the `notice-*.json` name every sweep globs, and is the same
+    # on both. Prints nothing and exits nonzero on failure, as mktemp did.
+    PRIMER=$(python3 -c 'import os,sys,tempfile; fd,p=tempfile.mkstemp(prefix="notice-",suffix=".json",dir=sys.argv[1]); os.close(fd); print(p)' "$PRIMERS")
     # The strong asker: fold the member's outstanding debt into the primer, so
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.

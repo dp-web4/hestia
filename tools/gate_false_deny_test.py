@@ -10,6 +10,9 @@
 3. Found while measuring: with the program from a FILE (`grep -f`, `sed -f`, `awk -f`, `jq -f`, and
    clustered as `-rf`), the first operand was still taken as the pattern and never judged, so
    `grep -f P /outside` passed.
+4. #1560 (legion-claude's #1550 v2 review): the cluster rule went on scanning past a letter whose value
+   is text, so in `grep -nefoo FILE` the `f` inside `-e`'s pattern `foo` was read as `-f` and `oo`
+   judged as a program file. The first text-valued letter now owns the rest of the word.
 
 Every FALSE row below fails on main's core; every DENY row passes on both. Strings only: nothing
 here opens a file it names. No forbidden token is spelled in this source (tools/marker_bar_probe.py's
@@ -105,11 +108,31 @@ SCOPE_DENY = [
     ("jq -L/DIR attached outside", "jq -n -L/etc 'include \"x\"; .'"),
     ("jq -nL clustered outside", "jq -nL /etc 'include \"x\"; .'"),
     ("jq -nL/DIR clustered attached", "jq -nL/etc 'include \"x\"; .'"),
+    # #1560: a clustered PATTERN letter owns the rest of the word; every operand is still a file
+    ("grep -nefoo, outside data", "grep -nefoo " + OUTSIDE),
+    ("grep -ne PAT, outside data", "grep -ne foo " + OUTSIDE),
+    ("grep -nef: `f` is -e's pattern, outside data", "grep -nef " + OUTSIDE),
+    ("grep -nefoo, granted then outside", "grep -nefoo {ws}/repo/a.json " + OUTSIDE),
+    ("sed -ne SCRIPT, outside data", "sed -ne p " + OUTSIDE),
+    # an UNQUOTED glob in the clustered value is expanded by the shell (a directory read), so it is
+    # judged, as the attached `-e/x/*` already is. Main left it unjudged: a small tightening.
+    ("grep -ne with an unquoted glob value", "grep -ne/etc/* {ws}/repo"),
+    # string options are head-wide (git's `-m` is a boolean under checkout): a cluster ending in one
+    # does not hand the next word over unjudged
+    ("git checkout -fm, outside path", "git checkout -fm " + OUTSIDE),
 ]
 # Shapes that must not be over-judged by the cluster rule.
 SCOPE_ALLOW += [
     ("sed -if: `f` is -i's backup suffix", "sed -if 's/a/b/' {ws}/repo/a.json"),
     ("jq -n --library-path granted", "jq -n --library-path {ws}/repo 'include \"x\"; .'"),
+    # #1560: `-e` owns `foo`; the `f` inside it is not -f (legion-claude's #1550 v2 review)
+    ("grep -nefoo: `foo` is -e's pattern", "grep -nefoo {ws}/repo/a.json"),
+    ("grep -inef: `f` is -e's pattern", "grep -inef {ws}/repo/a.json"),
+    ("grep -nefoo/bar: a pattern, not a path", "grep -nefoo/bar {ws}/repo/a.json"),
+    # the shape that is a false deny on main: the text after the misread `f` names an existing outside
+    # path, so `-f`'s "program file" /etc/hosts was judged, though grep reads the pattern `f/etc/hosts`
+    ("grep -nef/etc/hosts: the pattern `f/etc/hosts`", "grep -nef/etc/hosts {ws}/repo/a.json"),
+    ("grep -ief/etc/hosts: the pattern `f/etc/hosts`", "grep -ief/etc/hosts {ws}/repo/a.json"),
 ]
 
 

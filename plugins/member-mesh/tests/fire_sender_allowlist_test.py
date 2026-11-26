@@ -364,10 +364,10 @@ for script, stub, peer in CASES:
               "evil.example" not in (prompt or ""),
               f"prompt={str(prompt)[:300]!r}")
 
-    # B6. The second daemon kind (#459). A `disposition` — "the petition you filed
-    #     has been ruled" — ALONE must wake the member with its pointer intact:
-    #     withheld, a ruled appeal reads exactly like an open one and the member
-    #     keeps polling a question that already has an answer.
+    # B6. The second daemon kind (#459). A non-withdrawal `disposition` — "the
+    #     petition you filed has been ruled" — ALONE must wake the member with its
+    #     pointer intact: withheld, a ruled appeal reads exactly like an open one
+    #     and the member keeps polling a question that already has an answer.
     with tempfile.TemporaryDirectory() as tmp:
         ptr = "hestia://appeal/8bea2e21fa62eccd#ruled"
         r, prompt = fire(script, stub,
@@ -380,6 +380,86 @@ for script, stub, peer in CASES:
               "#ruled" in (prompt or ""),
               f"pointer stripped — the petitioner cannot follow it to the ruling; "
               f"prompt={str(prompt)[:300]!r}")
+
+    # B7. #1249: a self-withdrawal is terminal and already known to its asker. It
+    #     must not wake every co-seat, and the clean exit must not turn into a
+    #     retained-primer retry loop.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub,
+                         [notice(9, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B7. {script}: a self-withdrawal alone exits 0 WITHOUT firing",
+              r.returncode == 0 and prompt is None,
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B8. The quiet notice is not erased from a batch that has another reason to
+    #     wake: the next primer still carries its id and pointer.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub, [
+            notice(10, "hestia", kind="disposition", pointer=ptr),
+            notice(11, peer, pointer="shared-context/real.md"),
+        ], tmp)
+        check(f"B8. {script}: a real notice still fires beside a self-withdrawal",
+              prompt is not None and "id=11" in (prompt or ""),
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+        check(f"B8b. {script}: the mixed primer retains the withdrawal",
+              "id=10" in (prompt or "") and "#withdrawn" in (prompt or ""),
+              f"the quiet row was dropped instead of deferred; prompt={str(prompt)[:300]!r}")
+
+    # B9. Suppression is exact, never a substring claim about another terminal
+    #     state or a lookalike suffix.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn-lookalike"
+        r, prompt = fire(script, stub,
+                         [notice(12, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B9. {script}: a withdrawal-lookalike suffix still fires",
+              prompt is not None and "id=12" in (prompt or ""),
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B10. The scope namespace (#1709 emits `hestia://scope/<id>#withdrawn`) is quiet
+    #      on the same terms as the escalation one.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://scope/scope-0123456789ab#withdrawn"
+        r, prompt = fire(script, stub,
+                         [notice(13, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B10. {script}: a scope self-withdrawal alone exits 0 WITHOUT firing",
+              r.returncode == 0 and prompt is None,
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B11. Quiet is the DAEMON's disposition, never a pointer shape a member can send.
+    #      The same `#withdrawn` pointer from an allowlisted peer is ordinary mail and
+    #      wakes; from the daemon under another kind it wakes too.
+    for nid, sender, kind in ((14, peer, "disposition"), (15, peer, "reply"),
+                              (16, "hestia", "unreachable")):
+        with tempfile.TemporaryDirectory() as tmp:
+            ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+            r, prompt = fire(script, stub, [notice(nid, sender, kind=kind, pointer=ptr)], tmp)
+            check(f"B11. {script}: a #withdrawn pointer from {sender}/{kind} still fires",
+                  prompt is not None and f"id={nid}" in (prompt or ""),
+                  f"a member-sent or wrong-kind notice was consumed without a wake; "
+                  f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B12. A withheld sender beside a quiet withdrawal is still WITHHELD: the batch
+    #      must not exit 0, or the watcher deletes a primer nobody was shown.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub, [
+            notice(17, "hestia", kind="disposition", pointer=ptr),
+            notice(18, "some-unknown-member"),
+        ], tmp)
+        check(f"B12. {script}: withheld + quiet exits 70 and fires nothing (primer retained)",
+              r.returncode == 70 and prompt is None,
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B13. An unallowlisted sender cannot make itself quiet by naming the daemon's kind.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub,
+                         [notice(19, "some-unknown-member", kind="disposition", pointer=ptr)], tmp)
+        check(f"B13. {script}: an unknown sender's 'disposition' is withheld, not quiet",
+              r.returncode == 70 and prompt is None and "WITHHELD" in (r.stderr or ""),
+              f"rc={r.returncode} stderr={str(r.stderr)[-300:]!r}")
 
 
 print()

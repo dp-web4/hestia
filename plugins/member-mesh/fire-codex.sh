@@ -100,6 +100,8 @@ DAEMON={("hestia","unreachable"),("hestia","disposition")}
 d=json.load(open(sys.argv[1]))
 live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
+# #1249: render a self-withdrawal when another notice wakes, never wake for it alone.
+quiet=lambda x: (x.get("from_plugin"),x.get("kind")) == ("hestia","disposition") and str(x.get("pointer_uri","")).endswith("#withdrawn")
 for x in live:
     if x.get("from_plugin") in ALLOW or (x.get("from_plugin"),x.get("kind")) in DAEMON:
         # AN UNDELIVERED ECHO IS NOT AN ANSWER (2026-08-06).
@@ -127,6 +129,9 @@ for x in live:
         # artefact as evidence is the same failure shape this hunk exists to remove, one
         # layer up, so it is gone rather than re-justified.
         _ptr = clean(x.get('pointer_uri',''))
+        if quiet(x):
+            print(f"~ QUIET id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={_ptr} queued_at={clean(x.get('queued_at',''))} — self-withdrawal; no wake for this row alone")
+            continue
         if "#undelivered:" in _ptr:
             print(f"!! NOT-AN-ANSWER id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} "
                   f"from={clean(x.get('from_plugin',''))} queued_at={clean(x.get('queued_at',''))} "
@@ -173,13 +178,17 @@ PY
 # it, are the only thing that still makes a delivery failure reach a member. That makes
 # the exclusion rule here load-bearing rather than belt-and-braces.
 #
-# So: everything that is not an explicit `! WITHHELD` disclosure wakes the member. A
-# line kind added later inherits "deliver" instead of silently emptying the batch, and
-# because FIREWORTHY=0 now holds exactly when every line is withheld, the refusal
-# message below is true by construction rather than by coincidence.
-FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -vc '^! ')
+# So: everything except an explicit `! WITHHELD` disclosure or `~ QUIET` withdrawal wakes
+# the member. A new line kind still inherits "deliver". Zero fireworthy rows has two distinct
+# causes: quiet withdrawals are consumed without a wake; withheld senders retain the primer.
+FIREWORTHY=$(printf '%s\n' "$DIGEST" | grep -vc -e '^! ' -e '^~ ')
 WITHHELD=$(printf '%s\n' "$DIGEST" | grep -c '^! ')
+QUIET=$(printf '%s\n' "$DIGEST" | grep -c '^~ ')
 if [ "$FIREWORTHY" -eq 0 ]; then
+  if [ "$WITHHELD" -eq 0 ]; then
+    echo "[fire-codex] $QUIET self-withdrawal disposition(s), and nothing else to fire — not firing"
+    exit 0
+  fi
   echo "[fire-codex] REFUSING: $WITHHELD notice(s) from unallowlisted sender(s), and nothing else to fire." >&2
   printf '%s\n' "$DIGEST" | grep '^! ' >&2
   echo "[fire-codex] The drain is consume-once — exiting 70 so the watcher RETAINS the primer." >&2
@@ -229,7 +238,7 @@ def liveness(x):
     ev = x.get("recipient_liveness_evidence") or {}
     if not isinstance(ev, dict) or not ev:
         # No liveness record at all — not a dormancy verdict, an absence of one.
-        return ("; recipient NEVER SEEN on this mesh — likely misrouted, try the hub mesh"
+        return ("; recipient NEVER SEEN on this mesh (no liveness record: no watcher here has read that name's mailbox)"
                 if live == "unknown" else "")
     bits = []
     age = _age_secs(ev.get("last_inbox_touch"))
@@ -480,5 +489,10 @@ cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-m
 # The fired CLI's rc IS this script's rc. A dead fire costs attention, not data — the
 # mesh is pointer-based and every pointer is committed.
 RC=$?
+# Only a completed member CLI wake mints invitation-specific observation; watcher drains do not.
+if [ "$RC" -eq 0 ]; then
+  printf '%s\n' "$DIGEST" | HESTIA_MESH_PLUGIN="$MEMBER" python3 "$HERE_DIR/hestia-mesh.py" presented >> "$LOG_DIR/codex-$STAMP.log" 2>&1 || \
+    echo "[fire-codex] WARNING: invitation presentation was not recorded; the member remains unanswered, not observed." >> "$LOG_DIR/codex-$STAMP.log"
+fi
 echo "[fire-codex] done rc=$RC (log: $LOG_DIR/codex-$STAMP.log)"
 exit "$RC"

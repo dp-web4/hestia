@@ -59,6 +59,19 @@ from typing import Any, Dict, Iterator, Optional, Sequence
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 MAX_WINDOW = 500  # handler clamps with .min(500)
 
+# One outcome vocabulary for every census (#540). Corroboration is evidence and a claim is
+# post-decision consumption; neither is terminal. Rates over the ask channel count attempts,
+# not only the subset that minted an escalation id.
+ESCALATION_TERMINAL_EVENTS = frozenset({
+    "gate_escalation_decided",
+    "gate_escalation_expired",
+    "gate_escalation_withdrawn",
+})
+ESCALATION_ATTEMPT_EVENTS = frozenset({
+    "gate_escalation_opened",
+    "gate_escalation_refused",
+})
+
 # The only keys `filter` understands. Anything else is silently ignored, so we refuse
 # it here rather than let the daemon serve a confidently wrong answer (trap 1).
 _ALLOWED_FILTER_KEYS = frozenset({"limit", "tool_name", "hash"})
@@ -91,6 +104,28 @@ def payload(entry: Dict[str, Any]) -> Dict[str, Any]:
         merged.update(inner)
         return merged
     return d
+
+
+def terminal_escalation_ids(entries) -> set[str]:
+    """The DISTINCT escalation ids that reached a terminal event, for COUNTING outcomes.
+
+    One id per escalation however many terminal rows it has (a decision followed by an
+    expiry, or replayed evidence), so a census that asks "how many escalations ended" cannot
+    inflate the count. Rows with no `escalation_id` are ignored.
+
+    Not a replacement for the per-entry maps in factor_attribution_census.py,
+    grounds_vs_acts.py and retired_before_review.py: those need the terminal ENTRY (its
+    timestamp, its status) and so keep `{id: entry}`. What they share with this helper is the
+    one event set, `ESCALATION_TERMINAL_EVENTS`, which escalation_outcomes_test.py pins.
+    """
+    terminal = set()
+    for entry in entries:
+        if entry.get("eventType") not in ESCALATION_TERMINAL_EVENTS:
+            continue
+        escalation_id = payload(entry).get("escalation_id")
+        if escalation_id:
+            terminal.add(escalation_id)
+    return terminal
 
 
 class ChainWalker:

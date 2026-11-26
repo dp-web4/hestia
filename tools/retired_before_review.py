@@ -2,10 +2,11 @@
 """Does the petition outlive its own invitation? — time-to-terminal vs time-to-factor.
 
 WHY. `peer_participation()` retains the peer conjunct as evidence: who was invited
-against who answered, "so that three invited seats that all declined to look is a
-finding". `invitation_deadletter_census.py` already showed one way that `absent` lies:
-an invited id whose mailbox nobody reads is indistinguishable from a peer who read the
-ask and ignored it. This measures a SECOND way, with a different mechanism: the row was
+against who answered. `invitation_deadletter_census.py` showed one way that `absent`
+could be misread as a decline: an invited id whose mailbox nobody reads was
+indistinguishable from a peer who read the ask and ignored it. Current code calls that
+state `unanswered`, never a refusal. This measures a SECOND route problem, with a
+different mechanism: the row was
 already terminal when the invitee woke. Nothing retracts an invitation when its
 petition is decided, withdrawn or expired, so the notice keeps its place in the primer
 and the invitee spends a wake slot dereferencing a corpse.
@@ -73,7 +74,7 @@ import datetime, json, re, sys, statistics
 from collections import Counter
 
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
-from chain_walk import ChainWalker, payload
+from chain_walk import ChainWalker, ESCALATION_TERMINAL_EVENTS, payload
 
 MAX = 60_000
 JSON_OUT = False
@@ -83,7 +84,7 @@ while _a:
     if x == "--json": JSON_OUT = True
     else: MAX = int(x)
 
-TERMINAL = {"gate_escalation_decided", "gate_escalation_withdrawn", "gate_escalation_expired"}
+TERMINAL = ESCALATION_TERMINAL_EVENTS
 
 def esc_id(p):
     return p.get("escalation_id") or p.get("id")

@@ -364,12 +364,13 @@ def test_gate_file_shell_write_refused():
                   claims and [str(x) for x in claims[0].get("resolved_targets", [])][-1:]
                   and str(claims[0]["resolved_targets"][-1]).endswith(
                       os.path.basename(gate_file(fx, seat))), claims)
-            # Codex P1-2 on #1239: an ORDINARY governed target first, padding past the summary's
-            # bound, the seat's gate LAST. The closure reports the first; the claim must carry
-            # every governed target, so the daemon can price the gate.
+            # Codex P1-2 on #1239: an ORDINARY governed target first, padding past the recorded
+            # act's 4,000-character bound (#1569), the seat's gate LAST. The closure reports the
+            # first; the claim must carry every governed target, so the daemon can price the gate.
             mark = len(stub.calls)
             ordinary = os.path.join(fx.repo, "plugins", "_shared", "ordinary.txt")
-            pad = " ".join(os.path.join(fx.repo, "docs", f"pad{i}.txt") for i in range(25))
+            pad_path = os.path.join(fx.repo, "docs", "pad.txt")
+            pad = " ".join([pad_path] * (4000 // len(pad_path) + 1))
             v2, text2, _ = run(seat, home, native(seat, "Bash", {
                 "command": f"touch {ordinary} {pad} {gate_file(fx, seat)}"}, n=2))
             check(f"{seat}-multi-denied", v2 == "deny" and "gate.self_access" in text2, text2)
@@ -377,7 +378,7 @@ def test_gate_file_shell_write_refused():
             check(f"{seat}-multi-claim-carries-every-governed-target",
                   multi and multi[0].get("resolved_targets") == [ordinary, gate_file(fx, seat)],
                   multi)
-            check(f"{seat}-multi-summary-lost-the-gate (the case the targets exist for)",
+            check(f"{seat}-multi-record-lost-the-gate (the case the targets exist for)",
                   multi and os.path.basename(gate_file(fx, seat)) not in multi[0].get("reason", ""),
                   multi)
             # The glob row (kimi, #1231 Q4): `rm <hooks dir>/*.py` is refused, and the claim

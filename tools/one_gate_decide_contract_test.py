@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import re
 import time
 import uuid
 
@@ -65,6 +66,17 @@ RAN: list = []
 def check(name, ok, detail=""):
     if not ok:
         FAILS.append(f"{name}{': ' + str(detail)[:600] if detail else ''}")
+
+
+def _gate_has_deliberate_escalation() -> bool:
+    """True once #1497's gate half (held/build-noauto) is in the gate under test: the single gate
+    then renders a scope `not_asked` as "nothing was sent" with the escalate command. Read from
+    the source the test loads (an OVERLAY copy wins), so a staged run checks the new contract."""
+    src = pathlib.Path(OVERLAY.get("hestia_single_gate") or SHARED / "hestia_single_gate.py")
+    try:
+        return "Nothing was sent to the operator or to any peer" in src.read_text()
+    except OSError:
+        return False
 
 
 def load_engine():
@@ -109,7 +121,7 @@ class Policy:
                  scope_spend_fails=False, scope_lost=None):
         self.query = query or (lambda a: "allow")
         self.superseded = superseded
-        self.claim = claim                 # escalate | approve
+        self.claim = claim                 # escalate | approve | not_asked
         # hestia_scope_claim: path -> opened | pending | approved | in_force | refused | absent
         self.scope_claim = scope_claim or (lambda path: "opened")
         self.scope_spend_fails = scope_spend_fails   # the atomic reserve refuses (a race)
@@ -214,6 +226,16 @@ class Stub:
             if p.claim == "approve":
                 return _ok(rid, {"claimed": True, "permits_write": True, "decided_by": "stub-human",
                                  "decided_via": "stub"})
+            if p.claim == "not_asked":        # dp, 2026-11-05: recorded, nothing opened
+                return _ok(rid, {"claimed": False, "permits_write": False, "not_asked": True,
+                                 "refusal_id": "refusal-stubgov", "escalation_id": None,
+                                 "detail": "refused; nothing was sent to the operator or to any "
+                                           "peer. hestia gate escalate refusal-stubgov --as "
+                                           f"{args.get('plugin_id')} --reason '...'",
+                                 # what an OLDER gate prints when no id comes back (mixed versions)
+                                 "error": "not asked — refused; nothing was sent to the operator "
+                                          "or to any peer. hestia gate escalate refusal-stubgov "
+                                          f"--as {args.get('plugin_id')} --reason '...'"})
             return _ok(rid, {"claimed": False, "permits_write": False,
                              "escalation_id": "stub-esc-" + uuid.uuid4().hex[:8],
                              "how_to_decide": "stub: nobody decides"})
@@ -247,6 +269,9 @@ class Stub:
             if verdict == "absent":            # an older daemon: no such verb
                 return _ok(rid, {"ok": True})
             rid_ = "scope-stub" + str(abs(hash(path)) % 10**6)
+            if verdict == "not_asked":        # dp, 2026-11-05: nothing opened, a refusal recorded
+                return _ok(rid, {"verdict": verdict, "refusal_id": "refusal-stub" + rid_[10:],
+                                 "permits": False, "detail": "stub not_asked", "path": path})
             permits = verdict in ("in_force", "approved")
             return _ok(rid, {"verdict": verdict, "request_id": rid_, "permits": permits,
                              "detail": f"stub {verdict}", "path": path})
@@ -347,7 +372,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
     """The act in this harness's native hook event, shaped on recorded events (see docstring)."""
     if seat == "claude-code":
         return {"session_id": "9261dc9a-0000-4000-8000-00000000c1a0",
-                "transcript_path": "/home/probe/.claude/projects/x/9261dc9a.jsonl", "cwd": cwd,
+                "transcript_path": "/home/member/.claude/projects/x/9261dc9a.jsonl", "cwd": cwd,
                 "permission_mode": "default", "hook_event_name": "PreToolUse",
                 "tool_name": act_tool, "tool_input": act_input, "tool_use_id": f"toolu_01Contract{n:04d}"}
     if seat == "codex":
@@ -360,7 +385,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
         else:
             tool, ti = act_tool, act_input
         return {"session_id": "019f94e0-0000-7000-8000-00000000c0de", "turn_id": f"019f94e0-{n:04d}",
-                "transcript_path": "/home/probe/.codex/sessions/rollout.jsonl", "cwd": cwd,
+                "transcript_path": "/home/member/.codex/sessions/rollout.jsonl", "cwd": cwd,
                 "hook_event_name": "PreToolUse", "model": "gpt-probe", "permission_mode": "default",
                 "tool_name": tool, "tool_input": ti, "tool_use_id": f"call_Contract{n:04d}"}
     if seat == "kimi":
@@ -373,7 +398,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
                 "cwd": cwd, "tool_name": act_tool, "tool_input": ti, "tool_call_id": f"tool_Contract{n:04d}"}
     gtool = {"Read": "read_file", "Edit": "replace", "Write": "write_file",
              "Bash": "run_shell_command"}.get(act_tool, act_tool)
-    return {"session_id": "gemini-contract-session", "transcript_path": "/home/probe/.gemini/tmp/chat.json",
+    return {"session_id": "gemini-contract-session", "transcript_path": "/home/member/.gemini/tmp/chat.json",
             "cwd": cwd, "hook_event_name": "BeforeTool", "timestamp": "2026-10-01T00:00:00Z",
             "tool_name": gtool, "tool_input": dict(act_input)}
 
@@ -383,14 +408,15 @@ def native_event(seat, act_tool, act_input, cwd, n):
 class _Env:
     """Point the mechanism at a stub (or a dead port) for one test; restore after."""
 
-    def __init__(self, m, url, home: pathlib.Path):
+    def __init__(self, m, url, home: pathlib.Path, workspace: pathlib.Path | None = None):
         self.m, self.url, self.home = m, url, home
+        self.workspace = workspace or REPO.parent
 
     def __enter__(self):
         self.saved = {k: os.environ.get(k) for k in ("HESTIA_ENDPOINT", "HESTIA_HOME", "HESTIA_WORKSPACE")}
         os.environ["HESTIA_ENDPOINT"] = self.url
         os.environ["HESTIA_HOME"] = str(self.home)
-        os.environ["HESTIA_WORKSPACE"] = str(REPO.parent)
+        os.environ["HESTIA_WORKSPACE"] = str(self.workspace)
         self.m._POLICY_SNAPSHOT_CACHE.clear()
         self.saved_disc = self.m._discover_endpoint
         self.m._discover_endpoint = lambda: self.url
@@ -444,6 +470,8 @@ def test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial(m, g, w
                 check(f"{tag}-denial-carries-rule", second.get("rule_id") == "gate.evidence_uncommitted", second)
                 check(f"{tag}-denial-names-what-it-replaced",
                       "supersedes uncommitted allow" in (second.get("attempted") or ""), second)
+                check(f"{tag}-synthetic-denial-is-not-the-exact-original-act",
+                      second.get("attempted_exact") is False, second)
             finally:
                 stub.close()
     # A PERMITTED read whose RECORD does not commit keeps C11's read posture and says so (C11 text).
@@ -498,6 +526,48 @@ def test_the_key_from_the_raw_event_reaches_every_join(m, g, wc, home):
         check("closure-escalation-surfaced", bool(d.escalation_id), d)
     finally:
         stub.close()
+    # dp, 2026-11-05: the current daemon opens no escalation on a refused governance write.
+    # The deny says nothing was sent, names the deliberate door, and carries no escalation id.
+    stub = Stub(Policy(claim="not_asked"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Write", {"file_path": str(SHARED / "hestia_gate_core.py"),
+                                                "content": "x"}, home, n=10)
+        check("closure-not-asked-denies", d.decision == "deny" and d.rule == "gate.self_access", d)
+        check("closure-not-asked-says-nothing-sent",
+              "nothing was sent to the operator or to any peer" in d.reason, d.reason)
+        check("closure-not-asked-names-the-door",
+              "hestia gate escalate refusal-stubgov --as kimi" in d.reason, d.reason)
+        check("closure-not-asked-no-escalation-id", not d.escalation_id, d)
+        check("closure-not-asked-no-open-talk", "is open" not in d.reason
+              and "escalation opened" not in d.reason, d.reason)
+    finally:
+        stub.close()
+
+
+def test_escalation_record_carries_the_full_held_patch_apply(m, g, wc, home):
+    digest = "61fcd377" * 8
+    with tempfile.TemporaryDirectory() as tmp:
+        patch = pathlib.Path(tmp) / ("d" * 120) / "held" / f"{digest}.patch"
+        patch.parent.mkdir(parents=True)
+        patch.write_text("diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py\n"
+                         "--- a/plugins/_shared/hestia_gate_core.py\n"
+                         "+++ b/plugins/_shared/hestia_gate_core.py\n"
+                         "@@ -1 +1 @@\n-old\n+new\n")
+        command = f"git -C {REPO} apply {patch}"
+        check("held-patch-fixture-is-past-display-depth", len(command) > 220, len(command))
+        stub = Stub()
+        try:
+            with _Env(m, stub.url, home):
+                _decide(g, "kimi", "Bash", {"command": command}, home)
+            claims = [a for a, _ in stub.named("hestia_gate_escalation_claim")]
+            check("held-patch-claim-is-present", len(claims) == 1, claims)
+            if claims:
+                reason = claims[0].get("reason")
+                check("held-patch-act-is-uncut", reason == f"Bash: {command}", reason)
+                check("held-patch-digest-survives", isinstance(reason, str) and digest in reason, reason)
+        finally:
+            stub.close()
 
 
 def test_the_gate_owns_no_cache_no_client_and_one_recorder(m, g, wc, home):
@@ -1017,6 +1087,31 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
         check("scope-read-escalates", d.decision == "deny" and d.rule == "mrh.path" and d.escalation_id, d)
     finally:
         stub.close()
+    # (1b) dp, 2026-11-05: the current daemon opens NOTHING. The deny says nothing was sent,
+    # names the deliberate escalation with the refusal id, and carries no escalation_id
+    # (nothing is pending, so there is nothing to watch).
+    stub = Stub(Policy(scope_claim=lambda p: "not_asked"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-not-asked-denies", d.decision == "deny" and d.rule == "mrh.command", d)
+        if _gate_has_deliberate_escalation():
+            check("scope-not-asked-says-nothing-sent",
+                  "Nothing was sent to the operator or to any peer" in d.reason, d.reason)
+            check("scope-not-asked-names-the-door",
+                  "hestia scope escalate refusal-stub" in d.reason and "--as claude-code" in d.reason,
+                  d.reason)
+        else:
+            # The gate half of #1497 is held (held/build-noauto), not applied. Until it lands,
+            # this is the README's "old gate, new daemon" row: the old gate reads not_asked as
+            # not_opened, denies, opens nothing, and names a deliberate door.
+            check("scope-not-asked-names-a-door (held gate half not applied)",
+                  "hestia_request_scope" in d.reason, d.reason)
+        check("scope-not-asked-no-escalation-id", d.escalation_id is None, d)
+        check("scope-not-asked-no-pending-talk", "is open for" not in d.reason
+              and "still pending" not in d.reason, d.reason)
+    finally:
+        stub.close()
     # (2) approved once / in force: lifted, and the act goes on to society law.
     for verdict in ("approved", "in_force"):
         stub = Stub(Policy(scope_claim=lambda p, v=verdict: v))
@@ -1189,14 +1284,15 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
     finally:
         stub.close()
     # (7) device sinks and temp roots are never escalated.
-    stub = Stub(Policy())
-    try:
-        with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
-        check("scope-sinks-allowed", d.decision == "allow", d)
-        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
-    finally:
-        stub.close()
+    with tempfile.TemporaryDirectory(dir="/tmp") as sink, tempfile.TemporaryDirectory() as workspace:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home, workspace=pathlib.Path(workspace)):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"ls 2>/dev/null >{sink}/x"}, home)
+            check("scope-sinks-allowed", d.decision == "allow", d)
+            check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
+        finally:
+            stub.close()
 
 
 def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
@@ -1725,7 +1821,7 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
     stub = Stub()
     try:
         with _Env(m, stub.url, home):
-            sibling = REPO.parent / "decide-contract-ungranted-sibling"
+            sibling = REPO.parent / f"decide-contract-ungranted-sibling-{uuid.uuid4().hex}"
             sibling.mkdir(exist_ok=True)
             try:
                 raw = native_event("gemini", "mcp_fs_read", {"path": "x"}, str(REPO), 14)
@@ -1751,14 +1847,49 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
 #: multi-second stall was measured here under `cargo -j2`, the #423 jitter class) cannot turn a
 #: behaviour check into a timing flake. The real deadline is what the parity arm runs at.
 RELAXED_DEADLINE_SECONDS = 15.0
+def test_attempted_exact_preserves_raw_whitespace_identity(m, g, wc, home):
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            expected = (
+                ("printf 'alpha beta'", True),
+                ("printf 'alpha  beta'", False),
+                ("printf 'alpha beta' ", False),
+            )
+            for command, exact in expected:
+                d, _ = _decide(g, "codex", "Bash", {"command": command}, home)
+                check("whitespace-act-recorded", d.evidence_committed, d)
+                sent = stub.named("hestia_witness_decision")[-1][0]
+                check(f"raw-whitespace-exact-{exact}", sent.get("attempted_exact") is exact, sent)
+            first, second = [a for a, _ in stub.named("hestia_witness_decision")][:2]
+            check("whitespace-distinct-acts-share-only-a-normalized-summary",
+                  first.get("attempted") == second.get("attempted")
+                  and first.get("attempted_exact") is True
+                  and second.get("attempted_exact") is False,
+                  (first, second))
+            for tool, tool_input in (
+                ("Bash", {"command": ["printf", "a b"]}),
+                _act(IN_SCOPE_EDIT),
+            ):
+                d, _ = _decide(g, "codex", tool, tool_input, home)
+                check("non-string-act-recorded", d.evidence_committed, d)
+                sent = stub.named("hestia_witness_decision")[-1][0]
+                check("only-a-preserved-string-command-can-be-exact",
+                      sent.get("attempted_exact") is False, sent)
+    finally:
+        stub.close()
+
+
 DEADLINE_TESTS = {"test_one_deadline_bounds_the_whole_invocation",
                   "test_the_gate_owns_no_cache_no_client_and_one_recorder",
                   # The real daemon is where the cold-start caveat lives: it MUST run at 3 s.
                   "test_against_an_isolated_real_daemon"}
 
 CONTRACT_TESTS = [
+    test_attempted_exact_preserves_raw_whitespace_identity,
     test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
     test_the_key_from_the_raw_event_reaches_every_join,
+    test_escalation_record_carries_the_full_held_patch_apply,
     test_the_gate_owns_no_cache_no_client_and_one_recorder,
     test_one_deadline_bounds_the_whole_invocation,
     test_c_threads_the_deadline_through_the_mechanism,
@@ -1786,7 +1917,7 @@ CONTRACT_TESTS = [
 
 # ── parity arm (subprocesses) ─────────────────────────────────────────────────────────────────
 
-PROBE_HOME = "/home/gate-parity-probe"   # text the gates classify; never a path touched
+PROBE_HOME = "/home/member"   # text the gates classify; never a path touched
 #: A credential-file path, assembled from parts so its literal never has to be typed anywhere.
 CRED_PATH = (PROBE_HOME + "/.config/x/." + "e" + "nv")
 
@@ -2274,16 +2405,20 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         check("real-daemon-deny-one-row", d.evidence_committed, d)
         d = run("Read", {"file_path": str(REPO / "README.md")}, 4)
         check("real-read-allowed-and-recorded", d.decision == "allow" and d.evidence_committed, d)
-        # A scope refusal against the REAL daemon opens a request, and a re-issue finds it
-        # (hestia_scope_claim, 2026-10-05). An older daemon answers no-channel; say so.
+        # A scope refusal against the REAL daemon opens NOTHING (dp, 2026-11-05, #1497: "deny
+        # with option to escalate ... as a deliberate act"). The deny names a refusal id the
+        # member may escalate, and a re-issue names the same one. Both the held gate and the
+        # current gate carry the daemon's refusal id through to the deny text.
         d = run("Bash", {"command": "cat /etc/hostname"}, 5)
         check("real-scope-refusal-is-mrh-command", d.decision == "deny" and d.rule == "mrh.command", d)
-        check("real-scope-refusal-opens-a-request", bool(d.escalation_id)
-              and str(d.escalation_id).startswith("scope-"), d)
+        check("real-scope-refusal-opens-nothing", not d.escalation_id, d)
+        rid = re.search(r"\b(refusal-[0-9a-f]{8,})\b", d.reason or "")
+        check("real-scope-refusal-names-an-escalatable-refusal", rid and "escalate" in d.reason, d.reason)
         again = run("Bash", {"command": "cat /etc/hostname"}, 6)
-        check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
-              (d.escalation_id, again.escalation_id))
-        check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
+        check("real-scope-reissue-opens-nothing", not again.escalation_id, again)
+        rid2 = re.search(r"\b(refusal-[0-9a-f]{8,})\b", again.reason or "")
+        check("real-scope-reissue-keeps-the-refusal-id", rid and rid2 and rid.group(1) == rid2.group(1),
+              (rid and rid.group(1), rid2 and rid2.group(1)))
         # dp, 2026-10-14 (hestia#1313): an act whose reach an expansion decides is refused under
         # its own rule against the real handler too, and opens no request, on a re-issue either.
         u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)

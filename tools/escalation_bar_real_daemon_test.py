@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""The RECORDED bar of a real escalation, opened by every seat's real gate on a real daemon.
+"""The RECORDED bar of a real escalation after every seat's real gate refuses a write.
 
 Why this exists. The seat-boundary suite asserts that a write to a member's gate entry is
 REFUSED, against a stub daemon whose escalation reply is canned, so it cannot see the price the
 daemon records. An escalation that opens at one approver where two factors were owed is refused
 just the same, and is weaker. This file runs each seat's real gate against an ISOLATED daemon,
-lets the daemon open the escalation for real, then reads the escalation back
+deliberately escalates the recorded refusal, then reads the real escalation back
 (`hestia://escalation/<id>`) and asserts the bar it recorded.
 
 It covers the spellings whose summary cannot carry the entry's location: a write relative to the
@@ -97,28 +97,56 @@ def read_escalation(url, esc_id):
 
 
 ESC_ID = re.compile(r"Escalation ([0-9a-f]{8,}) is open")
+REFUSAL_ID = re.compile(r"\b(refusal-[0-9a-f]{8,})\b")
+
+
+def escalate(url, member, refusal_id):
+    """The member's deliberate act (dp, 2026-11-05): the gate records the refusal and opens
+    nothing; the member escalates it with a reason. The escalation carries the gate's own act,
+    marker and targets, so the bar it records is the one the gate's claim would have priced."""
+    sid, _ = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "escalation-bar-test", "version": "0"}}})
+    _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+    _, out = _post(url, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "hestia_gate_escalation_escalate", "arguments": {
+            "plugin_id": member, "refusal_id": refusal_id,
+            "reason": "escalation-bar test: price this refused write as the gate resolved it"}}}, sid)
+    content = ((out or {}).get("result") or {}).get("content") or []
+    try:
+        return json.loads(content[0]["text"]) if content else {"_raw": out}
+    except (KeyError, ValueError):
+        return {"_raw": out}
 
 
 def open_and_read(seat, home, event, label, shim_path=None):
     # A cold daemon (a debug build's first claims) can miss the gate's claim deadline: the gate
-    # then says OUTCOME UNKNOWN and that re-issuing the identical act is safe (it returns the
-    # same escalation). Its first witness can likewise miss the connect deadline before any
-    # claim or open: refusal_unwitnessed says so explicitly, and re-issuing opens at most one
-    # linked escalation after the session is warm. Re-issue, bounded; the refusal never depends on it.
+    # then says OUTCOME UNKNOWN and that re-issuing the identical act is safe. Its first
+    # witness can likewise miss the connect deadline before any claim: refusal_unwitnessed
+    # says so explicitly. Re-issue, bounded, to refresh the recorded refusal once the session
+    # is warm; only the deliberate escalate call below opens an escalation.
     for _attempt in range(3):
         v, text, _ = sb.run(seat, home, event, shim_path=shim_path)
         if "OUTCOME UNKNOWN" not in text and "refusal_unwitnessed" not in text:
             break
     check(f"{seat}-{label}-refused", v == "deny" and "gate.self_access" in text, text)
-    m = ESC_ID.search(text)
-    check(f"{seat}-{label}-escalation-opened", m, text)
-    rec = read_escalation(ENDPOINT, m.group(1)) if m else {}
+    # The deny opens nothing on its own: no "Escalation X is open" (a regression guard).
+    check(f"{seat}-{label}-deny-opened-nothing", not ESC_ID.search(text), text)
+    r = REFUSAL_ID.search(text)
+    check(f"{seat}-{label}-deny-names-refusal", r, text)
+    if not r:
+        return {}
+    opened = escalate(ENDPOINT, sb.SEATS[seat]["member"], r.group(1))
+    esc_id = opened.get("escalation_id")
+    check(f"{seat}-{label}-escalation-opened", esc_id, opened)
+    rec = read_escalation(ENDPOINT, esc_id) if esc_id else {}
     answers_deny = (rec.get("_opened") or {}).get("answers_deny") or ""
     check(f"{seat}-{label}-answers-deny", re.fullmatch(r"[0-9a-f]{64}", answers_deny), rec)
-    if _attempt == 0:
-        denial = re.search(r"DENY ([0-9a-f]{64}) — appeal", text)
-        check(f"{seat}-{label}-answers-deny-matches-refusal",
-              denial and answers_deny == denial.group(1), (text, rec))
+    # Every not_asked reissue refreshes the refusal's claim args. This fresh escalation
+    # therefore answers the final refusal even when the gate needed a bounded retry.
+    denial = re.search(r"DENY ([0-9a-f]{64}) — appeal", text)
+    check(f"{seat}-{label}-answers-deny-matches-refusal",
+          denial and answers_deny == denial.group(1), (text, rec))
     return rec
 
 
