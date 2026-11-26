@@ -21,6 +21,7 @@ CI's isolated-daemon job sets it. An endpoint on :7711 (the live daemon's port) 
 Run: python3 tools/decision_witness_contract_test.py
 """
 import http.server
+import importlib.util
 import json
 import os
 import pathlib
@@ -34,8 +35,16 @@ import urllib.error
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SHARED = REPO / "plugins" / "_shared"
+OVERLAY = json.loads(os.getenv("HESTIA_CONTRACT_OVERLAY") or "{}")
 if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
+for name in ("hestia_gate_mechanism", "hestia_witness_core"):
+    path = OVERLAY.get(name)
+    if path:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
 import hestia_gate_mechanism as m  # noqa: E402
 import hestia_witness_core as wc  # noqa: E402
 
@@ -183,8 +192,38 @@ def test_every_verdict_commits_on_a_receipt_that_names_it():
                      ("correlation_key", "toolu_01ABC"), ("session_id", "sess-1")):
             check(f"wire-arg-{k}", a.get(k) == v, a)
         check("wire-carries-core-digest-key", "core_digest" in a, a)
+        check("older-direct-callers-default-to-inexact", a.get("attempted_exact") is False, a)
     finally:
         stub.close()
+
+
+def test_an_older_daemon_gets_one_conservative_retry():
+    for exact in (True, False):
+        def older_daemon(rid, args):
+            if "attempted_exact" in args:
+                return ok_reply(rid, {"_hestia_error": {
+                    "code": "hestia.witness_decision_unknown_arg",
+                    "message": "unknown argument refused by the older daemon",
+                    "data": {"unknownKeys": ["attempted_exact"]},
+                }})
+            return None
+
+        stub = Stub(older_daemon)
+        try:
+            r = record(stub.url, "allow", attempted_exact=exact)
+            check("old-daemon-retry-committed", r.committed, r)
+            calls = stub.witness_calls()
+            check("old-daemon-retried-once", len(calls) == 2, calls)
+            check("old-daemon-first-carried-new-key", "attempted_exact" in calls[0], calls[0])
+            check("old-daemon-retry-drops-new-key", "attempted_exact" not in calls[1], calls[1])
+            if exact:
+                check("old-daemon-lossless-summary-unchanged",
+                      calls[1].get("attempted") == "Write -> /tmp/x", calls[1])
+            else:
+                check("old-daemon-lossy-summary-cannot-read-as-exact",
+                      calls[1].get("attempted", "").endswith(" …"), calls[1])
+        finally:
+            stub.close()
 
 
 def test_sse_framed_receipt_commits():
@@ -683,6 +722,7 @@ def test_real_daemon_warm_latency_within_hook_budget():
 
 TESTS = [
     test_every_verdict_commits_on_a_receipt_that_names_it,
+    test_an_older_daemon_gets_one_conservative_retry,
     test_sse_framed_receipt_commits,
     test_the_daemons_existing_row_is_a_committed_receipt,
     test_a_refused_verdict_is_not_committed,

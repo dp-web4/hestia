@@ -220,10 +220,17 @@ for script, stub, peer in CASES:
               f"'recipient dormant — queued, watcher not running', and routing could not "
               f"tell 'ask again' from 'this address is dead'")
 
-        check(f"B3. {script}: the never-seen misroute hint survives",
-              "NEVER SEEN" in never,
+        check(f"B3. {script}: the never-seen hint survives",
+              "NEVER SEEN" in never and "no liveness record" in never,
               f"row={never!r} — no liveness record is an ABSENCE of a verdict, and it "
               f"wants the opposite response from a quiet member")
+        # hestia#1604: "likely misrouted, try the hub mesh" fired on every NEVER SEEN row (51 of
+        # 385 on cbp, 11-17), named no route, and none of those names was a hub member: they
+        # were invitation-pool fixtures and model ids no reader chose. Say the fact, not a job.
+        check(f"B3b. {script}: the never-seen row describes, and prescribes no route",
+              not any(w in never.lower() for w in ("try ", "misrouted", "hub mesh")),
+              f"row={never!r} — an unanswerable row read as a task sends sessions probing "
+              f"for a hub sender (hestia#1604)")
 
         forged = [l for l in prompt.splitlines()
                   if l.startswith("- id=666") or l.startswith("- id=667")]

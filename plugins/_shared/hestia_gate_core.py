@@ -208,6 +208,12 @@ class Remedy:
 
 REMEDIES: dict[str, Remedy] = {
     # ── scope ────────────────────────────────────────────────────────────────────────────
+    "runtime.python_ambient_import": Remedy(
+        "For ad-hoc Python outside a declared trusted package root, prefer `python3 -I` so the "
+        "script directory, user site-packages, and PYTHON* environment cannot change what gets "
+        "imported. If local sibling imports are intentional, run from the declared package root "
+        "instead; -I is hygiene, not a sandbox.",
+    ),
     "mrh.path": Remedy(
         "Adjust to work within scope. If the path is genuinely needed: when this refusal names "
         "a scope request id, the gate already opened it for you — a NOT-SAME peer decides it "
@@ -2053,12 +2059,14 @@ _LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
 #: quotes (no field splitting, no globbing at that use) — evidence the literal rule needs before a
 #: whitespace value may bind, and that a data position needs before an expansion is one argument.
 _DQ_REF = "\x04"
+#: An UNQUOTED opening brace in a word: prose-filter evidence only, not an enumeration claim.
+_BRACE_OPEN = "\x05"
 #: `$'…'` (ANSI-C) and `$"…"` (locale) quoting rewrite their content; never modelled. The word
 #: carries this unbound parameter reference, so wherever it is judged as a path it is
 #: unenumerated (`ANSI-C` is not an identifier: no assignment can ever bind it).
 _ANSI_C_MARK = "${ANSI-C}"
 #: Every byte the lexer uses as an IN-BAND marker (`_LIT_DOLLAR`, `\x01` in `_path_shaped`,
-#: `_LIT_TICK`, `_BRACE`, `_DQ_REF`) plus one spare. A command that already contains one could
+#: `_LIT_TICK`, `_BRACE`, `_DQ_REF`, `_BRACE_OPEN`). A command that already contains one could
 #: forge quote / literal evidence (Codex 20554: `cat \x04$S` read as a quoted use), so such a
 #: command is UNENUMERATED before any marker is inserted. (`_ANSI_C_MARK` is spelled in shell
 #: syntax; forging it only makes a word unenumerated, the strict direction.)
@@ -2198,8 +2206,10 @@ def _tokenize(text: str) -> list:
             continue
         if c in "*?[":
             uglob = True
-        if c == "{" and _BRACE_EXPANSION.match(text, i):
-            buf.append(_BRACE)                   # brace expansion: never modelled (dp, 2026-10-10)
+        if c == "{":
+            buf.append(_BRACE_OPEN)               # any unquoted open: prose filter stays conservative
+            if _BRACE_EXPANSION.match(text, i):
+                buf.append(_BRACE)               # brace expansion: never modelled (dp, 2026-10-10)
         buf.append(c)
         in_word = True
         i += 1
@@ -2255,12 +2265,23 @@ _GIT_GREP_SPEC = dict(_GREP_SPEC)
 #: Heads whose PATTERN operands the in-workspace passes of `command_scope_reach` do not read as
 #: reaches (#1241 recut, SAGE #368): the tool matches the text against what it reads and never
 #: opens it. Recorded by value in `_Found.patterns`, LITERAL words only (an expansion stays live).
-_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep"))
+_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep", "pgrep", "pkill"))
+#: `pgrep` / `pkill` (#1595): the first positional is a regex matched against process names or
+#: (`-f`) command lines; neither tool opens it. Their one FILE operand is `-F` / `--pidfile`.
+#: `signal_words`: pkill's `-HUP` / `-9` / `-SIGTERM` is a flag, not a cluster that hands `-U` or
+#: `-P` a value. Options are the union of the BSD (macOS) and procps (Linux) spellings.
+_PGREP_SPEC = {"pattern_first": True, "signal_words": True,
+               "file_opts": {"-F", "--pidfile"},
+               "value_opts": {"-G", "-g", "-P", "-s", "-t", "-U", "-u", "-d", "-c", "-O", "-r",
+                              "--delimiter", "--group", "--pgroup", "--parent", "--session",
+                              "--terminal", "--euid", "--uid", "--ns", "--nslist", "--signal",
+                              "--older", "--runstates", "--cgroup", "--env"}}
 _CMD_SPECS = {
     "tr": {"positional": "strings"},
     "echo": {"positional": "strings_noglob"},
     "printf": {"positional": "strings_noglob"},
     "grep": _GREP_SPEC, "egrep": _GREP_SPEC, "fgrep": _GREP_SPEC, "zgrep": _GREP_SPEC,
+    "pgrep": _PGREP_SPEC, "pkill": _PGREP_SPEC,
     "rg": {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_opts": {"-f", "--file"},
            "value_opts": {"-g", "--glob", "-t", "--type", "-T", "--type-not", "-m", "--max-count",
                           "-A", "-B", "-C", "-j", "--threads", "-M", "--max-columns",
@@ -2280,6 +2301,15 @@ _CMD_SPECS = {
                               "-regex", "-iregex", "-lname", "-ilname"},
              "string_opts": {"-printf"}},
     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
+    # gh's `-q`/`--jq` takes a jq expression in every subcommand that has it: 55 of 55 in `gh help
+    # reference` (gh 2.x, McNugget, 2026-11-10). `--template` and `-t` are NOT listed: under `repo
+    # edit` and `auth status` they are booleans, so the next word would be swallowed (#1314).
+    "gh": {"string_opts": {"--jq", "-q"}},
+    # jq's first operand is its FILTER, unless `-f`/`--from-file` supplies the program (then every
+    # operand is a file). `-L` and its jq 1.8 long form `--library-path` name a library directory
+    # and are judged (legion-claude on #1550: without the long form its DIR became the filter).
+    "jq": {"pattern_first": True, "file_opts": {"-f", "--from-file"},
+           "value_opts": {"--indent", "-L", "--library-path"}},
 }
 _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
 #: Heads whose `-c` value is shell code (they also disqualify the literal rule).
@@ -2514,7 +2544,8 @@ def _word_value(value: str, known=None) -> str:
             raise _Unenumerated(_expansion_kind(ref))
         last = b
     out.append(value[last:])
-    return ("".join(out).replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"))
+    return ("".join(out).replace(_DQ_REF, "").replace(_BRACE_OPEN, "")
+            .replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"))
 
 
 def _path_shaped(value: str, uglob: bool) -> bool:
@@ -2930,6 +2961,10 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             if opt in spec.get("code_opts", ()):
                 code(w)
                 continue
+            if opt in spec.get("file_opts", ()):
+                # The program came from a file (`grep -f P`, `sed -f S`, `jq -f F`): every operand
+                # is a file. Before this the first one was taken as the pattern and never judged.
+                state["pattern_given"] = True
             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
                     or opt in _string_opts(head, spec, state["subs"])) and not uglob:
                 if opt in spec.get("pattern_opts", ()):
@@ -2968,11 +3003,14 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
                      | strs | spec.get("file_opts", set())
                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+            if spec.get("signal_words") and w not in takes \
+                    and re.fullmatch(r"-(?:SIG)?[A-Z][A-Z0-9+-]*|-[0-9]+", w):
+                continue                                   # `pkill -HUP`, `-9`, `-SIGTERM` (#1595)
             if eq:
                 if name in spec.get("code_opts", ()):
                     code(val)
                     continue
-                if name in spec.get("pattern_opts", ()):
+                if name in spec.get("pattern_opts", ()) or name in spec.get("file_opts", ()):
                     state["pattern_given"] = True
                 if uglob or not (name in spec.get("delim_opts", ())
                                  or name in spec.get("pattern_opts", ())
@@ -3003,7 +3041,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 if w[:2] in spec.get("code_opts", ()):
                     code(w[2:])
                     continue
-                if w[:2] in spec.get("pattern_opts", ()):
+                if w[:2] in spec.get("pattern_opts", ()) or w[:2] in spec.get("file_opts", ()):
                     state["pattern_given"] = True
                 if uglob or not (w[:2] in spec.get("delim_opts", ())
                                  or w[:2] in spec.get("pattern_opts", ())
@@ -3011,6 +3049,43 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     emit(w[2:], uglob)
                 elif w[:2] in spec.get("pattern_opts", ()):
                     pattern(w[2:], judge=False)            # as before, plus its value recorded
+                continue
+            run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
+            valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
+            # Pattern and delimiter options only: string options are head-wide and some are booleans in
+            # another subcommand (`git checkout -m`), so a cluster ending in one keeps the old scan.
+            worded = spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued | worded), None) if run else None
+            if fat is not None and head == "sed" and "i" in w[1:fat]:
+                fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
+            if fat is not None and "-" + w[fat] in worded:
+                # A clustered option whose value is TEXT (`grep -nefoo`: `-e` takes `foo`, #1560): getopt
+                # hands it the rest of the word, or the next word, so the letters after it are its value,
+                # not options (before this the scan went on and judged `oo` as a `-f` program file). Its
+                # value is skipped as the attached spelling's is (`-efoo`), unless it carries an unquoted
+                # glob the shell expands. A pattern option still means every operand is a file.
+                opt = "-" + w[fat]
+                if opt in spec.get("pattern_opts", ()):
+                    state["pattern_given"] = True
+                if fat == len(w) - 1:
+                    state["pending"] = opt
+                elif uglob:
+                    emit(w[fat + 1:], uglob)
+                elif opt in spec.get("pattern_opts", ()):
+                    pattern(w[fat + 1:], judge=False)
+                continue
+            if fat is not None:
+                # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
+                # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
+                # the word, or the next word, which is judged as that option's value always is. A
+                # program-file option also means every operand is a file. A letter before it that
+                # itself takes a value only makes this judge more, never less.
+                if "-" + w[fat] in spec.get("file_opts", ()):
+                    state["pattern_given"] = True
+                if fat == len(w) - 1:
+                    state["pending"] = "-" + w[fat]
+                else:
+                    emit(w[fat + 1:], uglob)
                 continue
             m = _ATTACHED_OPT.match(w)
             if m:
@@ -3364,7 +3439,17 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
     # environment must not become authority.
     patterns, judged_words = _grammar_patterns(cmd, cwd)
-    for after in cmd.split(workspace)[1:]:
+    # THE TEXT PASSES 1 AND 2 SCAN (#1594): the same text pass 3 judges, with every DATA heredoc
+    # body removed (`_strip_data_heredocs`). Before this they read the raw command, so prose in a
+    # quoted `cat > f <<'EOF'` body naming `<ws>/..` was refused and opened a scope request for the
+    # workspace's parent. A body the shell runs, an interpreter's path literals and every `$( )` in
+    # an unquoted-delimiter body are kept by that function, so they stay judged. A heredoc it cannot
+    # read leaves the raw text here: pass 3 refuses that act as unenumerated anyway.
+    try:
+        scan = _strip_data_heredocs(cmd)
+    except _Unmodelled:
+        scan = cmd
+    for after in scan.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
@@ -3395,19 +3480,253 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 continue
             return (False,) + refused
 
+    cwd = (cwd or os.getcwd()).replace("\\", "/")
+    bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+    cwd_path = os.path.normpath(cwd).replace("\\", "/")
+    event_cwd = cwd_path
+    event_cwd_explicit = False
+    wrapper, wrapper_option = None, None
+    wrapper_option_error = False
+
+    # #1609: outside the workspace and every path grant, a slashless file operand resolves in
+    # this cwd just as its `./` spelling does. Existing read operands retain the existence vote:
+    # an existing in-scope interpretation wins, and a missing name is not a new scope request.
+    # A write names its destination even before that file exists, so judge it in the event cwd
+    # rather than inventing an in-scope destination under another plausible base.
+    if not (cwd_path == ws or cwd_path.startswith(ws + "/")
+            or _within_path_grant(cwd_path, scopes, workspace)):
+        bare = []
+
+        def add_bare(word, uglob, write):
+            if not word or word == "-" or _path_shaped(word, uglob):
+                return
+            try:
+                value = _word_value(word)
+            except _Unenumerated:
+                return
+            if value and value != "-" and not _path_shaped(value, False):
+                bare.append((value, write, event_cwd, event_cwd_explicit))
+
+        def finish_bare_command():
+            if head == "cp":
+                for i, (word, uglob) in enumerate(operands):
+                    add_bare(word, uglob, not cp_target and i == len(operands) - 1)
+            elif head == "tee":
+                for word, uglob in operands:
+                    add_bare(word, uglob, True)
+            elif head == "cat":
+                for word, uglob in operands:
+                    add_bare(word, uglob, False)
+            elif head == "rm":
+                for word, uglob in operands:
+                    add_bare(word, uglob, True)
+
+        head, operands, cp_target = None, [], False
+        redirect, pending, opts_done = None, None, False
+        try:
+            bare_tokens = _shell_words(scan)
+        except _Unmodelled:
+            bare_tokens = []                     # pass 3 returns the ordinary unenumerated refusal
+        def apply_wrapper_option(kind, value):
+            nonlocal event_cwd, event_cwd_explicit, bare_tokens, wrapper_option_error
+            try:
+                value = _word_value(value)
+                if kind == "split":
+                    bare_tokens[i + 1:i + 1] = _shell_words(value)
+                elif kind == "chdir":
+                    if event_cwd is not None or os.path.isabs(value):
+                        event_cwd = os.path.normpath(os.path.join(
+                            event_cwd or "", value)).replace("\\", "/")
+                    event_cwd_explicit = True
+            except (_Unmodelled, _Unenumerated):
+                wrapper_option_error = True
+                if kind == "chdir":
+                    event_cwd = None
+                    event_cwd_explicit = True
+
+        wrapper_value_options = {
+            "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "doas": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+            "env": {"-u"},
+            "exec": {"-a"},
+            "timeout": {"-s", "-k", "--signal", "--kill-after"},
+            "stdbuf": {"-i", "-o", "-e"},
+            "nice": {"-n", "--adjustment"},
+            "ionice": {"-c", "-n", "-p"},
+        }
+        env_long_options = ("--split-string", "--chdir", "--unset")
+        for i, (kind, word, uglob) in enumerate(bare_tokens):
+            if kind == "sep" or (kind == "word" and head is None
+                                 and word.replace(_BRACE_OPEN, "") in _SHELL_KEYWORDS):
+                finish_bare_command()
+                head, operands, cp_target = None, [], False
+                redirect, pending, opts_done = None, None, False
+                wrapper, wrapper_option = None, None
+                event_cwd = cwd_path
+                event_cwd_explicit = False
+                continue
+            if kind == "mark":
+                continue
+            if redirect is not None:
+                if redirect != "skip":
+                    add_bare(word, uglob, redirect == "write")
+                redirect = None
+                continue
+            if kind == "op":
+                if word.startswith(("<<", "<&", ">&")):
+                    redirect = "skip"
+                else:
+                    redirect = "read" if word == "<" else "write"
+                continue
+            if kind != "word":
+                continue
+            if head is None:
+                if wrapper_option is not None:
+                    kind = wrapper_option
+                    wrapper_option = None
+                    apply_wrapper_option(kind, word)
+                    continue
+                name, eq, value = word.partition("=")
+                base = os.path.basename(word)
+                if wrapper == "env":
+                    if name.startswith("--") and len(name) > 2:
+                        hits = [option for option in env_long_options if option.startswith(name)]
+                        if len(hits) == 1:
+                            name = hits[0]
+                    if re.fullmatch(r"-[iv0]+u", word):
+                        wrapper_option = "skip"
+                        continue
+                    attached = re.fullmatch(r"-[iv0]*([SC])(.*)", word, re.S)
+                    if attached:
+                        kind = "split" if attached.group(1) == "S" else "chdir"
+                        if attached.group(2):
+                            apply_wrapper_option(kind, attached.group(2))
+                        else:
+                            wrapper_option = kind
+                        continue
+                    if name == "--unset":
+                        if not eq:
+                            wrapper_option = "skip"
+                        continue
+                    if name == "--split-string":
+                        if eq:
+                            apply_wrapper_option("split", value)
+                        else:
+                            wrapper_option = "split"
+                        continue
+                    if name == "--chdir":
+                        if eq:
+                            apply_wrapper_option("chdir", value)
+                        else:
+                            wrapper_option = "chdir"
+                        continue
+                if wrapper in wrapper_value_options and base in wrapper_value_options[wrapper]:
+                    wrapper_option = "skip"
+                    continue
+                if eq and name.isidentifier():
+                    continue
+                if base in _HEREDOC_WRAPPERS:
+                    wrapper = base
+                    continue
+                if base in _CMD_SPECS or base in ("cat", "rm", "cp", "tee", "true", "false"):
+                    head = base
+                    wrapper = None
+                    continue
+                if wrapper is None:
+                    head = base
+                    continue
+                if word.isdigit() or re.fullmatch(r"\d+[smhd]?", word) \
+                        or (word.startswith("-") and len(word) > 1):
+                    continue
+            if pending is not None:
+                if pending == "target":
+                    add_bare(word, uglob, True)
+                pending = None
+                continue
+            if word == "--" and not opts_done:
+                opts_done = True
+                continue
+            if word.startswith("-") and len(word) > 1 and not opts_done:
+                name, eq, value = word.partition("=")
+                if head == "cp":
+                    if name in ("-t", "--target-directory"):
+                        cp_target = True
+                        if eq:
+                            add_bare(value, uglob, True)
+                        else:
+                            pending = "target"
+                    elif name in ("-S", "--suffix") and not eq:
+                        pending = "data"
+                    elif name.startswith("-t") and not name.startswith("--") and len(name) > 2:
+                        cp_target = True
+                        add_bare(name[2:], uglob, True)
+                continue
+            if head in ("cat", "cp", "rm", "tee"):
+                operands.append((word, uglob))
+        finish_bare_command()
+
+        if wrapper_option_error and not lift_unenum:
+            return False, f"{_UNMODELLED_PREFIX}an env -S/-C value the gate cannot read>", UNENUMERATED_TARGET
+        seen_bare = set()
+        for value, write, operand_cwd, operand_cwd_explicit in bare:
+            if (value, write, operand_cwd, operand_cwd_explicit) in seen_bare:
+                continue
+            if len(seen_bare) >= SCOPE_JUDGE_BUDGET:
+                if lift_overflow:
+                    break
+                return False, _INCOMPLETE, OVERFLOW_TARGET
+            seen_bare.add((value, write, operand_cwd, operand_cwd_explicit))
+            if operand_cwd is None:
+                continue
+            event_candidate = os.path.normpath(os.path.join(operand_cwd, value)).replace("\\", "/")
+            if write:
+                refused = _outside_reach_refused(event_candidate, scopes, workspace, cwd,
+                                                 egress, home_markers)
+                if refused is not None:
+                    return (False,) + refused
+                continue
+            if not os.path.lexists(event_candidate):
+                continue
+            refused = None
+            if operand_cwd_explicit:
+                read_bases = [operand_cwd]
+            else:
+                read_bases = bases + [root for root, _recursive in
+                                      _scope_roots_with_reach(scopes, workspace)]
+            for base in dict.fromkeys(read_bases):
+                cand = os.path.normpath(os.path.join(base, value)).replace("\\", "/")
+                if not os.path.lexists(cand):
+                    continue
+                r = _outside_reach_refused(cand, scopes, workspace, cwd, egress, home_markers)
+                if r is None:
+                    refused = None
+                    break
+                refused = refused or r
+            if refused is not None:
+                return (False,) + refused
+
     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
     # with a per-command workdir the event does not carry (observed live via the Codex gate —
     # event cwd = session launch dir while the command ran inside a granted repo). So a token
     # is judged by its PLAUSIBLE interpretations — the event cwd plus every granted repo root —
     # voting by what EXISTS: an existing in-scope interpretation passes; an existing
     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
-    # a reach.
-    cwd = (cwd or os.getcwd()).replace("\\", "/")
-    bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+    # a reach. The bare file operands above are the outside-cwd exception to the skip below.
     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
     probes = 0
     seen2 = set()
-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
+    # Filter literal prose only when no unquoted glob or opening brace exists anywhere:
+    # shlex loses quoting provenance, and filtering such a command could hide shell expansion.
+    # Any unquoted `{` gets a separate marker; the enumeration regex remains unchanged.
+    # Unparseable shell retains the original scan and is refused by pass 3 as before.
+    prose_scan = scan
+    try:
+        if not any(uglob or _BRACE_OPEN in word for kind, word, uglob in _shell_words(scan)
+                   if kind == "word"):
+            prose_scan = egress_command_text(scan)
+    except _Unmodelled:
+        pass
+    for raw in re.split(r"""[\s;|&<>()'"`]+""", prose_scan):
         for tok in raw.split("="):
             tok = tok.strip()
             if not tok or tok.startswith(("-", "/")) or ":" in tok or tok.strip(".") == "":
@@ -3525,7 +3844,14 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             probe = _glob_probe(cand) if globbed else cand
             if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
                 continue
-            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
+            # WHERE IT COULD NAME SOMETHING (#1317): a plain path when its parent exists; a glob
+            # only when its OWN directory does, since a glob expands inside that directory and a
+            # missing one leaves the word literal. Taking the dirname of a glob probe's `<dir>`
+            # climbed a level, so after `cd D &&` the event-cwd reading `<cwd>/tools/*` was refused
+            # while `<cwd>/tools` did not exist (McNugget, 2026-11-13 and 2026-11-16).
+            anchor = (probe[:-2] if globbed and probe.endswith("/*")
+                      else os.path.dirname(probe.rstrip("*").rstrip("/")))
+            if not os.path.lexists(anchor or "/"):
                 continue
             if cand == ws or cand.startswith(ws + "/"):
                 seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
@@ -3606,6 +3932,22 @@ def _offending_segment(path: str, workspace: str, cwd: Optional[str] = None) -> 
 def forbidden_tokens(profile: HarnessProfile) -> tuple:
     extra = os.environ.get(profile.forbidden_extra_env, "")
     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+
+
+#: The env-file token is matched as a FILE NAME, not a substring (#1494, #639). It is a hit unless it is
+#: glued inside one identifier on BOTH sides: `os.environ`, `venv.EnvBuilder` and `environ` are not the
+#: file, while `.env`, `./.env.local`, `.envrc`, `prod.env`, `app.env.bak` and a `\.env` regex still are.
+#: `process.env.X` stays a hit too: a word before and a dot after is also how a named env file reads.
+#: Measured on McNugget, 2026-11-03..10: 3 of the 4 egress.secret false denies were the glued shape.
+#: Every other token keeps the substring match.
+_ENV_FILE = re.compile(r"(?<![a-z0-9_])\.env|\.env(?![a-z0-9_])")
+
+
+def forbidden_hit(token: str, low: str) -> bool:
+    """Gate 1a's match of one forbidden token against LOWERED text."""
+    if token == ".env":
+        return _ENV_FILE.search(low) is not None
+    return token in low
 
 
 # ── The decision ─────────────────────────────────────────────────────────────────────────
@@ -3756,6 +4098,258 @@ def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
     return tuple(out)
 
 
+def _shell_without_comments(text: str) -> str:
+    out = []
+    quote = None
+    escaped = False
+    comment = False
+    word_start = True
+    for char in text:
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+                out.append(char)
+            else:
+                out.append(" ")
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            word_start = False
+            continue
+        if quote is not None:
+            out.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            word_start = False
+            continue
+        if char in ("'", '"'):
+            quote = char
+            out.append(char)
+            word_start = False
+            continue
+        if char == "#" and word_start:
+            comment = True
+            out.append(" ")
+            continue
+        out.append(char)
+        word_start = char.isspace() or char in ";|&()"
+    return "".join(out)
+
+
+def _python_invocations(command: Optional[str], cwd: str) -> list[tuple]:
+    """Parse direct interpreter command positions as `(isolated, script_dir, cwd, PYTHONPATH)`."""
+    if not command:
+        return []
+    try:
+        command = _shell_without_comments(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;\n")
+        lexer.whitespace = " \t\r\f\v"
+        lexer.commenters = ""
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return []
+    segments = [[]]
+    separators = []
+    for word in words:
+        if re.fullmatch(r"(?:[&|;]|\n)+", word):
+            separators.append(word)
+            segments.append([])
+        else:
+            segments[-1].append(word)
+
+    invocations = []
+    current_cwd = os.path.realpath(cwd)
+    alternate_cwds = []
+    current_pythonpath = None
+    skip_next = False
+    for segment_index, segment in enumerate(segments):
+        if skip_next:
+            if not segment:
+                continue
+            skip_next = False
+            continue
+        if not segment:
+            continue
+        previous_separator = separators[segment_index - 1] if segment_index else None
+        i = 0
+        pythonpath = current_pythonpath
+        while i < len(segment) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[i]):
+            name, value = segment[i].split("=", 1)
+            if name == "PYTHONPATH":
+                pythonpath = value
+            i += 1
+        if i < len(segment) and segment[i] == "env":
+            i += 1
+            while i < len(segment):
+                arg = segment[i]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", arg):
+                    name, value = arg.split("=", 1)
+                    if name == "PYTHONPATH":
+                        pythonpath = value
+                    i += 1
+                elif arg in ("-u", "--unset") and i + 1 < len(segment):
+                    if segment[i + 1] == "PYTHONPATH":
+                        pythonpath = None
+                    i += 2
+                elif arg == "--":
+                    i += 1
+                    break
+                elif arg.startswith("-"):
+                    i += 1
+                else:
+                    break
+        if i >= len(segment):
+            if segment[0] != "env":
+                current_pythonpath = pythonpath
+            continue
+        if segment[i] in ("export", "local", "declare", "typeset", "readonly"):
+            for arg in segment[i + 1:]:
+                name, eq, value = arg.partition("=")
+                if eq and name == "PYTHONPATH":
+                    current_pythonpath = value
+            continue
+        if segment[i] == "unset":
+            if any(arg == "PYTHONPATH" for arg in segment[i + 1:]):
+                current_pythonpath = None
+            continue
+        if segment[i] == "cd":
+            next_separator = (separators[segment_index]
+                              if segment_index < len(separators) else None)
+            if len(segment) == i + 2 and next_separator in ("&&", "||", ";", "\n"):
+                possible = list(dict.fromkeys([current_cwd] + alternate_cwds))
+                targets = [os.path.realpath(os.path.join(c, os.path.expanduser(segment[i + 1])))
+                           for c in possible]
+                if previous_separator in ("&&", "||") or next_separator == "||":
+                    keep = possible + targets
+                else:
+                    keep = [target if os.path.isdir(target) else original
+                            for original, target in zip(possible, targets)]
+                    if (not any(os.path.isdir(target) for target in targets)
+                            and next_separator == "&&" and segment_index == 0):
+                        skip_next = True
+                keep = list(dict.fromkeys(keep))
+                current_cwd, alternate_cwds = keep[0], keep[1:]
+            continue
+        program = (os.path.basename(os.path.realpath(os.path.join(current_cwd, segment[i])))
+                   if "/" in segment[i] else segment[i])
+        if not re.fullmatch(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?(?:-dbg)?", program):
+            continue
+
+        isolated = False
+        script = None
+        stop_at_cwd = False
+        j = i + 1
+        while j < len(segment):
+            arg = segment[j]
+            if arg in ("-c", "-m"):
+                stop_at_cwd = True
+                break
+            if arg in ("-W", "-X", "--check-hash-based-pycs"):
+                j += 2
+                continue
+            if arg == "--":
+                j += 1
+                if j < len(segment):
+                    script = segment[j]
+                break
+            if arg == "-":
+                break
+            if arg.startswith("-") and not arg.startswith("--"):
+                takes_separate_value = False
+                for offset, option in enumerate(arg[1:]):
+                    if option == "I":
+                        isolated = True
+                    elif option in ("c", "m"):
+                        stop_at_cwd = True
+                        break
+                    elif option in ("W", "X"):
+                        takes_separate_value = offset == len(arg) - 2
+                        break
+                if stop_at_cwd:
+                    break
+                j += 2 if takes_separate_value else 1
+                continue
+            if arg.startswith("--"):
+                j += 1
+                continue
+            script = arg
+            break
+        for invocation_cwd in dict.fromkeys([current_cwd] + alternate_cwds):
+            script_dir = None
+            if script and not stop_at_cwd:
+                script_dir = os.path.dirname(os.path.realpath(os.path.join(invocation_cwd, script)))
+            invocations.append((isolated, script_dir, invocation_cwd, pythonpath))
+    return invocations
+
+
+def _python_invocation(command: Optional[str], cwd: str) -> tuple:
+    """`(has_python, isolated, script_dir)` for the first direct Python invocation."""
+    invocations = _python_invocations(command, cwd)
+    if not invocations:
+        return (False, True, None)
+    isolated, script_dir, _cwd, _pythonpath = invocations[0]
+    return (True, isolated, script_dir)
+
+
+def _declared_package_root(cwd: str, workspace: str, scopes) -> Optional[str]:
+    """The nearest root carrying both an explicit path grant and package/source evidence."""
+    current = os.path.realpath(cwd)
+    evidence_dir = current
+    workspace = os.path.realpath(workspace)
+    markers = ("pyproject.toml", "setup.py", "setup.cfg", "Pipfile", ".git")
+    while True:
+        if any(os.path.exists(os.path.join(current, marker)) for marker in markers):
+            return current if _within_path_grant(evidence_dir, scopes, workspace) else None
+        if current == workspace or os.path.dirname(current) == current:
+            return None
+        current = os.path.dirname(current)
+
+
+def python_ambient_import_verdict(command: Optional[str], cwd: str, workspace: str, scopes) -> Optional[Verdict]:
+    """Warn when non-isolated Python runs without a declared trusted package root.
+
+    Trust requires an explicit `path:` grant that reaches the actual script/import directory
+    AND package evidence, never a marker or an exact grant on an ancestor alone. Existing denies
+    keep precedence: this is called only after scope has admitted the act. Only direct interpreter
+    commands are parsed; `sh -c`, `uv run`, command substitution, `if`/`while` bodies, subshells,
+    `pushd`, and heredoc-fed interpreters are outside this advisory, so no warning is not proof
+    of import safety.
+    """
+    for isolated, script_dir, invocation_cwd, pythonpath in _python_invocations(command, cwd):
+        if isolated:
+            continue
+        evidence_dir = script_dir or invocation_cwd
+        untrusted_pythonpath = None
+        path_entries = pythonpath.split(os.pathsep) if pythonpath is not None else ()
+        for entry in path_entries:
+            candidate = (invocation_cwd if not entry else os.path.realpath(
+                os.path.join(invocation_cwd, os.path.expanduser(entry))))
+            if _declared_package_root(candidate, workspace, scopes) is None:
+                untrusted_pythonpath = candidate
+                break
+        if (untrusted_pythonpath is None
+                and _declared_package_root(evidence_dir, workspace, scopes) is not None):
+            continue
+        evidence_dir = untrusted_pythonpath or evidence_dir
+        rule = "runtime.python_ambient_import"
+        return Verdict(
+            "warn",
+            rule,
+            f"Python is running without -I in a directory with no explicitly granted package root "
+            f"(script/import directory: {evidence_dir}); ambient module shadowing can change the effective program",
+            REMEDIES[rule].text,
+            target=evidence_dir,
+        )
+    return None
+
+
 def evaluate(event: NormalizedEvent, profile: HarnessProfile,
              workspace: Optional[str] = None,
              policy: Optional[AgentPolicy] = None) -> Verdict:
@@ -3788,7 +4382,7 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
-            if f in low:
+            if forbidden_hit(f, low):
                 return _deny(
                     "egress.secret",
                     f"'{event.tool}' touches a forbidden path (secret/credential or "
@@ -3828,7 +4422,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
         if not pol.stale:
             # Gate 1a swept only what link_reach reached; past its bound the rest is unchecked, so an
             # unscoped allow still refuses it (Nova's #1435 review: innate checks are never relaxed by scope).
-            return link_reach_too_wide(event) or ALLOW
+            return link_reach_too_wide(event) or python_ambient_import_verdict(
+                event.command, event.cwd or ws, ws, scopes) or ALLOW
         # Stale + unscoped: drop the wildcard so it cannot match downstream, and evaluate the
         # remaining standing scope normally. Fails narrow, which is the direction a replica may
         # move in.
@@ -3960,7 +4555,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     _repos, _roots = _scope_parts(scopes, ws)
     _wsr = os.path.realpath(os.path.expanduser(ws)).rstrip("/")
     within = tuple(_roots) + tuple(os.path.join(_wsr, r) for r in _repos if r and r != AgentPolicy.UNSCOPED)
-    return link_reach_too_wide(event, within) or ALLOW
+    return link_reach_too_wide(event, within) or python_ambient_import_verdict(
+        event.command, event.cwd or ws, ws, scopes) or ALLOW
 
 
 # ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
@@ -4085,7 +4681,7 @@ def degraded_verdict(event: NormalizedEvent,
     for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
-            if f in low:
+            if forbidden_hit(f, low):
                 return _deny(
                     "egress.secret",
                     f"'{event.tool}' touches a forbidden path (secret/credential or "

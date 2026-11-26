@@ -1,4 +1,4 @@
-# hestia-gt-sha256: b4570b065deba9aae840e21f8cefd5c3dd2625ab6240aa9728b06d07c2da2d6f  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: bd077c69b1872bd5b3d212c19d4b5a9f745186e030cf6ca98fb91a7d197b6e92  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -781,6 +781,9 @@ def _client_name(profile: GateProfile) -> str:
 # ── the record: ONE call, every final verdict ────────────────────────────────────────────────
 
 def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
+    command = inv.event.tool_input.get("command")
+    attempted_exact = (attempted is None and isinstance(command, str)
+                       and " ".join(command.split()) == command)
     return mechanism.record_decision(
         None,
         plugin_id=inv.profile.member_id,
@@ -794,6 +797,7 @@ def _record(inv: _Invocation, d: GateDecision, attempted: Optional[str] = None):
         action_id=d.action_id,
         correlation_key=inv.key,
         deadline=inv.deadline,
+        attempted_exact=attempted_exact,
     )
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: d91f805f4850680e79774333076f1a4121a35028d30f9348770da308d6da7009  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -827,7 +827,8 @@ def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
                     verdict_available: bool, attempted_summary: str,
                     action_id: Optional[str] = None,
                     correlation_key: Optional[str] = None,
-                    deadline: Optional[float] = None) -> DecisionReceipt:
+                    deadline: Optional[float] = None,
+                    attempted_exact: bool = False) -> DecisionReceipt:
     """Witness ONE final gate decision — allow, warn or deny — and say whether it COMMITTED.
 
     `client_or_none`: an initialized `_McpHttp` to reuse, or None to open a single-shot session.
@@ -838,6 +839,8 @@ def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
       the caller from the RAW harness event, carried onto the row.
     `deadline`: an absolute `time.monotonic()` bound; no request starts after it. The caller's
       one invocation deadline (stage B) passes straight through — this helper mints no time.
+    `attempted_exact`: true only when the sender preserved the raw act byte-for-byte before
+      bounded redaction, including whitespace. False is the safe default for older callers (#1588).
 
     Returns a DecisionReceipt; `.committed` is True only on a receipt that names this decision.
     NEVER raises. Never changes the caller's verdict — what to DO with an uncommitted permit is
@@ -853,6 +856,7 @@ def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
         "verdict_available": bool(verdict_available),
         "core_digest": _loaded_core_digest(),
         "attempted": attempted_summary,
+        "attempted_exact": bool(attempted_exact),
         "action_id": action_id,
         "correlation_key": correlation_key,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -893,6 +897,7 @@ def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
             "target": target,
             "session_id": session_id,
             "attempted": attempted_summary,
+            "attempted_exact": bool(attempted_exact),
             "core_digest": record["core_digest"],
         }
         if action_id is not None:
@@ -900,6 +905,18 @@ def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
         if correlation_key is not None:
             args["correlation_key"] = correlation_key
         rpc = client.call_tool("hestia_witness_decision", args)
+        kind, payload = _classify_decision_reply(rpc)
+        if (kind == "ruled" and payload.get("code") == "hestia.witness_decision_unknown_arg"
+                and payload.get("data", {}).get("unknownKeys") == ["attempted_exact"]):
+            # ONE compatibility retry for an older daemon. If the input was already lossy, make
+            # that visible to its pre-attempted_exact predicate too; never trade availability for
+            # a false exact-retry identity (#1588 review).
+            args.pop("attempted_exact")
+            if (not attempted_exact
+                    and not any(mark in attempted_summary for mark in ("…", "[REDACTED —", "***"))):
+                args["attempted"] = attempted_summary + " …"
+            rpc = client.call_tool("hestia_witness_decision", args)
+            kind, payload = _classify_decision_reply(rpc)
     except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
         return _keep_uncommitted(plugin_id, record, DecisionReceipt(
             status="unreachable", detail=f"network: {type(e).__name__}: {e}"))

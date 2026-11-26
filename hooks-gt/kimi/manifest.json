@@ -33,19 +33,19 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "a4a237dec125388a6ff88459438b7c13811836eb3fa1d7c15fa4d9a2ef79f1ef",
+    "gt_version": "f0323fdd3428615aa1847b6b857f49d8ff97694ac2150118da518807cf00ceff",
     "files": [
       {
         "path": "hestia_gate_core.py",
-        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
+        "sha256": "a1efede5310d9dbe7442a85b5c3ba6a34b5bdd596990329eba11f9dfa7dc9292"
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
+        "sha256": "d91f805f4850680e79774333076f1a4121a35028d30f9348770da308d6da7009"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2"
+        "sha256": "4ad54a4959cd63ebad1b4bab68592f1a7aaf806baa537486b37ed89a0e0e3178"
       },
       {
         "path": "hestia_shell_classifier.py",
@@ -53,11 +53,11 @@
       },
       {
         "path": "hestia_single_gate.py",
-        "sha256": "b4570b065deba9aae840e21f8cefd5c3dd2625ab6240aa9728b06d07c2da2d6f"
+        "sha256": "bd077c69b1872bd5b3d212c19d4b5a9f745186e030cf6ca98fb91a7d197b6e92"
       },
       {
         "path": "hestia_witness_core.py",
-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
+        "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1"
       }
     ]
   },
@@ -65,12 +65,12 @@
     {
       "unit": "member-mesh",
       "path": "hestia-mesh.py",
-      "sha256": "dfb4ff4ac958a32bec763900a933f139e25ab9fffd3d8e4ce72428ed06e1ff21"
+      "sha256": "a20a0af34b0627659e56d9753141ddc764da61afba09d0ea0fce87a7df95af09"
     },
     {
       "unit": "member-mesh",
       "path": "prompt-disposition-watch.sh",
-      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+      "sha256": "02463f52fa051805a2dd56b72853bc79d8c5aca2284ce05279da0942cd858c94"
     },
     {
       "unit": "member-mesh",
@@ -78,5 +78,5 @@
       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
     }
   ],
-  "gt_version": "fb7a1d5bf779cbb261a5e3df320280e3743358570f6ba0b528e0c1d9f276068d"
+  "gt_version": "b0d3e9ae345838e1f0d185e77b35569c4448c63ba6270f1c6f552034f38623ea"
 }
