@@ -11,7 +11,9 @@ key, no daemon and no network.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -138,6 +140,78 @@ def main() -> int:
         missing = seeder.verify_rendered(hestia_home, docs)
         check("C3 a projection missing a SHARED key is reported, not passed on the 200",
               any(m.startswith("claude-code:") and "HESTIA_HOME" in m for m in missing), str(missing))
+
+        print("C4. committed authority never gets reported as ready seats")
+        failed = {
+            "authority_committed": True,
+            "ready": False,
+            "seeded": ["_shared", "claude-code", "codex"],
+            "intentEntryHash": "intent-hash",
+            "verdict": [
+                {"member": "claude-code", "status": "unreadable"},
+                {"member": "codex", "status": "verified"},
+            ],
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = seeder.report_seed_result(failed, docs, hestia_home)
+        message = output.getvalue()
+        check("C4 projection failure returns failure after the authority commit", status == 1)
+        check("C4 the client names authority committed but projection not ready",
+              "AUTHORITY SEEDED; PROJECTION NOT READY" in message
+              and "claude-code" in message and "unreadable" in message, message)
+        check("C4 the client never says the seats can act",
+              "The seats can act" not in message, message)
+        check("C4 a missing per-seat verdict is not ready even if the aggregate lies",
+              any(line.startswith("codex:") for line in seeder.projection_problems(
+                  {"ready": True, "verdict": [
+                      {"member": "claude-code", "status": "verified"},
+                  ]}, docs)))
+        check("C4 two verdicts for one seat are not ready, whatever they say",
+              any("2 verdicts" in line for line in seeder.projection_problems(
+                  {"ready": True, "verdict": [
+                      {"member": "claude-code", "status": "verified"},
+                      {"member": "claude-code", "status": "verified"},
+                      {"member": "codex", "status": "verified"},
+                  ]}, docs)))
+        # An older daemon answers `ok`/`seeded` with no `ready` field. That answer covered the
+        # vault commit only; a client that read it as ready is the false statement #993 fixes.
+        old_daemon = {"ok": True, "seeded": ["_shared", "claude-code", "codex"],
+                      "intentEntryHash": "intent-hash",
+                      "verdict": [{"member": "claude-code", "status": "verified"},
+                                  {"member": "codex", "status": "verified"}]}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = seeder.report_seed_result(old_daemon, docs, hestia_home)
+        message = output.getvalue()
+        check("C4 an answer with no `ready` field is not ready, and says why",
+              status == 1 and "did not report readiness" in message
+              and "The seats can act" not in message, message)
+        # Ready, verified, rendered locally, but the daemon could not witness the readiness.
+        for member, doc in docs:
+            if member == seeder.SHARED_MEMBER:
+                continue
+            seat = hestia_home / "seats" / f"{member}.env"
+            seat.parent.mkdir(parents=True, exist_ok=True)
+            shared_env = dict(docs).get(seeder.SHARED_MEMBER, {})
+            seat.write_text("".join(f"{k}={v}\n" for k, v in {**shared_env, **doc}.items()))
+        good = {"authority_committed": True, "ready": True, "readiness_recorded": True,
+                "seeded": ["_shared", "claude-code", "codex"], "intentEntryHash": "intent-hash",
+                "verdict": [{"member": "claude-code", "status": "verified"},
+                            {"member": "codex", "status": "verified"}]}
+        for recorded, want_rc, want_act in ((True, 0, True), (False, 1, False)):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = seeder.report_seed_result({**good, "readiness_recorded": recorded}, docs, hestia_home)
+            message = output.getvalue()
+            check(f"C4 readiness_recorded={recorded}: rc {want_rc}, clean success only when witnessed",
+                  status == want_rc and ("The seats can act" in message) == want_act
+                  and ("READINESS NOT WITNESSED" in message) == (not recorded), f"rc={status} {message}")
+        check("C4 typed ready plus every required verified verdict is ready",
+              seeder.projection_problems({"ready": True, "verdict": [
+                  {"member": "claude-code", "status": "verified"},
+                  {"member": "codex", "status": "verified"},
+              ]}, docs) == [])
 
         print("D. a box with no seat is not seeded at all")
         bare = [{"member": "kimi-code", "harness_home": home / ".kimi-code"}]

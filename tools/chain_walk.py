@@ -106,6 +106,28 @@ def payload(entry: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+def terminal_escalation_ids(entries) -> set[str]:
+    """The DISTINCT escalation ids that reached a terminal event, for COUNTING outcomes.
+
+    One id per escalation however many terminal rows it has (a decision followed by an
+    expiry, or replayed evidence), so a census that asks "how many escalations ended" cannot
+    inflate the count. Rows with no `escalation_id` are ignored.
+
+    Not a replacement for the per-entry maps in factor_attribution_census.py,
+    grounds_vs_acts.py and retired_before_review.py: those need the terminal ENTRY (its
+    timestamp, its status) and so keep `{id: entry}`. What they share with this helper is the
+    one event set, `ESCALATION_TERMINAL_EVENTS`, which escalation_outcomes_test.py pins.
+    """
+    terminal = set()
+    for entry in entries:
+        if entry.get("eventType") not in ESCALATION_TERMINAL_EVENTS:
+            continue
+        escalation_id = payload(entry).get("escalation_id")
+        if escalation_id:
+            terminal.add(escalation_id)
+    return terminal
+
+
 class ChainWalker:
     def __init__(self, endpoint: str = DEFAULT_ENDPOINT, timeout: float = 30.0):
         self.endpoint = endpoint

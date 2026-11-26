@@ -120,18 +120,50 @@ pub fn evaluate_folded(
     role: &str,
     pa: &crate::policy::PolicyAction,
 ) -> crate::policy::PolicyEvaluation {
-    let mut evaluation = society.evaluate(pa);
+    evaluate_folded_inner(society, roles, instances, grants, law_gate, plugin_id, role, pa, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_folded_read_only(
+    society: &EngineView,
+    roles: &HashMap<String, EngineView>,
+    instances: &HashMap<(String, String), EngineView>,
+    grants: &HashMap<(String, String), InstanceGrant>,
+    law_gate: Option<&crate::policy::LawGate>,
+    plugin_id: &str,
+    role: &str,
+    pa: &crate::policy::PolicyAction,
+) -> crate::policy::PolicyEvaluation {
+    evaluate_folded_inner(society, roles, instances, grants, law_gate, plugin_id, role, pa, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_folded_inner(
+    society: &EngineView,
+    roles: &HashMap<String, EngineView>,
+    instances: &HashMap<(String, String), EngineView>,
+    grants: &HashMap<(String, String), InstanceGrant>,
+    law_gate: Option<&crate::policy::LawGate>,
+    plugin_id: &str,
+    role: &str,
+    pa: &crate::policy::PolicyAction,
+    read_only: bool,
+) -> crate::policy::PolicyEvaluation {
+    let eval = |engine: &EngineView| {
+        if read_only { engine.evaluate_read_only(pa) } else { engine.evaluate(pa) }
+    };
+    let mut evaluation = eval(society);
     if let Some(e) = roles.get(role) {
-        evaluation = crate::policy::fold_strictest(evaluation, e.evaluate(pa));
+        evaluation = crate::policy::fold_strictest(evaluation, eval(e));
     }
     if let Some(e) = instances.get(&(plugin_id.to_string(), role.to_string())) {
-        evaluation = crate::policy::fold_strictest(evaluation, e.evaluate(pa));
+        evaluation = crate::policy::fold_strictest(evaluation, eval(e));
     }
     let now = crate::server::gate_escalation::now_secs();
     if let Some(p) = instance_grant_in(grants, plugin_id, role, now)
         .and_then(|g| crate::policy::get_preset(&g.preset))
     {
-        evaluation = crate::policy::PolicyEngine::new(p.config).evaluate(pa);
+        evaluation = eval(&crate::policy::PolicyEngine::new(p.config));
     }
     if let Some(gate) = law_gate {
         evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(pa, role));
@@ -232,6 +264,17 @@ impl PolicyPublication {
                         self.law_gate.as_deref(), plugin_id, role, pa)
     }
 
+    /// Evaluate the same publication with no rate-limit mutation or any other decision write.
+    pub fn evaluate_read_only(
+        &self,
+        plugin_id: &str,
+        role: &str,
+        pa: &crate::policy::PolicyAction,
+    ) -> crate::policy::PolicyEvaluation {
+        evaluate_folded_read_only(&self.society, &self.roles, &self.instances, &self.instance_grants,
+                                  self.law_gate.as_deref(), plugin_id, role, pa)
+    }
+
     /// Resolve a caller-supplied session id. FAIL-CLOSED like `resolve_attributed_caller`.
     pub fn resolve(&self, session_id: Option<&str>) -> Option<CallerIdent> {
         let uuid = Uuid::parse_str(session_id?).ok()?;
@@ -328,6 +371,8 @@ pub struct SessionIdent {
     pub assigned_role: String,
     pub constellation_role: String,
     pub role_basis: Option<String>,
+    pub identity_basis: crate::server::state::IdentityBasis,
+    pub canonical_principal: Option<String>,
     /// Unix millis of the latest connect seen for this session, including lock-free reuses.
     last_seen_ms: AtomicI64,
 }
@@ -342,6 +387,8 @@ impl SessionIdent {
             assigned_role: s.assigned_role.clone(),
             constellation_role: s.constellation_role.clone(),
             role_basis: s.role_basis.clone(),
+            identity_basis: s.identity_basis,
+            canonical_principal: s.canonical_principal.clone(),
             last_seen_ms: AtomicI64::new(s.connected_at.timestamp_millis()),
         }
     }
