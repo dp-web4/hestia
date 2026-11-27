@@ -54,6 +54,7 @@ jobs:
         working-directory: hestia/core
         run: |
           cargo test --locked --lib fsperm -- --nocapture
+          cargo test --locked --lib fsync -- --nocapture
           cargo test --locked --bin hestia passphrase_file_tests -- --nocapture
 
       - name: init locks the home and the vault to this user

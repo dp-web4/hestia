@@ -286,7 +286,9 @@ impl Durability {
         if self.fail_next_sync.swap(false, Ordering::AcqRel) {
             return Err(anyhow!("injected fsync failure"));
         }
-        match std::fs::File::open(&self.wal_path) {
+        // `open_for_sync`: write access on Windows, where FlushFileBuffers refuses a read-only
+        // handle (hestia #342: the chain used to poison itself at open there).
+        match crate::fsync::open_for_sync(&self.wal_path) {
             Ok(f) => {
                 f.sync_data()?;
                 // A freshly created WAL needs its directory entry durable too.
@@ -302,7 +304,7 @@ impl Durability {
             // No WAL file: everything committed is already in the main database (a
             // checkpoint truncated it); sync that instead.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::File::open(&self.db_path)?.sync_data()?;
+                crate::fsync::sync_file_data(&self.db_path)?;
             }
             Err(e) => return Err(e.into()),
         }

@@ -338,8 +338,7 @@ impl TrustStore {
             let sealed = crypto::seal(&self.dk(), &json).context("sealing trust baseline")?;
             write_durable(&dir.join(name), &sealed)?;
         }
-        std::fs::File::open(&self.base_dir)
-            .and_then(|d| d.sync_all())
+        crate::fsync::sync_dir(&self.base_dir)
             .with_context(|| format!("syncing {}", self.base_dir.display()))
     }
 
@@ -548,8 +547,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
+        crate::fsync::sync_dir(dir)
             .with_context(|| format!("syncing {}", dir.display()))?;
     }
     Ok(())

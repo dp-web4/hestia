@@ -4265,9 +4265,7 @@ fn write_public_evidence_atomic(path: &std::path::Path, bytes: &[u8]) -> AnyResu
     drop(file);
     std::fs::rename(&tmp, path)
         .with_context(|| format!("publishing router certificate {}", path.display()))?;
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    let _ = hestia::fsync::sync_dir(parent);
     Ok(())
 }
 
