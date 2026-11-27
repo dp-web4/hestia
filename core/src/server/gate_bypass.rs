@@ -848,6 +848,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_config_keeps_its_mode() {
         use std::os::unix::fs::PermissionsExt;
         let (_d, home, cfg) = setup(CODEX, "config.toml");

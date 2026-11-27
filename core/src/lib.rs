@@ -18,6 +18,7 @@ pub mod derivation_cache;
 pub mod error;
 pub mod evidence;
 pub mod fleet_receiver;
+pub mod fsperm;
 pub mod gate_cli;
 pub mod hub;
 pub mod lct_publish;

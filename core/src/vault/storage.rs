@@ -262,6 +262,9 @@ fn stage_ciphertext(parent: &Path, buffer: &[u8]) -> Result<tempfile::NamedTempF
             .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|e| CoreError::io(tmp.path(), e))?;
     }
+    // Windows (hestia #342): the staged file inherits the parent's DACL. The daemon makes its home
+    // owner-only with an inheritable ACE (cli.rs restrict_home_on_windows), so a vault in the home is
+    // owner-only from creation; changing the DACL of a file tempfile holds open is not attempted.
     tmp.write_all(buffer)
         .map_err(|e| CoreError::io(tmp.path(), e))?;
     tmp.as_file()

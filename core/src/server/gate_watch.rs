@@ -545,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn shared_engine_paths_dedupe_realpaths_and_reject_external_targets() {
         let dir = tempfile::tempdir().unwrap();
         let shim = gate(&dir, "shim.py", "shim");
@@ -581,6 +582,7 @@ mod tests {
     /// manifest records `shared/<file>`. A redeploy or a rollback repoints the link, so the row
     /// must stay keyed on the stable path or the ratified build reads green forever.
     #[test]
+    #[cfg(unix)]
     fn a_repointed_shared_link_reads_modified_on_the_stable_path() {
         let dir = tempfile::tempdir().unwrap();
         let shim = gate(&dir, "shim.py", "shim");
