@@ -116,6 +116,22 @@ pub struct UngovernOutcome {
     pub backup: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum UngovernError {
+    Refused(String),
+    Unknown(String),
+}
+
+impl std::fmt::Display for UngovernError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(error) | Self::Unknown(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for UngovernError {}
+
 /// Resolve one member's exact owned targets and the already-deployed registrar that can remove
 /// them. A missing or ambiguous inventory record stops before any authority or file is changed.
 pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<UngovernPlan> {
@@ -197,13 +213,18 @@ pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<Ungovern
 /// gate on the machine. It gets this long.
 const REGISTRAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// `Command::output` with a deadline. On the deadline the child is killed and the error says the
-/// outcome is NOT known: the registrar writes its edit by an atomic rename, so the config is
-/// either as it was or fully edited, and only a fresh inventory can say which.
-fn output_within(mut command: Command, limit: std::time::Duration) -> Result<std::process::Output> {
+/// `Command::output` with a deadline. On the deadline the child is killed and the outcome is
+/// UNKNOWN. Atomic rename avoids a partial write, but it does not prove whether the commit landed
+/// or what an external editor changed; only fresh inventory and config bytes can answer that.
+fn output_within(mut command: Command, limit: std::time::Duration) -> Result<std::process::Output, UngovernError> {
     use std::io::Read;
     use std::process::Stdio;
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| UngovernError::Refused(format!("could not start the registrar: {e}; nothing was changed")))?;
     // Drain both pipes off-thread so a chatty child cannot block on a full pipe while we wait.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -218,16 +239,25 @@ fn output_within(mut command: Command, limit: std::time::Duration) -> Result<std
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let started = std::time::Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(UngovernError::Unknown(format!(
+                    "waiting for the registrar failed: {e}; whether the harness config was edited \
+                     is NOT known — run the inventory before anything else"
+                )));
+            }
         }
         if started.elapsed() >= limit {
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
+            return Err(UngovernError::Unknown(format!(
                 "the registrar did not finish within {limit:?} and was stopped; whether the harness \
                  config was edited is NOT known — run the inventory before anything else"
-            );
+            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
@@ -240,8 +270,9 @@ fn output_within(mut command: Command, limit: std::time::Duration) -> Result<std
 
 /// Execute the same ownership-proved registrar the operator installer uses, rather than keeping a
 /// second, JSON-only removal implementation in the daemon.
-pub fn ungovern(plan: &UngovernPlan, hestia_home: &Path) -> Result<UngovernOutcome> {
-    let operator_home = dirs_home().ok_or_else(|| anyhow::anyhow!("HOME is not set; nothing was changed"))?;
+pub fn ungovern(plan: &UngovernPlan, hestia_home: &Path) -> Result<UngovernOutcome, UngovernError> {
+    let operator_home = dirs_home()
+        .ok_or_else(|| UngovernError::Refused("HOME is not set; nothing was changed".into()))?;
     ungovern_at(plan, hestia_home, &operator_home)
 }
 
@@ -270,7 +301,7 @@ pub(crate) fn ungovern_at(
     plan: &UngovernPlan,
     hestia_home: &Path,
     operator_home: &Path,
-) -> Result<UngovernOutcome> {
+) -> Result<UngovernOutcome, UngovernError> {
     if plan.owned_targets.is_empty() {
         return Ok(UngovernOutcome { hooks_removed: 0, backup: None });
     }
@@ -278,28 +309,43 @@ pub(crate) fn ungovern_at(
         .registrar
         .as_ref()
         .filter(|path| path.is_file())
-        .ok_or_else(|| anyhow::anyhow!("the member registrar is not installed; nothing was changed"))?;
+        .ok_or_else(|| UngovernError::Refused("the member registrar is not installed; nothing was changed".into()))?;
     let command = ungovern_registrar_command(plan, registrar, hestia_home, operator_home);
     let out = output_within(command, REGISTRAR_TIMEOUT)?;
     let value: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-        anyhow::anyhow!(
-            "the registrar returned no readable result ({e}): {}",
+        UngovernError::Unknown(format!(
+            "the registrar returned no readable result ({e}); whether the harness config was edited \
+             is NOT known — run the inventory before anything else: {}",
             String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>()
-        )
+        ))
     })?;
     let status = value.get("status").and_then(Value::as_str).unwrap_or("");
-    if !out.status.success() || !matches!(status, "ok" | "unregistered") {
-        bail!(
-            "{}",
+    if matches!(status, "failed" | "refused") {
+        return Err(UngovernError::Refused(
             value
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("the registrar refused the removal; nothing was changed")
-        );
+                .into(),
+        ));
     }
-    let outcome: UngovernOutcome = serde_json::from_value(value)?;
+    if !out.status.success() || !matches!(status, "ok" | "unregistered") {
+        return Err(UngovernError::Unknown(format!(
+            "the registrar exited {} with unrecognized status {status:?}; whether the harness config \
+             was edited is NOT known — run the inventory before anything else",
+            out.status
+        )));
+    }
+    let outcome: UngovernOutcome = serde_json::from_value(value).map_err(|e| {
+        UngovernError::Unknown(format!(
+            "the registrar returned an unreadable outcome ({e}); whether the harness config was \
+             edited is NOT known — run the inventory before anything else"
+        ))
+    })?;
     if outcome.hooks_removed == 0 {
-        bail!("the registrar removed none of the inventory's owned targets; nothing was changed");
+        return Err(UngovernError::Refused(
+            "the registrar removed none of the inventory's owned targets; nothing was changed".into(),
+        ));
     }
     Ok(outcome)
 }
@@ -351,6 +397,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = output_within(command, std::time::Duration::from_millis(150)).unwrap_err();
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(matches!(&error, UngovernError::Unknown(_)), "{error:?}");
         assert!(error.to_string().contains("NOT known"), "{error}");
         // control: a child that finishes is read in full
         let mut command = Command::new("sh");

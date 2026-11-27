@@ -609,6 +609,10 @@ def unwire_results() -> None:
             "failureRecordError": "witness db full",
             "hooks_left_unowned": ["/elsewhere/foreign.js"],
         }},
+        {"ok": False, "status": 409, "out": {
+            "error": "registrar output lost", "unknownOutcome": True,
+            "unknownOutcomeRecorded": False, "unknownOutcomeRecordError": "witness db full",
+        }},
         {"ok": True, "status": 200, "out": {
             "message": "unwired", "recorded": False, "recordError": "witness db full",
         }},
@@ -635,7 +639,7 @@ def unwire_results() -> None:
     if r.returncode:
         check("unwire result renderer executes", r.stderr.strip()[-300:], 0)
         return
-    refusal, success = json.loads(r.stdout)
+    refusal, unknown, success = json.loads(r.stdout)
     text = refusal["alerts"][0]
     check("a refused unwire shows the refusal and does not reload",
           (text.startswith("unwire refused: registrar refused"), refusal["loads"]), (True, 0))
@@ -645,6 +649,14 @@ def unwire_results() -> None:
     check("a refused unwire never hides a failed terminal record",
           "this refusal was not recorded on the chain (witness db full)" in text)
     check("a refused unwire names hooks left in force", "/elsewhere/foreign.js" in text)
+    unknown_text = unknown["alerts"][0]
+    check("an unknown unwire outcome never reads as a proven rollback",
+          all(s in unknown_text for s in ["outcome is UNKNOWN, not a proven refusal",
+                                          "No rollback or completion was claimed",
+                                          "fresh inventory and the harness config",
+                                          "open intent"]))
+    check("an unknown outcome's record failure is visible",
+          "unknown outcome could not be recorded (witness db full)" in unknown_text)
     check("a successful unwire still warns when its terminal witness failed",
           (success["alerts"], success["loads"]),
           (["unwired\n\nWARNING: the act landed but its terminal witness failed: witness db full"], 1))

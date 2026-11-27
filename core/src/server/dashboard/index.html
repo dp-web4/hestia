@@ -5799,6 +5799,10 @@
         // A refusal can leave the member WITHOUT its authority (a failed rollback) or without a
         // terminal record: say so, or "refused" reads as "intact" (obligation 5, never hidden).
         let msg = out?.error || `HTTP ${res.status}`;
+        if (out?.unknownOutcome)
+          msg += `\n\nWARNING: the registrar outcome is UNKNOWN, not a proven refusal. No rollback or completion was claimed; authority remains removed and the projection quarantined. Reconcile a fresh inventory and the harness config before retrying the open intent.`;
+        if (out?.unknownOutcomeRecorded === false)
+          msg += `\n\nWARNING: the unknown outcome could not be recorded (${out.unknownOutcomeRecordError}); the original intent remains open.`;
         if (Array.isArray(out?.rollback_errors) && out.rollback_errors.length)
           msg += `\n\nWARNING: rollback was incomplete, so ${member} was NOT put back as it was (it may now be refused, not intact): ${out.rollback_errors.join('; ')}`;
         if (out?.failureRecorded === false)

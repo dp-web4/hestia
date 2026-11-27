@@ -7765,18 +7765,19 @@ fn register_refusal_not_here(atlas_id: &str, rec: &serde_json::Value) -> Option<
 ///
 /// surface: agent_ungovern   act: remove enforcement and configuration from a governed agent
 /// S: high/reversible [construct: the registrar backs up the harness config; the projection and
-///    chain are preserved, and refusal restores the authority and projection]
+///    chain are preserved; a proven refusal restores authority/projection, while an unknown outcome
+///    leaves the intent recoverable instead of claiming a rollback]
 /// R: pass [construct: mounted behind `operator_gate` with the rest of /api/*]
 /// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
 /// O: pass [construct: ungovern_ordered — reason and an exact-member recovery read, then the
 ///    agent_ungovern_intent record, authority/projection removal, and the registrar's
 ///    ownership-proved config edit]
 /// A: pass [construct: agent_ungovern_intent before the edit; agent_ungovern carries the canonical
-///    member id, reason, backup path, authority removal, quarantine and the intent hash; a failed
-///    terminal is reported, and a refused act writes agent_ungovern_failed]
+///    member id, reason, backup path, authority removal, quarantine and the intent hash; a proven
+///    refusal writes agent_ungovern_failed, and an unknown outcome writes a nonterminal unknown row]
 /// V: present [construct: unknown or ambiguous inventory records, unestablished registrar
 ///    provenance, unreadable recovery state, stale owned targets and unprovable edits are refused;
-///    authority and projection are restored if the registrar refuses]
+///    authority and projection are restored only on a proven no-write/restored refusal]
 /// verdict: PASS
 ///
 /// Ungoverning is deliberately louder than governing. Governing adds a gate and a bad
@@ -8472,7 +8473,9 @@ fn restore_ungovern_projection(
 }
 
 /// The newest ungovern row for `id`, when it is an intent with no terminal row after it: an
-/// attempt the daemon began and did not finish (it died, or its failure record itself failed).
+/// attempt the daemon began and did not finish (it died, its failure record itself failed, or the
+/// registrar outcome was unknown). `agent_ungovern_outcome_unknown` is deliberately nonterminal and
+/// absent from this filter, so an unknown result leaves the original intent recoverable.
 fn dangling_ungovern_intent(s: &super::state::ServerState, id: &str) -> anyhow::Result<Option<String>> {
     let newest = s.chain_store.read_latest_by_types_for_agent(
         &["agent_ungovern_intent", "agent_ungovern", "agent_ungovern_failed"],
@@ -8490,18 +8493,20 @@ fn dangling_ungovern_intent(s: &super::state::ServerState, id: &str) -> anyhow::
 ///     and projection are gone, so the member is REFUSED (fail closed), never silently ungoverned;
 ///   - after the hooks, before the record: the member is unwired and the chain holds the intent
 ///     only. The next call finds that intent (`dangling_ungovern_intent`) and its terminal row
-///     names it in `completes_intent`.
+///     names it in `completes_intent`;
+///   - a registrar result that is unknown (timeout, lost/malformed response) may follow a committed
+///     edit. Authority stays removed and the projection quarantined; no rollback or terminal failure
+///     is claimed. The intent stays open until a fresh-inventory/config retry.
 /// A retry from any of these states is safe: each step is a no-op when its work is already done.
 ///
-/// REASON -> INTENT -> AUTHORITY/PROJECTION -> HOOKS -> RECORD. Any hook-edit refusal restores the
-/// authority and projection; the registrar itself either writes its proved edit or restores the
-/// harness config it read. The intent remains as the record of the refused attempt.
+/// REASON -> INTENT -> AUTHORITY/PROJECTION -> HOOKS -> RECORD. Only a proven no-write or restored
+/// refusal restores the authority and projection. The intent remains as the record of the attempt.
 fn ungovern_ordered(
     s: &mut super::state::ServerState,
     id: &str,
     reason: &str,
     plan: &crate::server::agents::UngovernPlan,
-    ungovern: impl FnOnce(&crate::server::agents::UngovernPlan, &std::path::Path) -> anyhow::Result<crate::server::agents::UngovernOutcome>,
+    ungovern: impl FnOnce(&crate::server::agents::UngovernPlan, &std::path::Path) -> Result<crate::server::agents::UngovernOutcome, crate::server::agents::UngovernError>,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
     use super::seat_config as sc;
     let reason = reason.trim();
@@ -8584,7 +8589,34 @@ fn ungovern_ordered(
     }
     let outcome = match ungovern(plan, &s.home) {
         Ok(outcome) => outcome,
-        Err(e) => {
+        Err(crate::server::agents::UngovernError::Unknown(error)) => {
+            let unknown = s.append_chain(
+                "agent_ungovern_outcome_unknown",
+                serde_json::json!({
+                    "agent": id,
+                    "error": error,
+                    "intent": intent,
+                    "recoverable": true,
+                    "terminal": false,
+                }),
+            );
+            return Err((StatusCode::CONFLICT, serde_json::json!({
+                "error": error,
+                "outcome": "unknown",
+                "unknownOutcome": true,
+                "recoverable": true,
+                "rollback_attempted": false,
+                "seat_config_removed": authority_removed,
+                "projection_quarantined_to": quarantined.as_ref().map(|path| path.display().to_string()),
+                "intentEntryHash": intent,
+                "message": "The registrar outcome is unknown. Authority remains removed and the \
+                            projection quarantined; no rollback or completion was claimed. Reconcile \
+                            a fresh inventory and the harness config, then retry to complete the open intent.",
+                "unknownOutcomeRecorded": unknown.is_ok(),
+                "unknownOutcomeRecordError": unknown.as_ref().err().map(|e| e.to_string()),
+            })));
+        }
+        Err(crate::server::agents::UngovernError::Refused(error)) => {
             let mut rollback_errors = Vec::new();
             if let Some(bytes) = previous_document {
                 if let Err(re) = s.vault.put_document(sc::SEAT_CONFIG_NS, id, bytes) {
@@ -8597,7 +8629,6 @@ fn ungovern_ordered(
                 &quarantined,
                 previous_quarantine.as_deref(),
             ));
-            let error = e.to_string();
             let failed = s.append_chain(
                 "agent_ungovern_failed",
                 serde_json::json!({
@@ -16396,7 +16427,7 @@ mod operator_vault_tests {
         let error = {
             let mut s = state.lock().await;
             ungovern_ordered(&mut s, "claude-code", "try to retire", &plan, |_, _| {
-                Err(anyhow::anyhow!("registrar refused"))
+                Err(crate::server::agents::UngovernError::Refused("registrar refused".into()))
             })
             .unwrap_err()
         };
@@ -16412,6 +16443,101 @@ mod operator_vault_tests {
             .unwrap();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].event_data["error"], "registrar refused");
+    }
+
+    #[tokio::test]
+    async fn ungovern_unknown_registrar_result_keeps_intent_open_until_fresh_inventory() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let operator_home = dir.path().join("unknown-home");
+        let config = operator_home.join(".claude/settings.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let target = operator_home.join(".claude/hooks/hestia/pre_tool_use.py");
+        std::fs::write(&config, serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": format!("python3 {}", target.display())},
+                {"type": "command", "command": "node /elsewhere/foreign.js"},
+            ]}]},
+        })).unwrap()).unwrap();
+        let registrar = operator_home.join("deploy/register-members.py");
+        std::fs::create_dir_all(registrar.parent().unwrap()).unwrap();
+        std::fs::write(&registrar, r#"
+import json
+import sys
+
+home = sys.argv[sys.argv.index("--home") + 1]
+path = home + "/.claude/settings.json"
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+for groups in doc.get("hooks", {}).values():
+    for group in groups:
+        group["hooks"] = [h for h in group.get("hooks", [])
+                          if "pre_tool_use.py" not in h.get("command", "")]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh)
+print("response lost after the config commit")
+"#).unwrap();
+        let plan = crate::server::agents::UngovernPlan {
+            member: "claude-code".into(),
+            governance_id: "claude-code".into(),
+            registrar: Some(registrar),
+            owned_targets: vec![target.display().to_string()],
+            unowned_targets: Vec::new(),
+        };
+        let document = serde_json::to_vec(&sc::SeatConfig::default()).unwrap();
+        {
+            let mut s = state.lock().await;
+            s.vault.put_document(sc::SEAT_CONFIG_NS, "claude-code", document).unwrap();
+        }
+        let projection = sc::render_path(dir.path(), "claude-code");
+        std::fs::create_dir_all(projection.parent().unwrap()).unwrap();
+        std::fs::write(&projection, "current projection").unwrap();
+        let quarantine = projection.with_extension("env.unbacked");
+
+        let error = {
+            let mut s = state.lock().await;
+            ungovern_ordered(&mut s, "claude-code", "lose the registrar response", &plan, |plan, home| {
+                crate::server::agents::ungovern_at(plan, home, &operator_home)
+            })
+            .unwrap_err()
+        };
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1["outcome"], "unknown");
+        assert_eq!(error.1["recoverable"], true);
+        assert_eq!(error.1["rollback_attempted"], false);
+        assert_eq!(error.1["unknownOutcomeRecorded"], true);
+        let first_intent = error.1["intentEntryHash"].as_str().unwrap().to_string();
+        let current: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let remaining = current["hooks"]["PreToolUse"][0]["hooks"].as_array().unwrap();
+        assert_eq!(remaining.len(), 1, "the synthetic registrar really committed before losing its response");
+        assert_eq!(remaining[0]["command"], "node /elsewhere/foreign.js");
+        {
+            let s = state.lock().await;
+            assert!(s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").is_none(),
+                    "an unknown outcome must not restore authority over an uncertain config");
+            assert_eq!(dangling_ungovern_intent(&s, "claude-code").unwrap().as_deref(), Some(first_intent.as_str()));
+            let failures = s.chain_store.read_recent_by_types(None, &["agent_ungovern_failed"], 10).unwrap();
+            assert!(failures.is_empty(), "an unknown outcome is not a proven refusal and closes no intent");
+            let unknown = s.chain_store.read_recent_by_types(None, &["agent_ungovern_outcome_unknown"], 10).unwrap();
+            assert_eq!(unknown.len(), 1);
+            assert_eq!(unknown[0].event_data["terminal"], false);
+        }
+        assert!(!projection.exists());
+        assert_eq!(std::fs::read_to_string(&quarantine).unwrap(), "current projection");
+
+        let mut reconciled = plan;
+        reconciled.owned_targets.clear();
+        let value = {
+            let mut s = state.lock().await;
+            ungovern_ordered(&mut s, "claude-code", "finish after fresh inventory", &reconciled, |plan, home| {
+                crate::server::agents::ungovern_at(plan, home, &operator_home)
+            })
+            .unwrap()
+        };
+        assert_eq!(value["completes_intent"], first_intent);
+        assert_eq!(value["hooks_removed"], 0);
+        let s = state.lock().await;
+        assert!(dangling_ungovern_intent(&s, "claude-code").unwrap().is_none());
     }
 
     #[test]

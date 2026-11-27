@@ -87,7 +87,9 @@ one currently on disk (which the install is about to rewrite).
 the named, exactly matching targets (or the template's current targets when none are named), using
 the same structural edit and TOML proof. A stale target set refuses before any write. Register and
 remove writers share one advisory lock per config; before committing, the writer re-reads the source
-bytes under that lock and refuses rather than overwrite an intervening edit. A real write gets a
+bytes under that lock and refuses rather than overwrite an intervening edit. That guarantee covers
+cooperating writers only: an external editor can still write after the re-read, so an uncertain
+registrar outcome must be reconciled from a fresh inventory and config bytes. A real write gets a
 unique `.hestia-unregister.*` backup of the exact bytes this run read, never the older
 `.pre-register.bak`. `--json` returns the outcome for the daemon's witnessed ungovern act.
 
