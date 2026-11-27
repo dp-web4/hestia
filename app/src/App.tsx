@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, NavLink } from "react-router";
 import { Dashboard } from "./pages/Dashboard";
+import { Start } from "./pages/Start";
 import { Reach } from "./pages/Reach";
 import { Decide } from "./pages/Decide";
 import { Gates } from "./pages/Gates";
@@ -27,6 +28,7 @@ export default function App() {
             <span className="brand-text">Hestia</span>
           </div>
           <div className="nav-links">
+            <NavLink to="/start">Get started</NavLink>
             <NavLink to="/" end>Dashboard</NavLink>
             <NavLink to="/decide">Decide</NavLink>
             <NavLink to="/reach">Reach</NavLink>
@@ -50,6 +52,7 @@ export default function App() {
           <GateIntegrityBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/start" element={<Start />} />
             <Route path="/decide" element={<Decide />} />
             <Route path="/reach" element={<Reach />} />
             <Route path="/gates" element={<Gates />} />
