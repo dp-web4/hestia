@@ -49,6 +49,18 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/witness.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

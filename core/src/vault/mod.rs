@@ -74,7 +74,7 @@ impl Vault {
     ///
     /// The daemon holds one `Vault` in memory from startup; documents the CLI writes after
     /// that (a delegation minted with `hestia delegate grant`) are invisible to it until a
-    /// restart — and a restart destroys every pending scope request, so "restart to see the
+    /// restart — and before #1233 a restart destroyed every pending scope request, so "restart to see the
     /// delegation" would also destroy the ask it was minted to answer (measured on Legion,
     /// 2026-09-05, #952). A surface that must see the operator's latest durable state reads
     /// it fresh through this instead of the startup snapshot.
@@ -172,6 +172,24 @@ impl Vault {
             self.data.entries.push(entry);
         }
         self.save()
+    }
+
+    /// Replace or add SEVERAL entries as ONE commit: all of them land, or none does.
+    /// On a failed save the in-memory entries roll back too, so memory and disk agree.
+    pub fn upsert_many(&mut self, entries: &[VaultEntry]) -> Result<()> {
+        let snapshot = self.data.entries.clone();
+        for entry in entries {
+            if let Some(idx) = self.data.entries.iter().position(|e| e.name == entry.name) {
+                self.data.entries[idx] = entry.clone();
+            } else {
+                self.data.entries.push(entry.clone());
+            }
+        }
+        if let Err(e) = self.save() {
+            self.data.entries = snapshot;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Remove an entry by name. Returns the removed entry.
@@ -601,6 +619,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vault.enc");
         (dir, path)
+    }
+
+    #[test]
+    fn upsert_many_commits_as_one_or_rolls_back_every_entry() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        vault.upsert(VaultEntry::new("keep", "old")).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("stop".into())));
+        let error = vault
+            .upsert_many(&[VaultEntry::new("one", "1"), VaultEntry::new("two", "2")])
+            .unwrap_err();
+        assert!(matches!(error, CoreError::SaveBarrier(_)), "{error:?}");
+        assert_eq!(vault.get("keep").map(|e| e.secret.as_str()), Some("old"));
+        assert!(vault.get("one").is_none() && vault.get("two").is_none());
+
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault
+            .upsert_many(&[VaultEntry::new("keep", "new"), VaultEntry::new("two", "2")])
+            .unwrap();
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(reopened.get("keep").map(|e| e.secret.as_str()), Some("new"));
+        assert_eq!(reopened.get("two").map(|e| e.secret.as_str()), Some("2"));
     }
 
     #[test]

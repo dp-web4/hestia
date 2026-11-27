@@ -8,6 +8,7 @@ pub mod adjudicator;
 pub mod api_version;
 mod dashboard;
 pub mod decision_witness;
+pub mod delegation_gate;
 pub mod evidence;
 pub mod gate_escalation;
 pub mod governance_ledger;

@@ -270,6 +270,82 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s.trim()).ok()?.try_into().ok()
 }
 
+/// Read a complete member identity without changing the vault.
+///
+/// Complete means coherent, not merely present: the stored `ai_identity_pubkey` is what a hub may
+/// have pinned, so a secret that derives a different key is not this member's identity. Returning
+/// it would sign as a key the hub does not know while every surface reports the pinned one.
+pub fn read_member_identity(vault: &crate::vault::Vault) -> Option<(Uuid, KeyPair)> {
+    let lct_e = vault.get("ai_identity_lct_id")?;
+    let pub_e = vault.get("ai_identity_pubkey")?;
+    let sec_e = vault.get("ai_identity_secret")?;
+    let lct = Uuid::parse_str(&lct_e.secret).ok()?;
+    let bytes = hex_to_32(&sec_e.secret)?;
+    let kp = KeyPair::from_secret_bytes(&bytes);
+    if !kp.verifying_key().to_hex().eq_ignore_ascii_case(pub_e.secret.trim()) {
+        return None;
+    }
+    Some((lct, kp))
+}
+
+/// Why three present identity entries do not form an identity. For the operator's repair message.
+fn member_identity_defect(vault: &crate::vault::Vault) -> &'static str {
+    let entry = |name| vault.get(name).map(|e| e.secret.trim().to_string()).unwrap_or_default();
+    if Uuid::parse_str(&entry("ai_identity_lct_id")).is_err() {
+        return "ai_identity_lct_id is not a UUID";
+    }
+    let Some(bytes) = hex_to_32(&entry("ai_identity_secret")) else {
+        return "ai_identity_secret is not 32 hex-encoded bytes";
+    };
+    let stored = entry("ai_identity_pubkey");
+    if hex_to_32(&stored).is_none() {
+        return "ai_identity_pubkey is not 32 hex-encoded bytes";
+    }
+    if !KeyPair::from_secret_bytes(&bytes).verifying_key().to_hex().eq_ignore_ascii_case(&stored) {
+        return "ai_identity_secret does not derive the stored ai_identity_pubkey";
+    }
+    "entries are unreadable"
+}
+
+/// Load or provision the member identity shared by the CLI and dashboard.
+pub fn ensure_member_identity(vault: &mut crate::vault::Vault) -> Result<(Uuid, KeyPair)> {
+    let has_lct = vault.get("ai_identity_lct_id").is_some();
+    let has_pubkey = vault.get("ai_identity_pubkey").is_some();
+    let has_secret = vault.get("ai_identity_secret").is_some();
+    if has_lct && has_pubkey && has_secret {
+        return read_member_identity(vault)
+            .ok_or_else(|| anyhow::anyhow!(
+                "member identity entries are malformed ({}); operator repair required — refusing to sign or remint",
+                member_identity_defect(vault)
+            ));
+    }
+    if has_pubkey || has_secret {
+        if has_pubkey && !has_secret {
+            anyhow::bail!("member identity has a public key but no private key; operator repair is required — refusing to remint a key a hub may have pinned");
+        }
+        anyhow::bail!("member identity is partial (lct_id={has_lct}, pubkey={has_pubkey}, secret={has_secret}); operator repair is required — refusing to remint");
+    }
+
+    // A lone LCT has no public key a hub could have pinned, so it is the only partial state we
+    // may replace. Otherwise this is a fresh identity. All three entries commit as one write.
+    let kp = KeyPair::generate();
+    let lct = Uuid::new_v4();
+    let secret_hex: String = kp
+        .secret_key_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    vault.upsert_many(&[
+        crate::vault::VaultEntry::new("ai_identity_lct_id", lct.to_string())
+            .with_tags(vec!["identity".into()]),
+        crate::vault::VaultEntry::new("ai_identity_pubkey", kp.verifying_key().to_hex())
+            .with_tags(vec!["identity".into()]),
+        crate::vault::VaultEntry::new("ai_identity_secret", secret_hex)
+            .with_tags(vec!["identity".into(), "secret".into()]),
+    ])?;
+    Ok((lct, kp))
+}
+
 /// Resolve the keypair that signs member-tier acts to a hub, per its
 /// `member_key_source`. `VaultIdentity` reads `ai_identity_secret` from the
 /// sealed vault (default); `ChannelKeyFile` reads a raw 32-byte Ed25519 seed —
@@ -354,6 +430,43 @@ impl HubStore {
     pub fn find_by_id(&self, id: Uuid) -> Option<&HubConnection> {
         self.connections.iter().find(|c| c.id == id)
     }
+}
+
+/// Resolve a discovered REST endpoint without letting discovery choose a new origin.
+pub fn absolute_rest_endpoint(base_url: &str, rest: &str) -> Result<String> {
+    let rest = if rest.is_empty() { "/v1" } else { rest };
+    if rest.contains('?') || rest.contains('#') {
+        anyhow::bail!("discovery endpoint query/fragment is not allowed");
+    }
+    let base = reqwest::Url::parse(base_url.trim()).context("invalid selected hub URL")?;
+    if !base.username().is_empty() || base.password().is_some() {
+        anyhow::bail!("selected hub URL user-info is not allowed");
+    }
+    if base.query().is_some() || base.fragment().is_some() {
+        anyhow::bail!("selected hub URL query/fragment is not allowed");
+    }
+    let candidate = if rest.starts_with("http://") || rest.starts_with("https://") {
+        rest.to_string()
+    } else {
+        if rest.contains("://") {
+            anyhow::bail!("non-http discovery endpoint refused");
+        }
+        format!("{}/{}", base_url.trim_end_matches('/'), rest.trim_matches('/'))
+    };
+    let endpoint = reqwest::Url::parse(&candidate).context("invalid discovery endpoint")?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        anyhow::bail!("discovery endpoint must be an HTTP(S) origin");
+    }
+    if base.scheme() != endpoint.scheme()
+        || base.host_str() != endpoint.host_str()
+        || base.port_or_known_default() != endpoint.port_or_known_default()
+    {
+        anyhow::bail!("cross-origin discovery endpoint refused");
+    }
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        anyhow::bail!("discovery endpoint user-info is not allowed");
+    }
+    Ok(endpoint.to_string().trim_end_matches('/').to_string())
 }
 
 /// HTTP client for hub API calls.
@@ -635,32 +748,49 @@ impl HubClient {
         HubChannel::from_hub_info(&info, pair_id)
     }
 
-    /// Run a query over an established channel. The request `{tool, args}` is
-    /// sealed to the hub, POSTed to `/v1/hubs/{hub_id}/channel`, and the sealed
-    /// response is opened — nothing in the clear. `my` is the member's vault
-    /// keypair; `my_lct_id` identifies which pinned pubkey the hub uses.
-    /// Resolve a member LCT by display name via the hub roster
-    /// (`GET {base}/tools/list_members`). Exact (case-insensitive) name match
-    /// first, then a unique prefix (`thor` → `thor-sage`); an ambiguous prefix
-    /// fails closed. Mirrors the mesh `hub-notify.sh` fallback so a peer name
-    /// resolves the same way whether the sender is the shell watcher or hestia.
-    pub async fn resolve_member_by_name(&self, base_url: &str, name: &str) -> Result<Uuid> {
-        let url = format!("{}/tools/list_members", base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .get(&url)
-            .send()
+    /// Resolve a member LCT by display name through the sealed `list_members` channel read.
+    /// Exact (case-insensitive) name match first, then a unique prefix (`thor` → `thor-sage`);
+    /// an ambiguous prefix fails closed. The public operator-only roster is never a fallback.
+    /// An external caller gets the membership remedy, not a misleading missing-route error.
+    pub async fn resolve_member_by_name(
+        &self,
+        rest_endpoint: &str,
+        channel: &HubChannel,
+        my: &KeyPair,
+        my_lct_id: Uuid,
+        name: &str,
+    ) -> Result<Uuid> {
+        let body = self
+            .channel_query(rest_endpoint, channel, my, my_lct_id, "list_members", serde_json::json!({}))
             .await
-            .with_context(|| format!("listing members at {url}"))?;
-        if !resp.status().is_success() {
-            anyhow::bail!("hub /tools/list_members returned HTTP {}", resp.status());
+            .map_err(|e| {
+                let message = format!("{e:#}");
+                // Only the hub's external-tier refusal means "you are not a member". A member
+                // whose role the hub's law denies this read also gets a 403, and telling that
+                // member to request citizenship would send it down the wrong repair path.
+                if message.contains("HTTP 403") && message.contains("external LCT") {
+                    anyhow::anyhow!(
+                        "hub membership is required before roster reads: request citizenship or a denial review ({message})"
+                    )
+                } else {
+                    anyhow::anyhow!("the hub refused or failed the sealed roster read; nothing was resolved ({message})")
+                }
+            })?;
+        // A hub that capped the list has not shown every member, so "no match" and "the only
+        // match" are both unproven. Refuse rather than notify whoever happened to be listed.
+        if body.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false) {
+            anyhow::bail!(
+                "the hub returned a truncated roster, so '{name}' cannot be resolved by name; use the LCT id"
+            );
         }
-        let body: serde_json::Value = resp.json().await.context("parsing list_members response")?;
         let members = body
             .get("members")
             .and_then(|m| m.as_array())
             .ok_or_else(|| anyhow::anyhow!("list_members response has no `members` array"))?;
-        let want = name.to_lowercase();
+        let want = name.trim().to_lowercase();
+        if want.is_empty() {
+            anyhow::bail!("an empty member name resolves to nobody; name the peer or use the LCT id");
+        }
         let name_of = |m: &serde_json::Value| {
             m.get("name")
                 .and_then(|n| n.as_str())
@@ -672,8 +802,16 @@ impl HubClient {
                 .and_then(|l| l.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok())
         };
-        if let Some(m) = members.iter().find(|m| name_of(m) == want) {
-            return lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id"));
+        // An exact name is not unique by construction: two members may carry the same display
+        // name. Taking the first would notify whichever the hub happened to list first.
+        let exact: Vec<&serde_json::Value> = members.iter().filter(|m| name_of(m) == want).collect();
+        match exact.as_slice() {
+            [] => {}
+            [m] => return lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id")),
+            _ => anyhow::bail!(
+                "ambiguous member name '{name}' — {} members carry exactly that name; use the LCT id",
+                exact.len()
+            ),
         }
         let pref: Vec<&serde_json::Value> = members
             .iter()
@@ -689,6 +827,10 @@ impl HubClient {
         }
     }
 
+    /// Run a query over an established channel. The request `{tool, args}` is
+    /// sealed to the hub, POSTed to `/v1/hubs/{hub_id}/channel`, and the sealed
+    /// response is opened — nothing in the clear. `my` is the member's vault
+    /// keypair; `my_lct_id` identifies which pinned pubkey the hub uses.
     pub async fn channel_query(
         &self,
         rest_endpoint: &str,
@@ -1391,6 +1533,91 @@ mod tests {
     use super::*;
     use web4_core::crypto::KeyPair;
 
+    #[test]
+    fn member_identity_provisions_all_three_entries_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.enc");
+        let mut vault = crate::vault::Vault::init(path, "p".into()).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("stop".into())));
+        assert!(ensure_member_identity(&mut vault).is_err());
+        for name in ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret"] {
+            assert!(vault.get(name).is_none(), "a failed identity commit left {name}");
+        }
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        let (lct, keypair) = ensure_member_identity(&mut vault).unwrap();
+        let (read_lct, read_keypair) = read_member_identity(&vault).unwrap();
+        assert_eq!(read_lct, lct);
+        assert_eq!(read_keypair.verifying_key().to_hex(), keypair.verifying_key().to_hex());
+    }
+
+    #[test]
+    fn only_a_lone_lct_is_replaced_but_a_missing_private_key_is_never_reminted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lone = crate::vault::Vault::init(dir.path().join("lone.enc"), "p".into()).unwrap();
+        let old = Uuid::new_v4();
+        lone.add(crate::vault::VaultEntry::new("ai_identity_lct_id", old.to_string())).unwrap();
+        let (new, _) = ensure_member_identity(&mut lone).unwrap();
+        assert_ne!(new, old);
+        assert!(read_member_identity(&lone).is_some());
+
+        let mut pinned = crate::vault::Vault::init(dir.path().join("pinned.enc"), "p".into()).unwrap();
+        pinned
+            .add(crate::vault::VaultEntry::new("ai_identity_pubkey", KeyPair::generate().verifying_key().to_hex()))
+            .unwrap();
+        let before = pinned.get("ai_identity_pubkey").unwrap().secret.clone();
+        let error = match ensure_member_identity(&mut pinned) {
+            Ok(_) => panic!("a missing private key must never remint"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("no private key"), "{error:#}");
+        assert_eq!(pinned.get("ai_identity_pubkey").map(|e| e.secret.as_str()), Some(before.as_str()));
+        assert!(pinned.get("ai_identity_lct_id").is_none());
+        assert!(pinned.get("ai_identity_secret").is_none());
+    }
+
+    /// A secret for key S beside a stored public key P is not a complete identity: a hub may have
+    /// pinned P. The reader refuses it, `ensure` names the mismatch and changes nothing.
+    #[test]
+    fn a_secret_that_does_not_derive_the_stored_pubkey_is_not_an_identity() {
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let build = |file: &str, pubkey: String, secret: String| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut v = crate::vault::Vault::init(dir.path().join(file), "p".into()).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_lct_id", Uuid::new_v4().to_string())).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_pubkey", pubkey)).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_secret", secret)).unwrap();
+            (dir, v)
+        };
+        let snapshot = |v: &crate::vault::Vault| {
+            ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret"]
+                .map(|n| v.get(n).map(|e| e.secret.clone()))
+        };
+        let pinned = KeyPair::generate();
+        let other = KeyPair::generate();
+
+        // Positive control: the matching pair reads, in either hex case.
+        let (_d, ok) = build("ok.enc", pinned.verifying_key().to_hex().to_uppercase(), hex(&pinned.secret_key_bytes()));
+        assert!(read_member_identity(&ok).is_some(), "a matching pair must read");
+
+        for (label, pubkey, want) in [
+            ("mismatch", pinned.verifying_key().to_hex(), "does not derive the stored ai_identity_pubkey"),
+            ("malformed", "not-a-key".to_string(), "ai_identity_pubkey is not 32 hex-encoded bytes"),
+        ] {
+            let (_d, mut v) = build("bad.enc", pubkey, hex(&other.secret_key_bytes()));
+            let before = snapshot(&v);
+            assert!(
+                read_member_identity(&v).is_none(),
+                "{label}: read_member_identity accepted a secret whose public key != stored ai_identity_pubkey"
+            );
+            let error = match ensure_member_identity(&mut v) {
+                Ok(_) => panic!("{label}: ensure_member_identity returned a signer"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(want), "{label}: {error}");
+            assert_eq!(snapshot(&v), before, "{label}: a refused identity must not be rewritten");
+        }
+    }
+
     // [retired 2026-07-20] sealed_secret_roundtrips_e2e_and_fails_closed tested the
     // send_secret primitives; superseded by `crate::pairing`'s pair-channel tests.
 
@@ -1674,6 +1901,39 @@ mod tests {
     }
 
     #[test]
+    fn rest_endpoint_resolution_is_confined_to_the_selected_origin() {
+        let selected = "http://127.0.0.1:8770";
+        assert_eq!(absolute_rest_endpoint(selected, "").unwrap(),
+                   "http://127.0.0.1:8770/v1");
+        assert_eq!(absolute_rest_endpoint(selected, "/v1").unwrap(),
+                   "http://127.0.0.1:8770/v1");
+        assert_eq!(absolute_rest_endpoint(selected, "http://127.0.0.1:8770/v1/").unwrap(),
+                   "http://127.0.0.1:8770/v1");
+
+        for endpoint in [
+            "http://127.0.0.1:9999/v1",
+            "https://127.0.0.1:8770/v1",
+            "http://example.com/v1",
+            "http://user@127.0.0.1:8770/v1",
+            "http://127.0.0.1:8770/v1?query=1",
+            "http://127.0.0.1:8770/v1#fragment",
+            "file:///tmp/hub",
+            "/v1?query=1",
+            "/v1#fragment",
+        ] {
+            assert!(absolute_rest_endpoint(selected, endpoint).is_err(), "{endpoint}");
+        }
+        for selected in [
+            "http://user@127.0.0.1:8770",
+            "http://127.0.0.1:8770/?query=1",
+            "http://127.0.0.1:8770/#fragment",
+        ] {
+            assert!(absolute_rest_endpoint(selected, "/v1").is_err(), "{selected}");
+            assert!(absolute_rest_endpoint(selected, "http://127.0.0.1:8770/v1").is_err(), "{selected}");
+        }
+    }
+
+    #[test]
     fn test_hub_store_roundtrip() {
         let mut store = HubStore::default();
         store.connections.push(HubConnection {
@@ -1780,5 +2040,243 @@ mod tests {
             "a channel-key member signs with the seed file; resolving the vault identity \
              instead produces a key the hub does not pin for this member"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod sealed_roster_tests {
+    use super::*;
+    use axum::{extract::{Json, State}, response::{IntoResponse, Response}, routing::post, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockHub {
+        hub: KeyPair,
+        member: PublicKey,
+        pair_id: Uuid,
+        answer: Value,
+        calls: Arc<Mutex<Vec<String>>>,
+        /// Every opened inner request, whole: tool, args, nonce, issued_at.
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    fn mock(hub: &KeyPair, member: &KeyPair, pair_id: Uuid, answer: Value) -> MockHub {
+        MockHub {
+            hub: hub.clone(), member: member.verifying_key(), pair_id, answer,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A status and a plain-text body, as the hub's `ApiError` renders them.
+    fn refusing(status: u16, text: &'static str) -> Router {
+        Router::new().route("/v1/hubs/:id/channel", post(move || async move {
+            (axum::http::StatusCode::from_u16(status).unwrap(), text).into_response()
+        }))
+    }
+
+    async fn answer(State(mock): State<MockHub>, Json(req): Json<Value>) -> Response {
+        let sealed = Sealed::from_base64(req["sealed"].as_str().unwrap()).unwrap();
+        let plaintext = pair_channel::open(&mock.hub, &mock.member, mock.pair_id, &sealed).unwrap();
+        let request: Value = serde_json::from_slice(&plaintext).unwrap();
+        mock.calls.lock().unwrap().push(request["tool"].as_str().unwrap().to_string());
+        mock.requests.lock().unwrap().push(request.clone());
+        let sealed = pair_channel::seal(
+            &mock.hub,
+            &mock.member,
+            mock.pair_id,
+            &serde_json::to_vec(&mock.answer).unwrap(),
+        )
+        .unwrap();
+        Json(json!({"sealed": sealed.to_base64()})).into_response()
+    }
+
+    async fn unjoined() -> Response {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "external LCTs may only request citizenship or a denial review",
+        )
+            .into_response()
+    }
+
+    async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn a_joined_member_resolves_through_the_sealed_roster() {
+        let hub = KeyPair::generate();
+        let member = KeyPair::generate();
+        let hub_lct = Uuid::new_v4();
+        let member_lct = Uuid::new_v4();
+        let peer_lct = Uuid::new_v4();
+        let pair_id = Uuid::new_v4();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut mock = mock(&hub, &member, pair_id,
+            json!({"members": [{"name": "Peer Example", "lct_id": peer_lct}]}));
+        mock.calls = calls.clone();
+        let (rest, task) = serve(Router::new().route("/v1/hubs/:id/channel", post(answer)).with_state(mock)).await;
+        let channel = HubChannel::new(hub_lct, pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let client = HubClient::new();
+        let exact = client
+            .resolve_member_by_name(&rest, &channel, &member, member_lct, "Peer Example")
+            .await
+            .unwrap();
+        let prefix = client
+            .resolve_member_by_name(&rest, &channel, &member, member_lct, "Peer")
+            .await
+            .unwrap();
+        assert_eq!((exact, prefix), (peer_lct, peer_lct));
+        assert_eq!(calls.lock().unwrap().as_slice(), ["list_members", "list_members"]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unjoined_caller_gets_the_membership_remedy_not_a_404() {
+        let hub = KeyPair::generate();
+        let member = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let (rest, task) = serve(Router::new().route("/v1/hubs/:id/channel", post(unjoined))).await;
+        let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let err = HubClient::new()
+            .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), "peer")
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("HTTP 403"), "{text}");
+        assert!(text.contains("request citizenship or a denial review"), "{text}");
+        assert!(!text.contains("404"), "{text}");
+        task.abort();
+    }
+
+    /// NOVA's hold on #1715: the notify flow is resolve, then `referenced_act`, on ONE channel.
+    /// Each request must be fresh (its own nonce and issued_at, or the hub's ReplayGuard would
+    /// drop the second), the act must name exactly the LCT the roster returned, and nothing may
+    /// leave the sealed route.
+    #[tokio::test]
+    async fn resolve_then_referenced_act_share_a_channel_with_fresh_requests_and_no_public_route() {
+        let (hub, member) = (KeyPair::generate(), KeyPair::generate());
+        let (peer_lct, pair_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mock = mock(&hub, &member, pair_id, json!({"members": [
+            {"name": "peer-example", "lct_id": peer_lct},
+            {"name": "someone-else", "lct_id": Uuid::new_v4()},
+        ]}));
+        let requests = mock.requests.clone();
+        let stray = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = stray.clone();
+        let router = Router::new()
+            .route("/v1/hubs/:id/channel", post(answer))
+            .with_state(mock)
+            // Anything else the client reaches for (the old public `/tools/list_members`) lands here.
+            .fallback(move |uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.to_string());
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            });
+        let (rest, task) = serve(router).await;
+        let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let client = HubClient::new();
+        let me = Uuid::new_v4();
+        let resolved = client.resolve_member_by_name(&rest, &channel, &member, me, "peer").await.unwrap();
+        assert_eq!(resolved, peer_lct);
+        client
+            .channel_query(&rest, &channel, &member, me, "referenced_act",
+                           json!({"peer_lct_id": resolved, "ref_uri": "x", "content_hash": "y"}))
+            .await
+            .unwrap();
+        let got = requests.lock().unwrap().clone();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0]["tool"].as_str(), got[1]["tool"].as_str()), (Some("list_members"), Some("referenced_act")));
+        assert_eq!(got[1]["args"]["peer_lct_id"], json!(peer_lct), "the act names the LCT the roster returned");
+        let nonce = |r: &Value| r["nonce"].as_str().unwrap().to_string();
+        assert!(!nonce(&got[0]).is_empty() && nonce(&got[0]) != nonce(&got[1]), "one nonce per request: {got:?}");
+        assert!(got.iter().all(|r| r["issued_at"].as_str().is_some()), "{got:?}");
+        assert!(stray.lock().unwrap().is_empty(), "left the sealed route: {:?}", stray.lock().unwrap());
+        task.abort();
+    }
+
+    /// A 403 is not always "you are not a member". The hub's read gate answers a MEMBER whose
+    /// role its law denies with a 403 too; that caller must not be told to request citizenship.
+    /// Nor is a 409 or a 500 a membership fact.
+    #[tokio::test]
+    async fn only_the_external_tier_refusal_is_reported_as_missing_membership() {
+        let (hub, member) = (KeyPair::generate(), KeyPair::generate());
+        for (status, text) in [
+            (403, "read denied by hub law (norm: citizens-may-not-list)"),
+            (409, "council mode active"),
+            (500, "ledger unavailable"),
+        ] {
+            let pair_id = Uuid::new_v4();
+            let (rest, task) = serve(refusing(status, text)).await;
+            let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+            let err = HubClient::new()
+                .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), "peer")
+                .await
+                .unwrap_err();
+            let shown = format!("{err:#}");
+            assert!(shown.contains(&format!("HTTP {status}")) && shown.contains(text), "{shown}");
+            assert!(!shown.contains("citizenship"), "HTTP {status} is not a membership fact: {shown}");
+            task.abort();
+        }
+    }
+
+    /// Fail closed wherever the roster cannot name exactly one member.
+    #[tokio::test]
+    async fn a_name_that_does_not_pick_exactly_one_member_resolves_to_nobody() {
+        let (hub, member) = (KeyPair::generate(), KeyPair::generate());
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let cases: Vec<(Value, &str, &str)> = vec![
+            // two members with the same exact name (case-insensitively)
+            (json!({"members": [{"name": "Twin", "lct_id": a}, {"name": "twin", "lct_id": b}]}),
+             "twin", "members carry exactly that name"),
+            // an ambiguous prefix
+            (json!({"members": [{"name": "thor-a", "lct_id": a}, {"name": "thor-b", "lct_id": b}]}),
+             "thor", "ambiguous member name"),
+            // an empty or blank name would otherwise prefix-match everyone
+            (json!({"members": [{"name": "only", "lct_id": a}]}), "  ", "empty member name"),
+            // a capped roster proves neither absence nor uniqueness
+            (json!({"members": [{"name": "peer-one", "lct_id": a}], "total": 9, "truncated": true}),
+             "peer", "truncated roster"),
+            (json!({"members": [{"name": "peer-one", "lct_id": a}]}), "nobody", "no hub member matches"),
+        ];
+        for (answer, name, want) in cases {
+            let pair_id = Uuid::new_v4();
+            let (rest, task) = serve(
+                Router::new().route("/v1/hubs/:id/channel", post(self::answer))
+                    .with_state(mock(&hub, &member, pair_id, answer)),
+            ).await;
+            let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+            let got = HubClient::new()
+                .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), name)
+                .await;
+            let shown = match got {
+                Ok(lct) => panic!("'{name}' resolved to {lct}; expected a refusal ({want})"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(shown.contains(want), "'{name}': {shown}");
+            task.abort();
+        }
+        // Control: an exact name still wins over a longer name it prefixes.
+        let pair_id = Uuid::new_v4();
+        let (rest, task) = serve(
+            Router::new().route("/v1/hubs/:id/channel", post(self::answer)).with_state(mock(
+                &hub, &member, pair_id,
+                json!({"members": [{"name": "thor", "lct_id": a}, {"name": "thor-sage", "lct_id": b}]}),
+            )),
+        ).await;
+        let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let got = HubClient::new()
+            .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), "THOR")
+            .await
+            .unwrap();
+        assert_eq!(got, a);
+        task.abort();
     }
 }
