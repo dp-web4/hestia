@@ -448,6 +448,12 @@ fn entry_str<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
     e.event_data.get(key).and_then(Value::as_str)
 }
 
+/// The one deny-reference rule (#610 review), so a legacy prefix credits here exactly when the
+/// queue and the ruling path treat it as the same deny.
+fn deny_hash_compatible(recorded: &str, full_hash: &str) -> bool {
+    crate::storage::chain::deny_refs_agree(recorded, full_hash)
+}
+
 fn entry_feedback_act(e: &ChainEntry) -> Option<&str> {
     e.event_data.get("feedback")?.get("act")?.as_str().filter(|act| !act.is_empty())
 }
@@ -816,7 +822,8 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         // disagreement, not obedience).
         let appealed = entries.iter().any(|e| {
             e.event_type == "appeal"
-                && entry_str(e, "deny_hash") == Some(deny.hash.as_str())
+                && entry_str(e, "deny_hash")
+                    .is_some_and(|recorded| deny_hash_compatible(recorded, &deny.hash))
                 && is_grain(e)
         });
         // RECAST-AFTER-DENY — the gap kimi named, and the half that still selected for
@@ -894,7 +901,8 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             && entries.iter().any(|e| {
                 e.event_type == "adjudication"
                     && is_member(entry_str(e, "subject_plugin_id"))
-                    && entry_str(e, "about_deny_hash") == Some(deny.hash.as_str())
+                    && entry_str(e, "about_deny_hash")
+                        .is_some_and(|recorded| deny_hash_compatible(recorded, &deny.hash))
                     && e.event_data
                         .get("upheld")
                         .and_then(Value::as_bool)

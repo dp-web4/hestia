@@ -1969,27 +1969,34 @@ impl SqliteChainStore {
         Ok(stmt.query_row(params![plugin_id, floor], |row| row.get(0)).optional()?)
     }
 
-    /// Unruled appeals in the position window, newest first (#488). The anti-join
+    /// Unruled appeals across the whole chain, newest first (#488, #610). The anti-join
     /// projects only the open queue rather than parsing every appeal and ruling.
     /// Only a later adjudication closes an appeal; an earlier ruling must not hide a new one.
-    pub fn open_appeal_rows(&self, window: u64) -> Result<Vec<ChainEntry>> {
+    /// Both the "is it rulable" filter and the "is it ruled" join are the one deny-reference
+    /// rule (`deny_ref_rulable_sql`, `deny_refs_agree_sql`), so the queue cannot list what
+    /// arbitration cannot find, nor close what the Rust readers still call open (#610 review).
+    pub fn open_appeal_rows(&self) -> Result<Vec<ChainEntry>> {
         let conn = self.observed(&self.read_conn)?;
-        let mut stmt = conn.prepare(
+        let a_ref = "json_extract(a.event_data, '$.deny_hash')";
+        let j_ref = "json_extract(j.event_data, '$.about_deny_hash')";
+        let sql = format!(
             "SELECT a.chain_position, a.hash, a.prev_hash, a.event_type,
                     a.event_data, a.signer_lct, a.timestamp
              FROM chain_entries a
              WHERE a.event_type = 'appeal'
-               AND a.chain_position > (SELECT COALESCE(MAX(chain_position), 0) - ?1 FROM chain_entries)
+               AND {rulable}
                AND NOT EXISTS (
                    SELECT 1 FROM chain_entries j
                    WHERE j.event_type = 'adjudication'
                      AND j.chain_position > a.chain_position
-                     AND json_extract(j.event_data, '$.about_deny_hash') =
-                         json_extract(a.event_data, '$.deny_hash')
+                     AND {agree}
                )
              ORDER BY a.chain_position DESC",
-        )?;
-        let rows = stmt.query_map(params![window as i64], |row| {
+            rulable = deny_ref_rulable_sql(a_ref),
+            agree = deny_refs_agree_sql(j_ref, a_ref),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
             row_to_entry(row)
         })?;
         let mut out = Vec::new();
@@ -2086,23 +2093,32 @@ impl SqliteChainStore {
     /// appended after them. `hestia://appeal/<hash>` then answered `appeal_pointer_not_found`
     /// for appeals that WERE ruled, so the appellant's only reader reported its rulings as
     /// nonexistent. A ruling does not stop being true because the fleet was busy (#610).
-    /// The filing and ruling paths keep their window deliberately: acting on an aged-out
-    /// deny is refused. Knowing what happened to one is not.
+    /// Since #610 the filing, discovery and ruling paths are windowless too. Rows come back
+    /// in ascending `chain_position` (pinned by `appeal_row_reads_are_chain_ordered`), but
+    /// the ruling path picks its appeal by position explicitly rather than by this order.
+    ///
+    /// A recorded `deny_hash` / `about_deny_hash` matches by the one deny-reference rule
+    /// (`deny_refs_agree_sql`) in BOTH directions, so a full hash finds a legacy prefix of at
+    /// least `MIN_LEGACY_DENY_PREFIX` recorded in any case. It used to be a one-way `LIKE` on
+    /// the pointer, which a caller could only feed the first eight characters, and a shorter
+    /// legacy prefix was then queued but unfindable (NOVA, #610 review).
     pub fn appeal_rows_for_pointer(&self, ptr: &str) -> Result<Vec<ChainEntry>> {
         let ptr = validate_hash_pointer(ptr)?;
         // Hex only (validated), so `%` cannot occur in `ptr` and needs no escaping.
-        let pattern = if ptr.len() >= 8 { format!("{ptr}%") } else { ptr };
+        let pattern = if ptr.len() >= 8 { format!("{ptr}%") } else { ptr.clone() };
         let conn = self.observed(&self.conn)?;
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
              WHERE event_type IN ('appeal', 'adjudication')
-               AND (json_extract(event_data, '$.deny_hash') LIKE ?1
-                    OR json_extract(event_data, '$.about_deny_hash') LIKE ?1
-                    OR (event_type = 'appeal' AND hash LIKE ?1))
+               AND ({deny} OR {about}
+                    OR (event_type = 'appeal' AND hash LIKE ?2))
              ORDER BY chain_position ASC",
-        )?;
-        let rows = stmt.query_map(params![pattern], row_to_entry)?;
+            deny = deny_refs_agree_sql("json_extract(event_data, '$.deny_hash')", "?1"),
+            about = deny_refs_agree_sql("json_extract(event_data, '$.about_deny_hash')", "?1"),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![ptr, pattern], row_to_entry)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r??);
@@ -2712,6 +2728,78 @@ pub(crate) fn validate_hash_pointer(pointer: &str) -> Result<String> {
         );
     }
     Ok(pointer.to_ascii_lowercase())
+}
+
+/// Shortest recorded deny reference honoured as a PREFIX of another (#610 review).
+///
+/// Before canonical filing, `hestia_appeal` and `hestia_arbitrate_appeal` recorded the raw
+/// pointer they were given, at any length `chain_by_pointer` resolved uniquely and in either
+/// case. NOVA's 2026-11-25 SQLite probe showed four readers applying four rules to those rows.
+/// Eight hex characters is the same floor `appeal_rows_for_pointer` and the appeal resolver
+/// already apply to a typed prefix: below it a prefix stops identifying one entry with any
+/// confidence on a chain of this size (a 6-character prefix has 16.7M values; a chain of ~1M
+/// entries gives a ~6% chance per prefix of a second match). A legacy reference shorter than
+/// this is NOT honoured: it is not queued, not rulable, credits nothing, and does not block a
+/// canonical re-file, which is the migration path for such an appeal.
+pub const MIN_LEGACY_DENY_PREFIX: usize = 8;
+
+fn is_deny_ref_hex(r: &str) -> bool {
+    r.len() <= 64 && r.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// THE ONE deny-reference rule, shared by filing, arbitration, the open queue (as SQL, see
+/// [`deny_refs_agree_sql`]), the appeal readers, `derivation.rs` and `appeal_floor`.
+///
+/// Two recorded references (`appeal.deny_hash`, `adjudication.about_deny_hash`, or a resolved
+/// full hash) agree when they are byte-equal and non-empty (the canonical path), or when both
+/// are ASCII hex of at most 64 characters, the shorter is at least
+/// [`MIN_LEGACY_DENY_PREFIX`] long, and it is a prefix of the longer ignoring ASCII case.
+/// Case is ignored because hex is case-free and `validate_hash_pointer` lowercases every
+/// pointer, while legacy rows kept whatever case the caller typed.
+pub fn deny_refs_agree(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let n = a.len().min(b.len());
+    n >= MIN_LEGACY_DENY_PREFIX
+        && is_deny_ref_hex(a)
+        && is_deny_ref_hex(b)
+        && a[..n].eq_ignore_ascii_case(&b[..n])
+}
+
+/// Can an appeal recording `r` be reached by the ruling path? Arbitration resolves its pointer
+/// to a full 64-hex deny hash and then matches appeals with [`deny_refs_agree`], so only a hex
+/// reference of [`MIN_LEGACY_DENY_PREFIX`]..=64 characters can ever be ruled. The open queue
+/// lists exactly these, so "listed" and "rulable" stay one predicate.
+pub fn deny_ref_rulable(r: &str) -> bool {
+    r.len() >= MIN_LEGACY_DENY_PREFIX && is_deny_ref_hex(r)
+}
+
+/// [`deny_refs_agree`] as a SQLite boolean over two SQL expressions. Pinned to the Rust form
+/// by `deny_ref_rule_is_one_rule_in_rust_and_sql`.
+pub fn deny_refs_agree_sql(a: &str, b: &str) -> String {
+    let m = MIN_LEGACY_DENY_PREFIX;
+    format!(
+        "(typeof({a}) = 'text' AND typeof({b}) = 'text' AND {a} <> '' AND {b} <> '' AND (
+            {a} = {b}
+            OR (min(length({a}), length({b})) >= {m}
+                AND length({a}) <= 64 AND length({b}) <= 64
+                AND {a} NOT GLOB '*[^0-9A-Fa-f]*' AND {b} NOT GLOB '*[^0-9A-Fa-f]*'
+                AND lower(substr({a}, 1, min(length({a}), length({b}))))
+                    = lower(substr({b}, 1, min(length({a}), length({b})))))))"
+    )
+}
+
+/// [`deny_ref_rulable`] as a SQLite boolean.
+pub fn deny_ref_rulable_sql(r: &str) -> String {
+    let m = MIN_LEGACY_DENY_PREFIX;
+    format!(
+        "(typeof({r}) = 'text' AND length({r}) BETWEEN {m} AND 64 \
+         AND {r} NOT GLOB '*[^0-9A-Fa-f]*')"
+    )
 }
 
 fn compute_hash(
@@ -3793,17 +3881,19 @@ mod tests {
     fn appeal_queue_and_liveness_use_projections_not_a_tail_materialization_488() {
         let dir = TempDir::new().unwrap();
         let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
-        store.append("appeal", json!({"deny_hash": "a", "plugin_id": "kimi-code"}), "lct:test").unwrap();
+        // Deny references are realistic hashes: the queue lists only references the ruling
+        // path can reach (`deny_ref_rulable`), and a one-letter fixture is not one.
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        store.append("appeal", json!({"deny_hash": a, "plugin_id": "kimi-code"}), "lct:test").unwrap();
         store.append("outcome", json!({"plugin_id": "kimi-code", "success": true}), "lct:test").unwrap();
-        store.append("adjudication", json!({"about_deny_hash": "a", "adjudicator": "codex"}), "lct:test").unwrap();
-        store.append("appeal", json!({"deny_hash": "b", "plugin_id": "gemini"}), "lct:test").unwrap();
+        store.append("adjudication", json!({"about_deny_hash": a, "adjudicator": "codex"}), "lct:test").unwrap();
+        store.append("appeal", json!({"deny_hash": b, "plugin_id": "gemini"}), "lct:test").unwrap();
         store.append("adjudication", json!({"about_deny_hash": "other", "adjudicated_by": {"plugin_id": "kimi-code"}}), "lct:test").unwrap();
 
-        let open = store.open_appeal_rows(20_000).unwrap();
+        let open = store.open_appeal_rows().unwrap();
         assert_eq!(open.len(), 1);
-        assert_eq!(open[0].event_data["deny_hash"], "b");
+        assert_eq!(open[0].event_data["deny_hash"], b.as_str());
         assert_eq!(open[0].event_data["plugin_id"], "gemini");
-        assert!(store.open_appeal_rows(0).unwrap().is_empty());
 
         let latest = store.latest_actor_act("kimi-code").unwrap().unwrap();
         let expected = store.read_recent(1).unwrap()[0].timestamp.to_rfc3339();
@@ -3821,21 +3911,141 @@ mod tests {
 
         let later = store.append(
             "appeal",
-            json!({"deny_hash": "a", "plugin_id": "kimi-code", "reason": "new evidence"}),
+            json!({"deny_hash": a, "plugin_id": "kimi-code", "reason": "new evidence"}),
             "lct:test",
         ).unwrap();
-        let open = store.open_appeal_rows(20_000).unwrap();
+        let open = store.open_appeal_rows().unwrap();
         assert_eq!(open.len(), 2, "the older ruling must not hide the later appeal");
         assert!(open.iter().any(|e| e.hash == later.hash));
 
         store.append(
             "adjudication",
-            json!({"about_deny_hash": "a", "adjudicator": "codex"}),
+            json!({"about_deny_hash": a, "adjudicator": "codex"}),
             "lct:test",
         ).unwrap();
-        let open = store.open_appeal_rows(20_000).unwrap();
+        let open = store.open_appeal_rows().unwrap();
         assert_eq!(open.len(), 1, "a later ruling closes the later appeal too");
-        assert_eq!(open[0].event_data["deny_hash"], "b");
+        assert_eq!(open[0].event_data["deny_hash"], b.as_str());
+    }
+
+    /// NOVA's #610 review (2026-11-25), findings (a) and (b), at the SQLite layer: the open
+    /// queue and the pointer lookup must answer the SAME question about a legacy prefix.
+    /// Before the fix a six-character prefix was queued but the lookup (fed the first eight
+    /// characters) returned nothing, and an UPPERCASE prefix ruled under the full hash was
+    /// closed by `LIKE` while the lookup could not return the appeal row at all.
+    #[test]
+    fn nova_610_a_legacy_prefix_is_queued_exactly_when_the_lookup_finds_it() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        let short_deny = format!("abcdef{}", "1".repeat(58));
+        let eight_deny = format!("12345678{}", "2".repeat(56));
+        let upper_deny = format!("fedcba98{}", "3".repeat(56));
+        let appeal = |r: &str| {
+            store.append("appeal", json!({"deny_hash": r, "plugin_id": "kimi-code"}), "lct:test").unwrap()
+        };
+        // (a) six characters: below MIN_LEGACY_DENY_PREFIX, so the limitation is explicit and
+        // both readers agree it is not a live appeal (the remedy is a canonical re-file).
+        let short = appeal(&short_deny[..6]);
+        // Control: an eight-character legacy prefix IS live, in both readers.
+        let eight = appeal(&eight_deny[..8]);
+        // (b) an uppercase ten-character prefix, then ruled under the full hash.
+        let upper_ref = upper_deny[..10].to_ascii_uppercase();
+        let upper = appeal(&upper_ref);
+
+        let queued = |h: &str| store.open_appeal_rows().unwrap().iter().any(|e| e.hash == h);
+        let found = |deny: &str, h: &str| {
+            store.appeal_rows_for_pointer(deny).unwrap().iter().any(|e| e.hash == h)
+        };
+        for (deny, entry, live) in [
+            (&short_deny, &short, false),
+            (&eight_deny, &eight, true),
+            (&upper_deny, &upper, true),
+        ] {
+            assert_eq!(queued(&entry.hash), live, "queue on {}", entry.event_data);
+            assert_eq!(found(deny, &entry.hash), live, "lookup on {}", entry.event_data);
+        }
+
+        store.append("adjudication", json!({"about_deny_hash": upper_deny, "upheld": true}), "lct:test").unwrap();
+        assert!(!queued(&upper.hash), "(b) the full-hash ruling closes the uppercase prefix");
+        let rows = store.appeal_rows_for_pointer(&upper_deny).unwrap();
+        assert!(rows.iter().any(|e| e.hash == upper.hash), "(b) and the lookup still finds the appeal");
+        assert!(rows.iter().any(|e| e.event_type == "adjudication"), "(b) and its ruling");
+        // The ruling path's view is the same rule: the appeal it finds is the one it ruled.
+        assert!(deny_refs_agree(&upper_ref, &upper_deny));
+        // (c), SQL half: a lower-case prefix ruled under the full hash is closed in SQL.
+        store.append("adjudication", json!({"about_deny_hash": eight_deny, "upheld": false}), "lct:test").unwrap();
+        assert!(!queued(&eight.hash), "(c) a ruled lower-case legacy prefix is closed");
+    }
+
+    /// The one deny-reference rule, evaluated by Rust and by SQLite over the same pairs. Every
+    /// reader of appeal identity goes through one of these two forms; if they ever drift, the
+    /// queue and the ruling path disagree again (NOVA, #610 review).
+    #[test]
+    fn deny_ref_rule_is_one_rule_in_rust_and_sql() {
+        let full = format!("abcdef0123{}", "4".repeat(54));
+        let refs: Vec<String> = vec![
+            full.clone(),
+            full.to_ascii_uppercase(),
+            full[..6].into(),
+            full[..7].into(),
+            full[..8].into(),
+            full[..8].to_ascii_uppercase(),
+            full[..12].into(),
+            full[..63].into(),
+            format!("{}5", &full[..63]),
+            format!("{}0", full),
+            "abcdeg01".into(),
+            "hash-2".into(),
+            "".into(),
+            "ABCDEF01".into(),
+            "abcdef01".into(),
+        ];
+        let conn = Connection::open_in_memory().unwrap();
+        let agree_sql = format!("SELECT {}", deny_refs_agree_sql("?1", "?2"));
+        let rulable_sql = format!("SELECT {}", deny_ref_rulable_sql("?1"));
+        for a in &refs {
+            let sql_rulable: bool = conn.query_row(&rulable_sql, params![a], |r| r.get(0)).unwrap();
+            assert_eq!(sql_rulable, deny_ref_rulable(a), "rulable({a:?})");
+            for b in &refs {
+                let sql: bool = conn.query_row(&agree_sql, params![a, b], |r| r.get(0)).unwrap();
+                assert_eq!(sql, deny_refs_agree(a, b), "agree({a:?}, {b:?})");
+                assert_eq!(deny_refs_agree(a, b), deny_refs_agree(b, a), "symmetric");
+            }
+        }
+        // The explicit limits, spelled out.
+        assert!(deny_refs_agree(&full[..8], &full) && !deny_refs_agree(&full[..7], &full));
+        assert!(deny_refs_agree(&full[..12].to_ascii_uppercase(), &full));
+        assert!(deny_refs_agree("hash-2", "hash-2"), "exact equality is the canonical path");
+        assert!(!deny_refs_agree("", ""));
+        assert!(!deny_ref_rulable(&full[..7]) && deny_ref_rulable(&full[..8]));
+    }
+
+    /// NOVA's #610 ordering ask, pinned at the storage layer: the windowless appeal reads
+    /// return rows oldest first, interleaved by position across both event types. The ruling
+    /// path no longer depends on it (it picks by `chain_position`), but the member-facing
+    /// readers (`tool_my_appeals`) still do.
+    #[test]
+    fn appeal_row_reads_are_chain_ordered() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        let deny = "ab12cd34ef56ab12";
+        for i in 0..3 {
+            store.append("appeal", json!({"deny_hash": deny, "plugin_id": "kimi-code", "n": i}), "lct:test").unwrap();
+            store.append("outcome", json!({"plugin_id": "kimi-code"}), "lct:test").unwrap();
+            store.append("adjudication", json!({"about_deny_hash": deny, "subject_plugin_id": "kimi-code", "n": i}), "lct:test").unwrap();
+        }
+        for rows in [
+            store.appeal_rows_for_pointer(deny).unwrap(),
+            store.appeal_rows_for_member("kimi-code", 100).unwrap(),
+        ] {
+            assert_eq!(rows.len(), 6);
+            let positions: Vec<u64> = rows.iter().map(|e| e.chain_position).collect();
+            let mut sorted = positions.clone();
+            sorted.sort_unstable();
+            assert_eq!(positions, sorted, "appeal reads must be ascending by chain position");
+            assert_eq!(rows[0].event_type, "appeal");
+            assert_eq!(rows[1].event_type, "adjudication");
+        }
     }
 
     /// A dashboard projection is allowed to be slow; it is not allowed to

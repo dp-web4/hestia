@@ -1,41 +1,21 @@
-//! `appeal_floor` — enumerate appeals that fell below the arbitration window.
+//! `appeal_floor` — report unruled-appeal backlog by chain depth.
 //!
-//! ## Why this is a separate surface, not a flag on the queue
-//!
-//! `hestia_open_appeals` (PR #67) and `hestia_arbitrate_appeal` share one
-//! constant, `APPEAL_CHAIN_WINDOW`, so *listed* and *rulable* are the same
-//! predicate by construction. That invariant is the queue's whole value and it
-//! must not be weakened. This bin answers the OPPOSITE question — what is
-//! **un**rulable — and so wears a different name and lives outside the queue
-//! (kimi-code's refinement, `kimi-to-cbp-the-dead-pointer-reproduced-and-one-
-//! overstatement-in-s4-2026-07-27.md` §3: the queue measures *approaching*
-//! expiry; nothing enumerated what already fell off the edge).
-//!
-//! ## The failure it measures
-//!
-//! An appeal is filed. No eligible arbiter finds it (the discovery gap #67
-//! repairs). The chain grows by `APPEAL_CHAIN_WINDOW` entries. Now:
-//!
-//!   * `hestia_arbitrate_appeal` cannot rule on it — it searches only
-//!     `recent_chain(APPEAL_CHAIN_WINDOW)` for the `appeal` entry
-//!     (handler.rs `tool_arbitrate_appeal`, the `arbitration_no_appeal` arm).
-//!   * `hestia_appeal` cannot re-file it — that path first requires the
-//!     *deny* entry in the same window, and the deny is strictly OLDER than
-//!     the appeal citing it. Both doors close, and the deny's door closes
-//!     first.
-//!
-//! So the state is terminal, not merely stale: the appellant carries the
-//! deny's score forever, no `adjudication` is possible, and nothing in the
-//! chain marks the transition. Absence is not a state — this bin is the
-//! instrument that makes it one.
+//! Filing, discovery, and arbitration are windowless (#610). `DEFAULT_WINDOW` is therefore a
+//! reporting bucket, never a ruling boundary: an `aged_unruled` appeal remains open, appears in
+//! `hestia_open_appeals`, and can be ruled through `hestia_arbitrate_appeal`. This report exists
+//! to prioritize old work, not to pronounce it terminal.
 //!
 //! ## Method
 //!
-//! Full-chain scan (NOT windowed), ascending. Join `appeal.deny_hash` against
-//! `adjudication.about_deny_hash` — the exact pair the ruling path matches on.
-//! Survivors are unruled; those with `chain_position <= head - window` are
-//! expired. Reported separately from the in-window survivors, because the
-//! second set is the queue's job and the first set is nobody's.
+//! Full-chain scan, ascending. Join `appeal.deny_hash` against
+//! `adjudication.about_deny_hash` with `deny_refs_agree`, the one deny-reference rule the
+//! queue, the ruling path and `derivation.rs` share (#610 review). An exact join called a
+//! legacy prefix ruled under the full hash unruled while the queue had closed it. A legacy
+//! reference the ruling path cannot reach (`deny_ref_rulable`: under 8 hex characters) is
+//! reported apart, as needing a canonical re-file, not as backlog. Survivors are
+//! unruled and are split at `head - reporting_window` to distinguish older backlog from recent
+//! work. Legacy nested appeals remain a separate shape diagnostic because their missing flat
+//! `deny_hash` genuinely prevents arbitration.
 //!
 //! Sealed-at-rest respected the same way `calib_export` does it: the encrypted
 //! DB is byte-copied to avoid SQLCipher single-writer contention with the live
@@ -55,13 +35,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use hestia::storage::chain::{deny_ref_rulable, deny_refs_agree};
 use hestia::storage::{SqliteChainStore, storage_key};
 use hestia::vault::storage::default_hestia_home;
 
-/// Mirrors `handler.rs`'s `APPEAL_CHAIN_WINDOW`. Overridable with `--window` so
-/// the margin can be probed, but the DEFAULT MUST TRACK the handler constant —
-/// a report computed against a different window than the one that rules is a
-/// report about nothing. Checked by `appeal_floor_window_matches_handler`.
+/// Backlog-reporting bucket only. This has no filing, discovery, or arbitration semantics.
 const DEFAULT_WINDOW: u64 = 20_000;
 
 struct Appeal {
@@ -74,24 +52,13 @@ struct Appeal {
 }
 
 /// An appeal that is unrulable by SHAPE rather than by age: filed through
-/// `hestia_request_witness("appeal", ...)` before `hestia_appeal` existed, so
-/// its `deny_hash` sits under `data` and every reader that matters — the ruling
-/// path, the queue, `derivation.rs` — matches it FLAT and misses.
+/// `hestia_request_witness("appeal", ...)` before `hestia_appeal` existed, so its `deny_hash`
+/// sits under `data` and the ruling path, queue, and `derivation.rs` all match it FLAT and miss.
 ///
-/// `handler.rs`'s own comment records these three (62959/62963/63408, verified
-/// by hand 2026-07-27) and stops at "inert". It is worse than inert, and the
-/// difference is a deadline: the nested appeal does not block a re-file (the
-/// duplicate check is also a flat match), so the dispute is still recoverable
-/// through `hestia_appeal` — but only while the DENY it cites is inside the
-/// window. The deny is strictly older than the appeal, so the deny's door
-/// closes first, and after it closes the dispute is unrecordable forever while
-/// the conduct scale goes on reading the member as ordinarily compliant.
-///
-/// That deadline was real and it was MET: `claude-code` re-filed 62963 and 63408
-/// flat through `hestia_appeal`, and `kimi-code` ruled both UPHELD on
-/// 2026-07-28T17:42Z (chain 70339/70340, adjudications `eba318fa`/`d36e20d7`,
-/// both `judge-by-mention` false positives predating the executable-position fix
-/// `2f9a4a5`). Which exposed the reporting defect below.
+/// The nested appeal does not block a flat re-file. With whole-chain filing (#610), that remedy
+/// remains available whenever the cited deny exists on the chain; chain depth is reporting
+/// telemetry, not a deadline. Two historical disputes were re-filed flat and ruled UPHELD on
+/// 2026-07-28 (chain 70339/70340), which is the regression fixture below.
 struct Nested {
     position: u64,
     plugin_id: String,
@@ -100,29 +67,9 @@ struct Nested {
     recovered_deny: Option<String>,
 }
 
-/// What is actually true of a nested appeal's underlying DISPUTE — which is not
-/// the same question as what is true of the nested ENTRY.
-///
-/// ## Why a four-state enum and not the boolean it replaces
-///
-/// The first cut of this bin reported `refilable_now: bool` and never consulted
-/// the adjudication set for nested rows at all — it joined `ruled` against flat
-/// appeals only. So on 2026-07-28 at 17:42Z two of these disputes were upheld,
-/// and at 18:0xZ this report still printed both as open deadlines with ~12,500
-/// entries of headroom, instructing a re-file of a grievance that had already
-/// won. kimi-code named the class before the fixture existed ("the flat join
-/// lies by omission — it needs nested rulings"); the two rulings are the fixture.
-///
-/// The boolean conflated *action is possible* with *action is needed*. A ruled
-/// dispute is still technically re-filable — the shape defect means nothing
-/// blocks it — so `refilable_now` stayed honest by its own definition while the
-/// report built on it was false. Splitting the states is the repair: `Ruled` and
-/// `Refilable` are both "re-file would succeed", and only one of them is anyone's
-/// job.
-///
-/// Note the asymmetry this preserves: a nested entry is inert FOREVER. Ruling
-/// the dispute does not make the ruling path see the entry. `Ruled` means the
-/// grievance was heard through a flat re-file, not that the shape defect healed.
+/// What is true of a nested appeal's underlying DISPUTE, as distinct from the nested ENTRY.
+/// A known, unruled deny is `Refilable` at any chain depth. `Ruled` closes the dispute but does
+/// not heal the nested entry's shape; `Unrecoverable` means no cited deny can be found.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum NestedDisposition {
     /// The cited deny carries an `adjudication`. The dispute was heard. Nobody's
@@ -131,11 +78,6 @@ enum NestedDisposition {
     /// No adjudication, and the deny is still inside the window. THIS is the
     /// deadline: the live, actionable state this bin was built to surface.
     Refilable,
-    /// No adjudication and the deny has aged below the floor. Terminal: the
-    /// dispute can no longer be filed OR ruled, and the appellant carries the
-    /// deny's score permanently. The failure `expired_unruled` measures for flat
-    /// appeals, in its nested form.
-    Expired,
     /// No `deny_hash` survives in the payload, or the deny is not on this chain:
     /// there is nothing to re-file AGAINST. Terminal for a different reason.
     Unrecoverable,
@@ -146,42 +88,41 @@ impl NestedDisposition {
         match self {
             Self::Ruled => "ruled",
             Self::Refilable => "refilable",
-            Self::Expired => "expired",
             Self::Unrecoverable => "unrecoverable",
         }
     }
 
-    /// Does this dispute still want something from someone? `Ruled` is closed;
-    /// `Unrecoverable` and `Expired` are closed by loss, which is worth counting
-    /// separately but is nobody's action item either.
-    fn is_open_deadline(self) -> bool {
+    fn needs_refiling(self) -> bool {
         matches!(self, Self::Refilable)
     }
 }
 
-/// The join the first cut omitted. Pure, so the omission is testable without a
-/// chain.
-///
-/// Order matters: `ruled` is consulted BEFORE any position arithmetic. An
-/// adjudication is evidence the dispute was heard, and that stays true whether
-/// or not the deny it is about can still be located in the window — a ruling
-/// does not lapse when the entry it cites ages out.
+/// Position of the latest adjudication whose `about_deny_hash` names the same deny as
+/// `deny_ref` under the one deny-reference rule. Linear in the rulings, which is fine for a
+/// read-only report; an exact `HashMap` key is what made a ruled legacy prefix read unruled.
+fn ruled_position(deny_ref: &str, ruled: &[(String, u64)]) -> Option<u64> {
+    ruled
+        .iter()
+        .filter(|(about, _)| deny_refs_agree(about, deny_ref))
+        .map(|&(_, pos)| pos)
+        .max()
+}
+
+/// Pure so the distinction between a malformed nested entry and its underlying dispute is
+/// testable without a chain.
 fn classify_nested(
     recovered_deny: Option<&str>,
-    ruled: &HashMap<String, u64>,
+    ruled: &[(String, u64)],
     deny_pos: Option<u64>,
-    floor: u64,
 ) -> NestedDisposition {
     let Some(hash) = recovered_deny else {
         return NestedDisposition::Unrecoverable;
     };
-    if ruled.contains_key(hash) {
+    if ruled_position(hash, ruled).is_some() {
         return NestedDisposition::Ruled;
     }
     match deny_pos {
-        // `>` mirrors the flat path's `<= floor` expiry test, inverted.
-        Some(p) if p > floor => NestedDisposition::Refilable,
-        Some(_) => NestedDisposition::Expired,
+        Some(_) => NestedDisposition::Refilable,
         None => NestedDisposition::Unrecoverable,
     }
 }
@@ -203,9 +144,9 @@ fn main() -> Result<()> {
             "--help" | "-h" => {
                 eprintln!(
                     "appeal_floor [--window N] [--json]\n\n\
-                     Enumerates appeals with no adjudication, split by whether they are\n\
-                     still inside the arbitration window (rulable — the queue's job) or\n\
-                     below it (UNRULABLE and unrefilable — nobody's job until now).\n\
+                     Enumerates appeals with no adjudication, split into older and recent\n\
+                     backlog by a reporting-only chain-depth window. Every listed flat appeal\n\
+                     remains open and rulable; the window is not an arbitration boundary.\n\
                      Read-only; appends nothing to the chain."
                 );
                 return Ok(());
@@ -236,7 +177,7 @@ fn main() -> Result<()> {
     // any size costs a bounded amount of memory in the join.
     let mut appeals: Vec<Appeal> = Vec::new();
     let mut nested: Vec<Nested> = Vec::new();
-    let mut ruled: HashMap<String, u64> = HashMap::new();
+    let mut ruled: Vec<(String, u64)> = Vec::new();
     // Position of every chain entry, so a nested appeal's recovered deny_hash
     // can be located and its re-file headroom computed.
     let mut positions: HashMap<String, u64> = HashMap::new();
@@ -308,7 +249,7 @@ fn main() -> Result<()> {
                         .get("about_deny_hash")
                         .and_then(|v| v.as_str())
                     {
-                        ruled.insert(about.to_string(), e.chain_position);
+                        ruled.push((about.to_string(), e.chain_position));
                     }
                 }
                 _ => {}
@@ -323,19 +264,16 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_dir(&tmp_dir);
 
     let floor = head.saturating_sub(window);
-    let unruled: Vec<&Appeal> = appeals
+    // A legacy reference the ruling path cannot reach is not backlog: it is excluded from the
+    // open queue by the same rule, and its remedy is a canonical re-file.
+    let (unruled, not_rulable): (Vec<&Appeal>, Vec<&Appeal>) = appeals
         .iter()
-        .filter(|a| !ruled.contains_key(&a.deny_hash))
-        .collect();
-    // `<=` not `<`: the ruling path matches over `recent_chain(window)`, whose
-    // oldest retained position is head - window + 1. An appeal AT the floor is
-    // already out.
-    let (expired, live): (Vec<&&Appeal>, Vec<&&Appeal>) =
+        .filter(|a| ruled_position(&a.deny_hash, &ruled).is_none())
+        .partition(|a| deny_ref_rulable(&a.deny_hash));
+    // The partition is only a backlog-reporting bucket. Both sets remain open and rulable.
+    let (aged, recent): (Vec<&&Appeal>, Vec<&&Appeal>) =
         unruled.iter().partition(|a| a.position <= floor);
 
-    // Nested appeals. The disposition — NOT the headroom — is the answer: a
-    // ruled dispute has headroom too, and reporting only the headroom is what
-    // made the first cut print discharged deadlines as live ones.
     let nested_dispositions: Vec<NestedDisposition> = nested
         .iter()
         .map(|nn| {
@@ -343,7 +281,7 @@ fn main() -> Result<()> {
                 .recovered_deny
                 .as_ref()
                 .and_then(|h| positions.get(h).copied());
-            classify_nested(nn.recovered_deny.as_deref(), &ruled, deny_pos, floor)
+            classify_nested(nn.recovered_deny.as_deref(), &ruled, deny_pos)
         })
         .collect();
     let nested_rows: Vec<_> = nested
@@ -360,27 +298,25 @@ fn main() -> Result<()> {
                 "filed_at": nn.timestamp,
                 "recovered_deny_hash": nn.recovered_deny,
                 "deny_position": deny_pos,
-                // None = the deny_hash was absent or the deny is not on this
-                // chain: nothing to re-file against, already unrecoverable.
-                "refile_headroom": deny_pos.map(|p| p.saturating_sub(floor)),
+                "deny_entries_from_head": deny_pos.map(|p| head.saturating_sub(p)),
                 "disposition": disp.as_str(),
                 // The adjudication's own position, so "ruled" is a claim the
                 // reader can follow to an entry rather than take on trust.
                 "ruled_at_position": nn
                     .recovered_deny
                     .as_ref()
-                    .and_then(|h| ruled.get(h).copied()),
-                "open_deadline": disp.is_open_deadline(),
+                    .and_then(|h| ruled_position(h, &ruled)),
+                "needs_refiling": disp.needs_refiling(),
             })
         })
         .collect();
     let nested_open = nested_dispositions
         .iter()
-        .filter(|d| d.is_open_deadline())
+        .filter(|d| d.needs_refiling())
         .count();
 
     if json_out {
-        let rows: Vec<_> = expired
+        let rows: Vec<_> = aged
             .iter()
             .map(|a| {
                 serde_json::json!({
@@ -399,46 +335,51 @@ fn main() -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "chain_entries": total,
                 "head": head,
-                "window": window,
-                "floor": floor,
+                "reporting_window": window,
+                "reporting_floor": floor,
+                "ruling_window": null,
                 "appeals_total": appeals.len(),
                 "adjudications_total": ruled.len(),
                 "unruled_total": unruled.len(),
-                "unruled_in_window": live.len(),
-                "expired_unruled": rows,
+                "recent_unruled": recent.len(),
+                "aged_unruled": rows,
+                "aged_unruled_remain_rulable": true,
+                "legacy_ref_not_rulable": not_rulable
+                    .iter()
+                    .map(|a| serde_json::json!({
+                        "deny_hash": a.deny_hash,
+                        "appeal_entry": a.entry_hash,
+                        "chain_position": a.position,
+                        "appellant": a.plugin_id,
+                        "remedy": "re-file with hestia_appeal and the deny's full hash",
+                    }))
+                    .collect::<Vec<_>>(),
                 "nested_inert": nested_rows,
                 "nested_total": nested_rows.len(),
-                "nested_open_deadlines": nested_open,
+                "nested_needing_refiling": nested_open,
             }))?
         );
         return Ok(());
     }
 
-    println!("appeal_floor — unwindowed scan of {total} chain entries");
+    println!("appeal_floor — whole-chain backlog scan of {total} entries");
     println!("  head position:        {head}");
-    println!("  arbitration window:   {window}  (floor at {floor})");
+    println!("  reporting window:     {window}  (older backlog below {floor}; NOT a ruling boundary)");
     println!("  appeal entries:       {}", appeals.len());
     println!("  adjudications:        {}", ruled.len());
-    println!("  unruled appeals:      {}", unruled.len());
+    println!("  unruled appeals:      {}  (all remain rulable)", unruled.len());
+    println!("    recent backlog:     {}", recent.len());
+    println!("    older backlog:      {}", aged.len());
     println!(
-        "    still rulable:      {}  (inside the window — hestia_open_appeals' set)",
-        live.len()
+        "  legacy refs under {} hex chars: {}  (not rulable; re-file with the full hash)",
+        hestia::storage::chain::MIN_LEGACY_DENY_PREFIX,
+        not_rulable.len()
     );
-    println!(
-        "    EXPIRED:            {}  (below the floor — unrulable AND unrefilable)",
-        expired.len()
-    );
-    if expired.is_empty() {
-        println!(
-            "\nNo appeal has expired unruled on this chain. The predicted failure is\n\
-             UNTESTED-CLEAN, not refuted: the window has simply never been outrun by an\n\
-             unruled appeal yet. Re-run this after any period of heavy chain traffic."
-        );
-    } else {
-        println!("\nEXPIRED UNRULED APPEALS — each one a member stuck at its deny's score:");
-        for a in &expired {
+    if !aged.is_empty() {
+        println!("\nOLDER UNRULED APPEALS — still discoverable and rulable:");
+        for a in &aged {
             println!(
-                "  pos {:>7} ({:>6} below floor)  {}  appellant={} role={}  filed={}",
+                "  pos {:>7} ({:>6} beyond reporting floor)  {}  appellant={} role={}  filed={}",
                 a.position,
                 floor.saturating_sub(a.position),
                 &a.deny_hash[..a.deny_hash.len().min(16)],
@@ -447,13 +388,6 @@ fn main() -> Result<()> {
                 a.timestamp,
             );
         }
-    }
-    if !live.is_empty() {
-        let nearest = live.iter().map(|a| a.position).min().unwrap_or(head);
-        println!(
-            "\nNearest expiry: appeal at {nearest}, {} entries of headroom.",
-            nearest.saturating_sub(floor)
-        );
     }
 
     if !nested.is_empty() {
@@ -468,7 +402,7 @@ fn main() -> Result<()> {
             .zip(&nested_dispositions)
         {
             let deny_pos = row.get("deny_position").and_then(|v| v.as_u64());
-            let head_room = row.get("refile_headroom").and_then(|v| v.as_u64());
+            let deny_depth = row.get("deny_entries_from_head").and_then(|v| v.as_u64());
             let ruled_at = row.get("ruled_at_position").and_then(|v| v.as_u64());
             print!(
                 "  pos {:>7}  appellant={}  filed={}\n\x20   ",
@@ -483,15 +417,10 @@ fn main() -> Result<()> {
                     nn.position,
                 ),
                 NestedDisposition::Refilable => println!(
-                    "OPEN DEADLINE — deny at {} is still in window, re-filable via \
-                     hestia_appeal, {} entries of headroom",
+                    "NEEDS RE-FILING — deny at {} is on the chain and remains actionable via \
+                     hestia_appeal at any depth (currently {} entries from head)",
                     deny_pos.map_or("?".to_string(), |p| p.to_string()),
-                    head_room.unwrap_or(0),
-                ),
-                NestedDisposition::Expired => println!(
-                    "deny at {} is BELOW THE FLOOR and unruled — no longer re-filable; \
-                     the dispute is now unrecordable",
-                    deny_pos.map_or("?".to_string(), |p| p.to_string()),
+                    deny_depth.unwrap_or(0),
                 ),
                 NestedDisposition::Unrecoverable => println!(
                     "no recoverable deny_hash in the payload — nothing to re-file against"
@@ -499,10 +428,9 @@ fn main() -> Result<()> {
             }
         }
         println!(
-            "\n  OPEN DEADLINES: {nested_open} of {}.\n\
-             \x20 A nested appeal does NOT block a re-file: the duplicate check is a flat\n\
-             match too, so it does not see these either. That is what leaves a window open\n\
-             — and the window closes when the DENY ages out, not the appeal.\n\
+            "\n  NEEDING RE-FILING: {nested_open} of {}.\n\
+             \x20 A nested appeal does NOT block a flat re-file; whole-chain filing keeps that\n\
+             remedy available whenever the cited deny exists, regardless of chain depth.\n\
              \x20 A `ruled` row is closed because the dispute was heard through a re-file,\n\
              NOT because the nested entry became legible to the ruling path. It did not.",
             nested.len()
@@ -537,91 +465,75 @@ mod tests {
     const DENY_A: &str = "0329c5c589f427db948312a157940eda42fec2357371ba46685e8805138ec0da";
     const DENY_B: &str = "eb84d2541ae51204be926392f18897b7fc72cb9f54db148ec5c9ddc1c1557136";
 
-    fn live_fixture() -> (HashMap<String, u64>, HashMap<String, u64>) {
+    fn live_fixture() -> (Vec<(String, u64)>, HashMap<String, u64>) {
         // adjudication.about_deny_hash -> adjudication position
-        let ruled = HashMap::from([
+        let ruled = vec![
             (DENY_A.to_string(), 70339), // eba318fa, upheld
             (DENY_B.to_string(), 70340), // d36e20d7, upheld
-        ]);
+        ];
         // deny_hash -> deny position
         let positions = HashMap::from([(DENY_A.to_string(), 62958), (DENY_B.to_string(), 63406)]);
         (ruled, positions)
     }
 
-    /// THE REGRESSION. Before the join, both of these classified as a live
-    /// deadline with ~12,500 entries of headroom — 35 minutes after they were
-    /// upheld. The report told the appellant to re-file a grievance it had
-    /// already won.
     #[test]
-    fn a_ruled_dispute_is_not_an_open_deadline() {
+    fn a_ruled_dispute_never_needs_refiling() {
         let (ruled, positions) = live_fixture();
-        let floor = 50_377; // head 70,377 - window 20,000, the 2026-07-28 run
-
         for (deny, appeal_pos) in [(DENY_A, 62963u64), (DENY_B, 63408)] {
-            let disp = classify_nested(Some(deny), &ruled, positions.get(deny).copied(), floor);
+            let disp = classify_nested(Some(deny), &ruled, positions.get(deny).copied());
             assert_eq!(
                 disp,
                 NestedDisposition::Ruled,
-                "nested appeal at {appeal_pos} cites deny {} which HAS an adjudication; \
-                 classifying it any other way re-opens a settled dispute",
-                &deny[..16]
+                "nested appeal at {appeal_pos} cites an adjudicated deny"
             );
-            assert!(
-                !disp.is_open_deadline(),
-                "a ruled dispute must never be counted as an open deadline"
-            );
+            assert!(!disp.needs_refiling());
         }
     }
 
-    /// The state the bin exists to surface must survive the fix. If the join
-    /// were written to swallow everything, this is what would go quiet.
     #[test]
-    fn an_unruled_deny_in_window_is_still_the_deadline() {
+    fn an_unruled_deny_on_the_chain_needs_refiling() {
         let (_, positions) = live_fixture();
-        let empty = HashMap::new();
-        let disp = classify_nested(Some(DENY_A), &empty, positions.get(DENY_A).copied(), 50_377);
+        let empty = Vec::new();
+        let disp = classify_nested(Some(DENY_A), &empty, positions.get(DENY_A).copied());
         assert_eq!(disp, NestedDisposition::Refilable);
-        assert!(disp.is_open_deadline(), "this is the actionable state");
+        assert!(disp.needs_refiling());
     }
 
-    /// Below the floor and unruled: the nested form of `expired_unruled`. It is
-    /// terminal, and it must NOT be reported as an open deadline — nobody can
-    /// act on it — but it is also not `ruled`. Three-way, not two.
     #[test]
-    fn an_unruled_deny_below_the_floor_is_expired_not_refilable() {
-        let empty = HashMap::new();
-        let disp = classify_nested(Some(DENY_A), &empty, Some(40_000), 50_377);
-        assert_eq!(disp, NestedDisposition::Expired);
-        assert!(!disp.is_open_deadline());
+    fn chain_depth_does_not_make_an_unruled_deny_unrecoverable() {
+        let empty = Vec::new();
+        let disp = classify_nested(Some(DENY_A), &empty, Some(1));
+        assert_eq!(disp, NestedDisposition::Refilable, "#610: depth is not a deadline");
+        assert!(disp.needs_refiling());
     }
 
-    /// Entry 62959: `deny_hash` absent from the payload entirely. Nothing to
-    /// re-file against, ruled or not.
     #[test]
     fn no_recoverable_deny_hash_is_unrecoverable() {
         let (ruled, _) = live_fixture();
+        assert_eq!(classify_nested(None, &ruled, None), NestedDisposition::Unrecoverable);
         assert_eq!(
-            classify_nested(None, &ruled, None, 50_377),
-            NestedDisposition::Unrecoverable
-        );
-        // ...and a deny that is not on this chain at all is the same verdict.
-        assert_eq!(
-            classify_nested(Some("deadbeef"), &ruled, None, 50_377),
+            classify_nested(Some("deadbeef"), &ruled, None),
             NestedDisposition::Unrecoverable
         );
     }
 
-    /// A ruling does not lapse when the entry it is about ages out of the
-    /// window. `ruled` is consulted before any position arithmetic, and this
-    /// pins that ordering: deny below the floor, but adjudicated.
     #[test]
-    fn a_ruling_outlives_the_window_of_the_deny_it_is_about() {
+    fn a_ruling_outlives_the_reporting_window() {
         let (ruled, _) = live_fixture();
-        assert_eq!(
-            classify_nested(Some(DENY_A), &ruled, Some(1), 50_377),
-            NestedDisposition::Ruled,
-            "an adjudication is evidence the dispute was heard; the deny's age \
-             cannot un-hear it"
-        );
+        assert_eq!(classify_nested(Some(DENY_A), &ruled, Some(1)), NestedDisposition::Ruled);
+    }
+
+    /// NOVA's #610 review, finding (c): a lower-case legacy prefix ruled under the full hash
+    /// was closed by the queue SQL but reported unruled here by an exact join. The join is now
+    /// the one deny-reference rule, in both directions and either case.
+    #[test]
+    fn nova_610_c_a_ruled_legacy_prefix_is_ruled_here_too() {
+        let (ruled, _) = live_fixture();
+        assert_eq!(ruled_position(&DENY_A[..12], &ruled), Some(70339), "legacy prefix, full ruling");
+        assert_eq!(ruled_position(&DENY_A[..12].to_ascii_uppercase(), &ruled), Some(70339));
+        let prefix_ruling = vec![(DENY_B[..10].to_string(), 9)];
+        assert_eq!(ruled_position(DENY_B, &prefix_ruling), Some(9), "full appeal, legacy ruling");
+        assert_eq!(ruled_position(&DENY_A[..6], &ruled), None, "under 8 chars is not honoured");
+        assert!(!deny_ref_rulable(&DENY_A[..6]) && deny_ref_rulable(&DENY_A[..8]));
     }
 }
