@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build the held patch for hestia #608: refusal detail names the actual rule.
+"""Build the held patch for hestia #608: compose no-auto-open with the actual refusal rule.
+
+This supersedes the separate #1497 and #608 candidates. The no-auto source diff applies first;
+this builder then adds refusal_rule and strengthens the four-seat acceptance test.
 
 argv: <hestia worktree at the base> <out dir>
 Writes: mechanism_rev.py, single_gate_rev.py, seat_gate_boundary_test_rev.py and <sha256>.patch.
@@ -12,6 +15,8 @@ import subprocess
 import sys
 
 WT, OUT = (pathlib.Path(a).resolve() for a in sys.argv[1:3])
+HERE = pathlib.Path(__file__).resolve().parent
+NOAUTO = HERE.parent / "build-noauto" / "source-noauto.diff"
 sys.dont_write_bytecode = True
 MECH = "plugins/_shared/hestia_gate_mechanism.py"
 GATE = "plugins/_shared/hestia_single_gate.py"
@@ -32,12 +37,11 @@ def patch_mechanism(src):
     src = once(src, """                     resolved_targets_complete=True):
 """, """                     resolved_targets_complete=True, refusal_rule=None):
 """)
-    return once(src, """        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
-                   "because it did not choose to escalate. Approving authorises this one write."),
-""", """        "detail": ("Auto-opened by the gate on a refused act"
+    return once(src, """        "detail": ("The gate's record of a refused write. Nothing is asked unless the member "
+                   "escalates it as a deliberate act."),
+""", """        "detail": ("The gate's record of a refused act"
                    + (f" ({refusal_rule})" if refusal_rule else "")
-                   + "; the member stated no rationale because it did not choose to escalate. "
-                   + "Approving authorises this one write."),
+                   + ". Nothing is asked unless the member escalates it as a deliberate act."),
 """)
 
 
@@ -61,7 +65,9 @@ def patch_test(src):
             claims = stub.args("hestia_gate_escalation_claim")
             detail = claims and claims[0].get("detail", "")
             check(f"{seat}-real-write-rule", "governance-closure-write" in detail, detail)
-            check(f"{seat}-not-asserted-a-write", "refused write" not in detail, detail)
+            check(f"{seat}-not-auto-opened", "Auto-opened" not in detail, detail)
+            check(f"{seat}-deliberate-escalation",
+                  "Nothing is asked unless the member escalates" in detail, detail)
 
             mark = len(stub.calls)
             command = f"bash -c 'cat {target}'"
@@ -70,7 +76,10 @@ def patch_test(src):
             followup = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
             detail2 = followup and followup[0].get("detail", "")
             check(f"{seat}-read-fp-rule", "governance-closure-out-of-grammar" in detail2, detail2)
-            check(f"{seat}-read-fp-not-asserted-a-write", "refused write" not in detail2, detail2)
+            check(f"{seat}-read-fp-not-asserted-a-write", "write" not in detail2, detail2)
+            check(f"{seat}-read-fp-not-auto-opened", "Auto-opened" not in detail2, detail2)
+            check(f"{seat}-read-fp-deliberate-escalation",
+                  "Nothing is asked unless the member escalates" in detail2, detail2)
         finally:
             stub.close()
     _each_seat(arm)
@@ -104,6 +113,20 @@ def hunks(section):
     return out
 
 
+def apply_offset_tolerant(old_text, section):
+    lines = old_text.splitlines(keepends=True)
+    out, pos = [], 0
+    for h in hunks(section):
+        old, new = h["old"], h["new"]
+        at = [i for i in range(pos, len(lines) - len(old) + 1) if lines[i:i + len(old)] == old]
+        assert len(at) == 1, ("offset apply", h["start"], len(at))
+        out.extend(lines[pos:at[0]])
+        out.extend(new)
+        pos = at[0] + len(old)
+    out.extend(lines[pos:])
+    return "".join(out)
+
+
 def strict_apply(old_text, section):
     lines = old_text.splitlines(keepends=True)
     out, pos = [], 0
@@ -123,8 +146,10 @@ def sections(text):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    mechanism = patch_mechanism(blob(MECH))
-    gate = patch_gate(blob(GATE))
+    noauto = sections(NOAUTO.read_text(encoding="utf-8"))
+    assert set(noauto) == {MECH, GATE}, set(noauto)
+    mechanism = patch_mechanism(apply_offset_tolerant(blob(MECH), noauto[MECH]))
+    gate = patch_gate(apply_offset_tolerant(blob(GATE), noauto[GATE]))
     test_new = patch_test(blob(TEST))
     for name, text in (("mechanism_rev.py", mechanism), ("single_gate_rev.py", gate),
                        ("seat_gate_boundary_test_rev.py", test_new)):

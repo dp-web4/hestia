@@ -1,33 +1,48 @@
-# held/: hestia#608 refusal detail records the actual rule. NOT applied
+# held/: hestia#608 + #1497 deliberate-escalation detail. NOT applied
 
 | file | sha256 |
 |---|---|
-| `611bdc930a802bf45a36ce71bc35fd66bdf079ec288937b9b0244d4b0b424617.patch` | `611bdc930a802bf45a36ce71bc35fd66bdf079ec288937b9b0244d4b0b424617` |
+| `4eda8ccbba6a190f9af27bc3b3be6180e77fb26d51e14dd13efdf3f22750b37b.patch` | `4eda8ccbba6a190f9af27bc3b3be6180e77fb26d51e14dd13efdf3f22750b37b` |
 
-Base: main `59f2478eb70314a26c1538c166d9e938738e73fc`.
+Builder base: merged worktree `8f6dd4412d7f2d0e7f8949f6f95f485d95635247`, containing current main
+`faffd549c964d72eb09c3656dc6dff6da34bc1b1`. `git apply --check` also passes directly on that main.
+
+This one patch supersedes `e1a515cd…`, `dae63377…`, and `611bdc93…`; those candidates must not be
+applied. The older files remain only as history.
 
 ## The change
 
-`claim_self_write` accepts an optional `refusal_rule`; the common gate supplies the closure's actual
-rule. `stated_detail` now reads as an auto-opened **act**, not an auto-opened **write**, and includes
-that rule. It no longer asserts a verb class the marker layer did not establish.
+The builder applies `held/build-noauto/source-noauto.diff` first, then adds #608's rule-aware detail.
+The no-auto half handles the daemon's `not_asked` answer for both scope and governance-write refusals:
+nothing opens, and the member is offered the deliberate-escalation door with the refusal id.
 
-This lets a reviewer distinguish a real write (`governance-closure-write`) from a read-only
-out-of-grammar refusal (`governance-closure-out-of-grammar`) on the chain. It does not change claim
-identity, approval scope, or the old constant's behavior for callers that omit the optional rule.
+`claim_self_write` also accepts an optional `refusal_rule`, supplied by the common gate from `cv.rule`.
+Its `detail` now reads:
+
+> The gate's record of a refused act (&lt;actual-rule&gt;). Nothing is asked unless the member escalates it as a deliberate act.
+
+It no longer says the gate auto-opened anything, and a read-only out-of-grammar refusal no longer
+asserts a write. Claim identity and approval scope are unchanged; older callers that omit the optional
+rule retain a rule-free version of the same accurate detail.
 
 The patch updates the mechanism, common gate, both hooks-gt copies, five manifests, and the four-seat
-boundary test.
+boundary test: ten files total.
 
 ## Validation
 
-- Unmodified sources: the new acceptance test fails on the constant `refused write` literal; the
-  other 17 boundary tests pass.
-- Revised sources: **18 tests × 4 seats pass**, including:
-  - a real write carries `governance-closure-write`, not `refused write`;
-  - a read-only `bash -c 'cat …'` refusal carries `governance-closure-out-of-grammar`, not
-    `refused write`.
-- Builder strictly reproduces all nine files and `git apply --check` passes on the base.
+- Unmodified sources: the new acceptance test fails on the old auto-open/write detail; the other 17
+  boundary tests pass.
+- Revised sources through the overlay seam: **18 tests × 4 seats pass**, including:
+  - a real write carries `governance-closure-write` and the deliberate-escalation wording;
+  - a read-only `bash -c 'cat …'` refusal carries `governance-closure-out-of-grammar` and no `write`
+    claim or auto-open wording.
+- Overlaid `tools/one_gate_decide_contract_test.py`: **26 decide() contract tests plus 31×4 shim
+  parity pass**, including the `not_asked` scope and governance paths. The optional real-daemon arm
+  was skipped because `HESTIA_DECIDE_CONTRACT_ENDPOINT` was unset.
+- Builder strictly reproduces all ten files. `git apply --check` passes on the builder base and
+  directly on main `faffd549`.
+- No governed source was edited during validation; overlays and temporary roots stayed inside the
+  worktree.
 
 ## Apply
 
