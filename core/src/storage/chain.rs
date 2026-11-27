@@ -1833,6 +1833,34 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// The newest row of one of `event_types` for exactly this agent, without a global activity
+    /// window. Recovery decisions must not depend on how often other members have acted.
+    pub fn read_latest_by_types_for_agent(
+        &self,
+        event_types: &[&str],
+        agent: &str,
+    ) -> Result<Option<ChainEntry>> {
+        if event_types.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.observed(&self.conn)?;
+        let placeholders = vec!["?"; event_types.len()].join(",");
+        let sql = format!(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE event_type IN ({placeholders}) AND json_extract(event_data, '$.agent') = ?
+             ORDER BY chain_position DESC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = event_types
+            .iter()
+            .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        binds.push(Box::new(agent.to_string()));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        stmt.query_row(refs.as_slice(), row_to_entry).optional()?.transpose()
+    }
+
     /// Most recent D2 live-shadow parity rows, newest first.
     ///
     /// Uses the event-type index plus JSON presence rather than a global tail
@@ -4157,6 +4185,26 @@ mod tests {
         // Newest first — an operator opens the ledger to see what is waiting.
         assert_eq!(got[0].event_type, "policy_edit");
         assert_eq!(got[1].event_type, "gate_escalation_opened");
+    }
+
+    #[test]
+    fn ungovern_recovery_read_is_exact_and_newest_first() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+        let types = ["agent_ungovern_intent", "agent_ungovern"];
+        let intent = store
+            .append("agent_ungovern_intent", json!({"agent": "kimi-code"}), signer)
+            .unwrap();
+        store.append("agent_ungovern_intent", json!({"agent": "codex"}), signer).unwrap();
+        store.append("outcome", json!({"agent": "kimi-code"}), signer).unwrap();
+        let got = store.read_latest_by_types_for_agent(&types, "kimi-code").unwrap().unwrap();
+        assert_eq!(got.hash, intent.hash);
+        store.append("agent_ungovern", json!({"agent": "kimi-code"}), signer).unwrap();
+        let got = store.read_latest_by_types_for_agent(&types, "kimi-code").unwrap().unwrap();
+        assert_eq!(got.event_type, "agent_ungovern");
+        assert!(store.read_latest_by_types_for_agent(&[], "kimi-code").unwrap().is_none());
+        assert!(store.read_latest_by_types_for_agent(&types, "nobody").unwrap().is_none());
     }
 
     /// An empty type list asks for NOTHING. Widening it to the whole chain would hand a caller

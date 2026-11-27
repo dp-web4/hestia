@@ -78,18 +78,18 @@ def source_contract() -> None:
     # TWO requests of the pane's own: the inventory read, and register (#1101), which is the one
     # write built inline here -- retire and reinstate go through the retire block's reviewed
     # functions instead. Pinned by route and method, not by count alone.
-    # And two more since 2026-09-28, the gate BYPASS and RESTORE (dp: "in discover, for every
-    # registered harness add a 'bypass' button (that turns into 'restore')"), each a POST to the
-    # member's own route. They are template literals -- the spelling the operator-surfaces checker
-    # reads -- so the single-quote scan above does not see them; they are pinned by exact spelling
-    # here, and the total of template-literal requests in the block is pinned too, so a fifth
-    # request of either kind still turns this red.
-    GATE_ACTS = ["apiFetch(`/api/agents/${encodeURIComponent(member)}/bypass`, {\n        method: 'POST'",
-                 "apiFetch(`/api/agents/${encodeURIComponent(member)}/restore`, {\n        method: 'POST'"]
-    for act in GATE_ACTS:
-        check(f"the gate act is a POST on the member's own route: {act.split(',')[0]}", block.count(act), 1)
-    check("the only template-literal requests in the block are the two gate acts",
-          len(re.findall(r"apiFetch\(\s*`", block)), 2)
+    # The gate BYPASS and RESTORE arrived on 2026-09-28; UNGOVERN (#998) completes the set. Each is
+    # a POST to the member's own route. They are template literals -- the spelling the
+    # operator-surfaces checker reads -- so the single-quote scan above does not see them; they are
+    # pinned by exact spelling here, and the total of template-literal requests in the block is
+    # pinned too, so a fourth request of either kind still turns this red.
+    TEMPLATE_ACTS = ["apiFetch(`/api/agents/${encodeURIComponent(member)}/bypass`, {\n        method: 'POST'",
+                     "apiFetch(`/api/agents/${encodeURIComponent(member)}/restore`, {\n        method: 'POST'",
+                     "apiFetch(`/api/agents/${encodeURIComponent(member)}/ungovern`, {\n        method: 'POST'"]
+    for act in TEMPLATE_ACTS:
+        check(f"the member act is a POST on the member's own route: {act.split(',')[0]}", block.count(act), 1)
+    check("the only template-literal requests in the block are bypass, restore and ungovern",
+          len(re.findall(r"apiFetch\(\s*`", block)), 3)
     check("exactly two single-quoted requests in the Discover block: the read and register", len(fetches), 2)
     reads = [f for f in fetches if "method" not in f[1]]
     writes = [f for f in fetches if "method" in f[1]]
@@ -117,10 +117,13 @@ def source_contract() -> None:
                       # dp, 2026-09-28: a fail-open recovery switch for a member its own gate has
                       # locked out, and its undo. Reason on bypass; the confirm names what is off.
                       "data-gate-bypass": "bypass a member's gate (fail-open recovery)",
-                      "data-gate-restore": "restore a bypassed gate exactly"}
-    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|gate-bypass|gate-restore|delete|revoke|grant|merge-alias)(?![\w-])", block))
-    check("the write-capable controls in this pane are exactly the reviewed six",
+                      "data-gate-restore": "restore a bypassed gate exactly",
+                      "data-ungovern": "remove authority, owned hooks and projection in one act (#998)"}
+    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|gate-bypass|gate-restore|ungovern|delete|revoke|grant|merge-alias)(?![\w-])", block))
+    check("the write-capable controls in this pane are exactly the reviewed seven",
           sorted(found), sorted(WRITE_CONTROLS))
+    check("unwire has its own deliberate dispatch",
+          "closest('[data-ungovern]')" in UI and "ungovernAgent(b.dataset.ungovern)" in UI)
     check("retire and reinstate are dispatched by the retire block's own delegated handler",
           "closest('[data-retire],[data-reinstate],[data-retire-all],#disc-show-retired,#disc-hide-retired')" in UI)
     # THE BULK ACT MUST NOT BE THE WAY AROUND THE LIVE-MEMBER GUARD. retireNeverActed sends each id
@@ -214,6 +217,16 @@ def behaviour() -> None:
     check("fails_open false -> closed", rows["gemini"]["failure"], "closed")
     check("fails_open ABSENT -> unknown, NOT closed and NOT open", rows["codex"]["failure"], "unknown")
     check("no plugin -> no governance id, rather than echoing the atlas id", rows["aider"]["governanceId"], "")
+    check("only a governed harness is offered the one-act unwire",
+          (rows["claude"]["canUngovern"], rows["codex"]["canUngovern"], rows["aider"]["canUngovern"]),
+          (True, False, False))
+    # The route refuses a record the inventory could not fully classify, so no button is offered.
+    unclassified = dict(ok_report, detail=[
+        dict(d, unknown=["config scope is incomplete"]) if d["agent"] == "claude" else d
+        for d in ok_report["detail"]])
+    urows = {r["atlasId"]: r for g in run_model(unclassified)["groups"] for r in g["rows"]}
+    check("a governed harness the inventory could not classify is NOT offered unwire",
+          urows["claude"]["canUngovern"], False)
     check("scope carries where the atlas came from", m["scope"]["atlasSource"], "env")
 
     # UNKNOWN that still saw things: the banner AND the rows. The inventory deliberately keeps
@@ -584,11 +597,77 @@ def gate_bypass() -> None:
     check("a member whose gate is not hestia's is not offered bypass", rows["codex"][1].get("bypassable"), False)
 
 
+def unwire_results() -> None:
+    a = UI.index("  async function ungovernAgent(")
+    b = UI.index("  document.addEventListener('click'", a)
+    function = UI[a:b]
+    cases = [
+        {"ok": False, "status": 409, "out": {
+            "error": "registrar refused",
+            "rollback_errors": ["restoring the seat authority: read-only vault"],
+            "failureRecorded": False,
+            "failureRecordError": "witness db full",
+            "hooks_left_unowned": ["/elsewhere/foreign.js"],
+        }},
+        {"ok": False, "status": 409, "out": {
+            "error": "registrar output lost", "unknownOutcome": True,
+            "unknownOutcomeRecorded": False, "unknownOutcomeRecordError": "witness db full",
+        }},
+        {"ok": True, "status": 200, "out": {
+            "message": "unwired", "recorded": False, "recordError": "witness db full",
+        }},
+    ]
+    driver = r"""
+(async () => {
+  const results = [];
+  for (const c of JSON.parse(process.argv[1])) {
+    const alerts = [];
+    let loads = 0;
+    global.confirm = () => true;
+    global.prompt = () => 'reason';
+    global.apiFetch = async () => ({ok: c.ok, status: c.status, json: async () => c.out});
+    global.alert = message => alerts.push(message);
+    global.discoverLoad = () => { loads += 1; };
+    await ungovernAgent('kimi-code');
+    results.push({alerts, loads});
+  }
+  process.stdout.write(JSON.stringify(results));
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+    r = subprocess.run(["node", "-e", function + driver, json.dumps(cases)],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        check("unwire result renderer executes", r.stderr.strip()[-300:], 0)
+        return
+    refusal, unknown, success = json.loads(r.stdout)
+    text = refusal["alerts"][0]
+    check("a refused unwire shows the refusal and does not reload",
+          (text.startswith("unwire refused: registrar refused"), refusal["loads"]), (True, 0))
+    check("a refused unwire names rollback failure and its unsafe state",
+          all(s in text for s in ["WARNING: rollback was incomplete", "restoring the seat authority: read-only vault",
+                                  "NOT put back as it was", "may now be refused, not intact"]))
+    check("a refused unwire never hides a failed terminal record",
+          "this refusal was not recorded on the chain (witness db full)" in text)
+    check("a refused unwire names hooks left in force", "/elsewhere/foreign.js" in text)
+    unknown_text = unknown["alerts"][0]
+    check("an unknown unwire outcome never reads as a proven rollback",
+          all(s in unknown_text for s in ["outcome is UNKNOWN, not a proven refusal",
+                                          "No rollback or completion was claimed",
+                                          "fresh inventory and the harness config",
+                                          "open intent"]))
+    check("an unknown outcome's record failure is visible",
+          "unknown outcome could not be recorded (witness db full)" in unknown_text)
+    check("a successful unwire still warns when its terminal witness failed",
+          (success["alerts"], success["loads"]),
+          (["unwired\n\nWARNING: the act landed but its terminal witness failed: witness db full"], 1))
+
+
 def main() -> int:
     source_contract()
     if shutil.which("node"):
         behaviour()
         gate_bypass()
+        unwire_results()
         unaccounted()
         registry_members()
         cleanup()

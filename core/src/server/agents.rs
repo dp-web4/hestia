@@ -23,7 +23,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Where the inventory executable lives. Fixed paths only — never anything derived from
@@ -98,96 +98,348 @@ pub async fn inventory_off_thread() -> Result<Value> {
         .map_err(|e| anyhow::anyhow!("inventory task failed: {e}"))?
 }
 
-/// Configs we can safely un-wire, and the shape they are in. TOML is deliberately absent:
-/// removing a table entry from a hand-maintained TOML without a round-tripping editor
-/// risks eating comments and neighbouring settings, and silently mangling an agent's
-/// config while claiming to have merely ungoverned it is a worse outcome than declining.
-/// Codex and Kimi therefore report unsupported rather than being edited approximately.
-fn json_config_for(agent: &str) -> Option<PathBuf> {
-    let home = dirs_home()?;
-    let p = match agent {
-        "claude" | "claude-code" => home.join(".claude/settings.json"),
-        "gemini" => home.join(".gemini/settings.json"),
-        "cursor" => home.join(".cursor/hooks.json"),
-        _ => return None,
-    };
-    Some(p)
+#[derive(Debug, Clone)]
+pub struct UngovernPlan {
+    pub member: String,
+    pub governance_id: String,
+    pub registrar: Option<PathBuf>,
+    pub owned_targets: Vec<String>,
+    /// Hook targets the inventory reads for this member and does NOT attribute to hestia. They
+    /// are never removed. They are carried so the act can say what it left in force: "0 hooks
+    /// removed" beside a foreign gate line is not an unwired member.
+    pub unowned_targets: Vec<String>,
 }
 
-/// Remove hestia's hook wiring from an agent's config, keeping a timestamped backup.
-///
-/// Returns (backup_path, hooks_removed). Reversible by construction: the backup is
-/// written and fsync-ordered BEFORE the config is rewritten, so a failure mid-way leaves
-/// either the original file or the original plus a copy of itself — never a half-edited
-/// config. Ungoverning removes enforcement; it must not also risk the agent's own setup.
-pub fn ungovern(agent: &str) -> Result<(String, usize)> {
-    let Some(path) = json_config_for(agent) else {
-        bail!(
-            "ungovern is not supported for '{agent}' from here: its config is TOML and \
-             editing it without a round-tripping parser risks its comments and unrelated \
-             settings. Remove the hestia hook entries by hand."
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UngovernOutcome {
+    pub hooks_removed: usize,
+    pub backup: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum UngovernError {
+    Refused(String),
+    Unknown(String),
+}
+
+impl std::fmt::Display for UngovernError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(error) | Self::Unknown(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for UngovernError {}
+
+/// Resolve one member's exact owned targets and the already-deployed registrar that can remove
+/// them. A missing or ambiguous inventory record stops before any authority or file is changed.
+pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<UngovernPlan> {
+    let detail = report.get("detail").and_then(Value::as_array).cloned().unwrap_or_default();
+    let matches: Vec<&Value> = detail
+        .iter()
+        .filter(|rec| {
+            ["member", "plugin", "agent"]
+                .iter()
+                .any(|key| rec.get(*key).and_then(Value::as_str) == Some(id))
+        })
+        .collect();
+    let rec = match matches.as_slice() {
+        [one] => *one,
+        [] => bail!("'{id}' is not in the current inventory; nothing was changed"),
+        _ => bail!("'{id}' names more than one inventory record; nothing was changed"),
+    };
+    let unknown = rec.get("unknown").and_then(Value::as_array).cloned().unwrap_or_default();
+    if !unknown.is_empty() {
+        bail!("the inventory could not fully classify '{id}' ({unknown:?}); nothing was changed");
+    }
+    let governance_id = rec
+        .get("member")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("'{id}' has no canonical member id; nothing was changed"))?
+        .to_string();
+    let member = rec
+        .get("plugin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("'{id}' has no hestia registrar; nothing was changed"))?
+        .to_string();
+    let mut owned_targets: Vec<String> = rec
+        .get("hook_targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|target| target.get("owned_by_hestia").and_then(Value::as_bool) == Some(true))
+        .filter_map(|target| target.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    owned_targets.sort();
+    owned_targets.dedup();
+    let mut unowned_targets: Vec<String> = rec
+        .get("hook_targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|target| target.get("owned_by_hestia").and_then(Value::as_bool) != Some(true))
+        .filter_map(|target| target.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    unowned_targets.sort();
+    unowned_targets.dedup();
+    let registrar = if owned_targets.is_empty() {
+        None
+    } else {
+        let scope = report.get("scope").cloned().unwrap_or(Value::Null);
+        let source = scope.get("workspace_source").and_then(Value::as_str).unwrap_or("");
+        if !matches!(source, "env" | "argv") {
+            bail!("the inventory workspace is not explicitly established; refusing to execute its registrar");
+        }
+        let workspace = scope
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("the inventory names no workspace for the registrar"))?;
+        Some(PathBuf::from(workspace).join("hestia/deploy/register-members.py"))
+    };
+    Ok(UngovernPlan { member, governance_id, registrar, owned_targets, unowned_targets })
+}
+
+/// The caller holds the daemon's state lock across the registrar (the act must not interleave
+/// with another change to the same seat), so a registrar that never returns would stop every
+/// gate on the machine. It gets this long.
+const REGISTRAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `Command::output` with a deadline. On the deadline the child is killed and the outcome is
+/// UNKNOWN. Atomic rename avoids a partial write, but it does not prove whether the commit landed
+/// or what an external editor changed; only fresh inventory and config bytes can answer that.
+fn output_within(mut command: Command, limit: std::time::Duration) -> Result<std::process::Output, UngovernError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| UngovernError::Refused(format!("could not start the registrar: {e}; nothing was changed")))?;
+    // Drain both pipes off-thread so a chatty child cannot block on a full pipe while we wait.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(UngovernError::Unknown(format!(
+                    "waiting for the registrar failed: {e}; whether the harness config was edited \
+                     is NOT known — run the inventory before anything else"
+                )));
+            }
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(UngovernError::Unknown(format!(
+                "the registrar did not finish within {limit:?} and was stopped; whether the harness \
+                 config was edited is NOT known — run the inventory before anything else"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Execute the same ownership-proved registrar the operator installer uses, rather than keeping a
+/// second, JSON-only removal implementation in the daemon.
+pub fn ungovern(plan: &UngovernPlan, hestia_home: &Path) -> Result<UngovernOutcome, UngovernError> {
+    let operator_home = dirs_home()
+        .ok_or_else(|| UngovernError::Refused("HOME is not set; nothing was changed".into()))?;
+    ungovern_at(plan, hestia_home, &operator_home)
+}
+
+fn ungovern_registrar_command(
+    plan: &UngovernPlan,
+    registrar: &Path,
+    hestia_home: &Path,
+    operator_home: &Path,
+) -> Command {
+    let mut command = Command::new("python3");
+    command
+        .arg(registrar)
+        .arg("--remove")
+        .arg("--member")
+        .arg(&plan.member)
+        .arg("--json")
+        .arg("--home")
+        .arg(operator_home)
+        .args(plan.owned_targets.iter().flat_map(|target| ["--owned-target", target.as_str()]))
+        .env("HESTIA_HOME", hestia_home)
+        .env("DRY_RUN", "0");
+    command
+}
+
+pub(crate) fn ungovern_at(
+    plan: &UngovernPlan,
+    hestia_home: &Path,
+    operator_home: &Path,
+) -> Result<UngovernOutcome, UngovernError> {
+    if plan.owned_targets.is_empty() {
+        return Ok(UngovernOutcome { hooks_removed: 0, backup: None });
+    }
+    let registrar = plan
+        .registrar
+        .as_ref()
+        .filter(|path| path.is_file())
+        .ok_or_else(|| UngovernError::Refused("the member registrar is not installed; nothing was changed".into()))?;
+    let command = ungovern_registrar_command(plan, registrar, hestia_home, operator_home);
+    let out = output_within(command, REGISTRAR_TIMEOUT)?;
+    let value: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+        UngovernError::Unknown(format!(
+            "the registrar returned no readable result ({e}); whether the harness config was edited \
+             is NOT known — run the inventory before anything else: {}",
+            String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>()
+        ))
+    })?;
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+    if matches!(status, "failed" | "refused") {
+        return Err(UngovernError::Refused(
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the registrar refused the removal; nothing was changed")
+                .into(),
+        ));
+    }
+    if !out.status.success() || !matches!(status, "ok" | "unregistered") {
+        return Err(UngovernError::Unknown(format!(
+            "the registrar exited {} with unrecognized status {status:?}; whether the harness config \
+             was edited is NOT known — run the inventory before anything else",
+            out.status
+        )));
+    }
+    let outcome: UngovernOutcome = serde_json::from_value(value).map_err(|e| {
+        UngovernError::Unknown(format!(
+            "the registrar returned an unreadable outcome ({e}); whether the harness config was \
+             edited is NOT known — run the inventory before anything else"
+        ))
+    })?;
+    if outcome.hooks_removed == 0 {
+        return Err(UngovernError::Refused(
+            "the registrar removed none of the inventory's owned targets; nothing was changed".into(),
+        ));
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ungovern_plan_uses_only_inventory_owned_targets_and_an_explicit_workspace() {
+        let mut report = serde_json::json!({
+            "status": "UNGOVERNED_PRESENT",
+            "scope": {"workspace": "/w", "workspace_source": "env"},
+            "detail": [{
+                "agent": "kimi", "plugin": "kimi", "member": "kimi-code",
+                "hook_targets": [
+                    {"path": "/h/.kimi-code/hooks/pre_tool_use.py", "owned_by_hestia": true},
+                    {"path": "/h/.kimi-code/hooks/witness.py", "owned_by_hestia": true},
+                    {"path": "/h/.kimi-code/hooks/pre_tool_use.py", "owned_by_hestia": true},
+                    {"path": "/elsewhere/foreign.py", "owned_by_hestia": false},
+                    {"path": "/also-mine-but-not-inventoried.py"}
+                ]
+            }]
+        });
+        for id in ["kimi-code", "kimi"] {
+            let plan = ungovern_plan_from_inventory(id, &report).unwrap();
+            assert_eq!(plan.member, "kimi");
+            assert_eq!(plan.governance_id, "kimi-code", "an inventory alias must not rename the authority");
+        }
+        let plan = ungovern_plan_from_inventory("kimi-code", &report).unwrap();
+        assert_eq!(plan.member, "kimi");
+        assert_eq!(plan.owned_targets, [
+            "/h/.kimi-code/hooks/pre_tool_use.py".to_string(),
+            "/h/.kimi-code/hooks/witness.py".to_string(),
+        ]);
+        assert_eq!(plan.registrar.unwrap(), PathBuf::from("/w/hestia/deploy/register-members.py"));
+        assert_eq!(plan.unowned_targets, [
+            "/also-mine-but-not-inventoried.py".to_string(),
+            "/elsewhere/foreign.py".to_string(),
+        ], "what is not proved owned is reported as left in place, never as removable");
+        report["detail"][0]["unknown"] = serde_json::json!(["config scope is incomplete"]);
+        assert!(ungovern_plan_from_inventory("kimi-code", &report).is_err());
+    }
+
+    #[test]
+    fn a_registrar_that_never_returns_is_stopped_and_reported_as_unknown() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+        let error = output_within(command, std::time::Duration::from_millis(150)).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(matches!(&error, UngovernError::Unknown(_)), "{error:?}");
+        assert!(error.to_string().contains("NOT known"), "{error}");
+        // control: a child that finishes is read in full
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let out = output_within(command, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!((out.status.code(), out.stdout.as_slice(), out.stderr.as_slice()),
+                   (Some(3), b"out".as_slice(), b"err".as_slice()));
+    }
+
+    #[test]
+    fn ungovern_registrar_cannot_inherit_dry_run() {
+        let plan = UngovernPlan {
+            member: "kimi".into(),
+            governance_id: "kimi-code".into(),
+            registrar: Some(PathBuf::from("/w/hestia/deploy/register-members.py")),
+            owned_targets: vec!["/h/.kimi-code/hooks/pre_tool_use.py".into()],
+            unowned_targets: Vec::new(),
+        };
+        let command = ungovern_registrar_command(
+            &plan,
+            Path::new("/w/hestia/deploy/register-members.py"),
+            Path::new("/h"),
+            Path::new("/operator"),
         );
-    };
-    if !path.is_file() {
-        bail!("no config at {}", path.display());
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let mut cfg: Value = serde_json::from_str(&text)?;
-
-    // Backup first, and verify it landed. `?` on the write is not enough — a truncated
-    // backup that still returned Ok would leave nothing to restore from.
-    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let backup = path.with_extension(format!("json.hestia-ungovern.{stamp}"));
-    std::fs::write(&backup, &text)?;
-    if std::fs::read_to_string(&backup)? != text {
-        bail!("backup at {} did not verify; refusing to edit the config", backup.display());
+        let dry_run = command
+            .get_envs()
+            .find(|(key, _)| *key == "DRY_RUN")
+            .map(|(_, value)| value);
+        assert_eq!(dry_run, Some(Some(std::ffi::OsStr::new("0"))));
     }
 
-    let mut removed = 0usize;
-    if let Some(hooks) = cfg.get_mut("hooks").and_then(Value::as_object_mut) {
-        for (_event, groups) in hooks.iter_mut() {
-            let Some(arr) = groups.as_array_mut() else { continue };
-            for group in arr.iter_mut() {
-                let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-                    continue;
-                };
-                let before = inner.len();
-                // Ownership by CONTENT, matching the inventory: hestia deploys gates to
-                // paths that never say "hestia" (~/.codex/hooks/pre_tool_use.py), and a
-                // path-name test would leave a live gate wired while reporting success.
-                inner.retain(|h| !is_hestia_hook(h));
-                removed += before - inner.len();
-            }
-            arr.retain(|g| {
-                g.get("hooks").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(true)
-            });
-        }
+    #[test]
+    fn an_ungovern_with_no_owned_targets_never_executes_a_registrar() {
+        let plan = UngovernPlan {
+            member: "codex".into(),
+            governance_id: "codex".into(),
+            registrar: None,
+            owned_targets: Vec::new(),
+            unowned_targets: Vec::new(),
+        };
+        let outcome = ungovern(&plan, Path::new("/not-read")).unwrap();
+        assert_eq!(outcome.hooks_removed, 0);
+        assert_eq!(outcome.backup, None);
     }
-    if removed == 0 {
-        bail!("no hestia hooks found in {} — nothing to ungovern", path.display());
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&cfg)? + "\n")?;
-    Ok((backup.display().to_string(), removed))
-}
-
-/// Is this hook entry hestia's? Decided by reading the target where we can, because the
-/// path is not the owner: a gate whose filename says nothing about hestia can be entirely
-/// hestia's, and a path containing "hestia" can belong to something else.
-fn is_hestia_hook(h: &Value) -> bool {
-    let Some(cmd) = h.get("command").and_then(Value::as_str) else {
-        return false;
-    };
-    if cmd.to_lowercase().contains("hestia") {
-        return true;
-    }
-    for tok in cmd.split_whitespace() {
-        if tok.starts_with('/') && std::path::Path::new(tok).is_file() {
-            if let Ok(body) = std::fs::read_to_string(tok) {
-                if body.contains("hestia") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }

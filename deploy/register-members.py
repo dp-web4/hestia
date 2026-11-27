@@ -83,6 +83,16 @@ The renderer is shared: `deploy/from-main/gate-preflight.py` loads this file and
 candidate gate under `reconciled_commands()` — the registration this install WILL write — not the
 one currently on disk (which the install is about to rewrite).
 
+`--remove --member MEMBER [--owned-target ABSOLUTE_PATH ...]` is the inverse act. It drops only
+the named, exactly matching targets (or the template's current targets when none are named), using
+the same structural edit and TOML proof. A stale target set refuses before any write. Register and
+remove writers share one advisory lock per config; before committing, the writer re-reads the source
+bytes under that lock and refuses rather than overwrite an intervening edit. That guarantee covers
+cooperating writers only: an external editor can still write after the re-read, so an uncertain
+registrar outcome must be reconciled from a fresh inventory and config bytes. A real write gets a
+unique `.hestia-unregister.*` backup of the exact bytes this run read, never the older
+`.pre-register.bak`. `--json` returns the outcome for the daemon's witnessed ungovern act.
+
 Exit: 0 clean; 6 a write failed validation and was restored; 7 refused (an unrendered placeholder,
 HESTIA_HOME unset, or a config that cannot be verified; that member skipped, others proceed);
 8 a FOREIGN registration is narrower than the template; 9 pending; 10 a FOREIGN registration's
@@ -96,6 +106,17 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import time
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -1033,13 +1054,11 @@ def _backup(path: str) -> None:
         shutil.copy2(path, bak)
 
 
-def _write_atomic(path: str, text: str) -> None:
-    """Write `text` to `path` so a crash leaves the old file or the new one, never half of one.
-    The temp file takes the original's mode: ~/.codex/config.toml is 0600."""
+def _write_atomic_bytes(path: str, payload: bytes) -> None:
     d = os.path.dirname(path) or "."
     tmp = os.path.join(d, f".{os.path.basename(path)}.register-tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
     if os.path.exists(path):
@@ -1047,11 +1066,82 @@ def _write_atomic(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _write_atomic(path: str, text: str) -> None:
+    """Write `text` to `path` so a crash leaves the old file or the new one, never half of one.
+    The temp file takes the original's mode: ~/.codex/config.toml is 0600."""
+    _write_atomic_bytes(path, text.encode("utf-8"))
+
+
+CONFIG_LOCK_TIMEOUT = 5.0
+
+
+class ConfigLockTimeout(Exception):
+    pass
+
+
+def _read_config_bytes(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+class _ConfigLock:
+    """One advisory lock per harness config, shared by every cooperating registrar run."""
+    def __init__(self, path: str, timeout: float = CONFIG_LOCK_TIMEOUT):
+        self.path = path
+        self.timeout = timeout
+        self._fh = None
+
+    def __enter__(self):
+        if fcntl is None and msvcrt is None:
+            raise OSError("config locking is unsupported on this Python")
+        self._fh = open(self.path + ".hestia-register.lock", "a+b")
+        try:
+            if msvcrt is not None and fcntl is None:
+                self._fh.seek(0, os.SEEK_END)
+                if self._fh.tell() == 0:
+                    self._fh.write(b"\0")
+                    self._fh.flush()
+            deadline = time.monotonic() + self.timeout
+            while True:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        self._fh.seek(0)
+                        msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    return self
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ConfigLockTimeout(
+                            f"another registrar operation holds the config lock; nothing written")
+                    time.sleep(0.05)
+        except Exception:
+            self._fh.close()
+            self._fh = None
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if fcntl is not None:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            else:
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._fh.close()
+            self._fh = None
+        return False
+
+
 # ---------------------------------------------------------------- one member -------------
 class Loaded:
-    def __init__(self, cfg, dest, reader, layout, raw, data, hooks, desired, reg):
+    def __init__(self, cfg, dest, reader, layout, raw, raw_bytes, data, hooks, desired, reg):
         self.cfg, self.dest, self.reader, self.layout = cfg, dest, reader, layout   # layout: json|toml|flat
-        self.raw, self.data, self.hooks, self.desired, self.reg = raw, data, hooks, desired, reg
+        self.raw, self.raw_bytes = raw, raw_bytes
+        self.data, self.hooks, self.desired, self.reg = data, hooks, desired, reg
 
 
 def _load(member: str, spec: dict, template: dict, home: str, env=None, source=None):
@@ -1077,10 +1167,11 @@ def _load(member: str, spec: dict, template: dict, home: str, env=None, source=N
     if reader not in ("json-hook-commands", "toml-hook-commands"):
         return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
     layout = "json" if reader == "json-hook-commands" else ("flat" if reg.get("layout") == "flat" else "toml")
-    raw, data, hooks = "", None, None
+    raw, raw_bytes, data, hooks = "", None, None, None
     if os.path.exists(cfg):
-        with open(cfg, encoding="utf-8", errors="replace") as fh:
-            raw = fh.read()
+        with open(cfg, "rb") as fh:
+            raw_bytes = fh.read()
+        raw = raw_bytes.decode("utf-8", errors="replace")
     if layout == "json":
         try:
             data = json.loads(raw) if raw.strip() else {}
@@ -1096,7 +1187,7 @@ def _load(member: str, spec: dict, template: dict, home: str, env=None, source=N
             return "refused", [f"{cfg}: this config cannot be verified ({e}); nothing registered, "
                                f"nothing certified -- fix the file, or, on a host without tomllib, "
                                f"run with Python >= 3.11 or register by hand"]
-    return Loaded(cfg, dest, reader, layout, raw, data, hooks, desired, reg)
+    return Loaded(cfg, dest, reader, layout, raw, raw_bytes, data, hooks, desired, reg)
 
 
 class Prepared:
@@ -1220,7 +1311,6 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     if not isinstance(got, Prepared):
         return got
     L, P, changes = got.L, got.P, got.changes
-    exists = os.path.exists(L.cfg)
 
     def done(verdict: str, out: list[str]) -> tuple[str, list[str]]:
         # What this script registers points INTO `dest`; install-members.sh refuses a registration
@@ -1232,21 +1322,30 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         return verdict, out
 
     if got.new is not None and not dry:
-        if L.raw:
-            _backup(L.cfg)
-        _write_atomic(L.cfg, got.new)
-        if L.layout != "json":
-            with open(L.cfg, encoding="utf-8", errors="replace") as fh:
-                back = fh.read()
-            err = validate_toml(back)
-            if err:
-                # Restore what THIS run read, not `.pre-register.bak` (written once, on the first
-                # run ever). A file that did not exist goes back to not existing.
-                if exists:
-                    _write_atomic(L.cfg, L.raw)
-                else:
-                    os.remove(L.cfg)
-                return "failed", [f"{L.cfg} failed to parse after write ({err}); restored as it was"] + P.notes
+        try:
+            with _ConfigLock(L.cfg):
+                if _read_config_bytes(L.cfg) != L.raw_bytes:
+                    return "refused", [f"{L.cfg}: changed since the registration was prepared; "
+                                       "refusing to overwrite the intervening edit; rerun the "
+                                       "registrar"] + P.notes
+                if L.raw:
+                    _backup(L.cfg)
+                _write_atomic(L.cfg, got.new)
+                if L.layout != "json":
+                    with open(L.cfg, encoding="utf-8", errors="replace") as fh:
+                        back = fh.read()
+                    err = validate_toml(back)
+                    if err:
+                        # Restore what THIS run read, not `.pre-register.bak` (written once, on
+                        # the first run ever). A file that did not exist goes back to not existing.
+                        if L.raw_bytes is not None:
+                            _write_atomic_bytes(L.cfg, L.raw_bytes)
+                        else:
+                            os.remove(L.cfg)
+                        return "failed", [f"{L.cfg} failed to parse after write ({err}); "
+                                          "restored as it was"] + P.notes
+        except ConfigLockTimeout as e:
+            return "failed", [f"{L.cfg}: {e}"] + P.notes
     lines = changes + P.notes
     # #1142 re-review P2: narrow and pending are unfinished work: they outrank a partial registration.
     if P.narrow:
@@ -1256,6 +1355,135 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     if changes:
         return done("registered", lines)
     return done("ok", lines)
+
+
+def prepare_unregistration(member: str, spec: dict, template: dict, home: str, *,
+                           owned_targets=None, env=None, source=None):
+    got = _load(member, spec, template, home, env, source=source)
+    if not isinstance(got, Loaded):
+        return got
+    L = got
+    flat = L.layout == "flat"
+    norm = lambda p: os.path.normpath(p) if p else p  # noqa: E731
+    owned = {norm(d.target) for d in L.desired if d.target}
+    targets = {norm(t) for t in (owned_targets if owned_targets is not None
+                                else [d.target for d in L.desired]) if t}
+    # OWNERSHIP IS THIS FILE'S RULE, NOT THE CALLER'S WORD. A named target is removable only if it
+    # is one this member's template renders under its declared dest (the reconciler's definition
+    # of an owned line, point 3 of the header). Without this, `--owned-target` removed whatever
+    # path it was handed, and a FOREIGN line was safe only as long as every caller's own notion
+    # of "owned" agreed with this one.
+    not_owned = sorted(targets - owned)
+    if not_owned:
+        return "refused", [f"{L.cfg}: not a target this member's template owns under its declared "
+                           f"dest ({', '.join(not_owned)}); a FOREIGN line is never removed here, "
+                           "so nothing was removed"]
+    regs = index_hooks(L.hooks, flat)
+    found = {norm(r.target) for r in regs if r.target}
+    missing = sorted(targets - found)
+    if missing:
+        return "refused", [f"{L.cfg}: the inventory's owned targets are not all registered "
+                           f"({', '.join(missing)}); the registration changed since it was read, "
+                           "so nothing was removed"]
+    P = Plan()
+    for r in regs:
+        if r.target and norm(r.target) in targets:
+            P.ops.append(("drop", r))
+            P.changes.append(("remove", f"{r.event}/{r.base}: {r.hook.get('command')}"))
+    if not P.ops:
+        return Prepared(L, P, [], None, L.hooks)
+    if L.layout == "json":
+        data = copy.deepcopy(L.data)
+        data["hooks"] = apply_structural(L.hooks, P.ops, "json")
+        new = json.dumps(data, indent=2) + "\n"
+        if json.loads(new) != data:
+            return "failed", [f"rendered {L.cfg} does not reload; nothing written"]
+        return Prepared(L, P, [f"{verb} {text}" for verb, text in P.changes], new, data["hooks"])
+    expected = apply_structural(L.hooks, P.ops, L.layout)
+    try:
+        new = apply_toml_text(L.raw, L.hooks, P.ops, L.layout, member)
+    except Unlocatable as e:
+        return "refused", [f"{L.cfg}: the removal cannot be placed on this file's text ({e}); "
+                           "nothing written"]
+    why = verify_toml_edit(L.raw, new, expected, flat)
+    if why:
+        return "refused", [f"{L.cfg}: the removal could not be proved ({why}); nothing written"]
+    err = validate_toml(new)
+    if err:
+        return "failed", [f"rendered {L.cfg} would not parse ({err}); nothing written"]
+    return Prepared(L, P, [f"{verb} {text}" for verb, text in P.changes], new, expected)
+
+
+def _backup_unregistration(path: str, raw_bytes: bytes) -> str:
+    fd, backup = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.hestia-unregister.",
+                                  dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        shutil.copymode(path, backup)
+        with open(backup, "rb") as fh:
+            if fh.read() != raw_bytes:
+                raise OSError("the unregistration backup did not read back exactly")
+    except Exception:
+        try:
+            os.remove(backup)
+        except OSError:
+            pass
+        raise
+    return backup
+
+
+def _commit_unregistration(got: Prepared, dry: bool, *,
+                           lock_timeout: float = CONFIG_LOCK_TIMEOUT) -> dict:
+    L, P, changes = got.L, got.P, got.changes
+    result = {"status": "unregistered" if changes else "ok",
+              "hooks_removed": len(P.ops), "changes": changes, "config": L.cfg,
+              "backup": None, "error": None}
+    if got.new is None or dry:
+        return result
+    try:
+        with _ConfigLock(L.cfg, timeout=lock_timeout):
+            if _read_config_bytes(L.cfg) != L.raw_bytes:
+                result.update(
+                    status="refused", hooks_removed=0,
+                    error=f"{L.cfg}: changed since the removal was prepared; refusing to "
+                          "overwrite the intervening edit; rerun the inventory and ungovern act")
+                return result
+            try:
+                if L.raw_bytes is not None:
+                    result["backup"] = _backup_unregistration(L.cfg, L.raw_bytes)
+                _write_atomic(L.cfg, got.new)
+            except (OSError, ValueError) as e:
+                result.update(status="failed", hooks_removed=0,
+                              error=f"{L.cfg}: the removal was not written ({e})")
+                return result
+            if L.layout != "json":
+                with open(L.cfg, encoding="utf-8", errors="replace") as fh:
+                    back = fh.read()
+                err = validate_toml(back)
+                if err:
+                    if L.raw_bytes is not None:
+                        _write_atomic_bytes(L.cfg, L.raw_bytes)
+                    else:
+                        os.remove(L.cfg)
+                    result.update(status="failed", hooks_removed=0,
+                                  error=f"{L.cfg} failed to parse after write ({err}); "
+                                        "restored as it was")
+    except ConfigLockTimeout as e:
+        result.update(status="failed", hooks_removed=0, error=f"{L.cfg}: {e}")
+    return result
+
+
+def unregister_member(member: str, spec: dict, template: dict, home: str, dry: bool, *,
+                      owned_targets=None, env=None, source=None) -> dict:
+    got = prepare_unregistration(member, spec, template, home, owned_targets=owned_targets,
+                                 env=env, source=source)
+    if not isinstance(got, Prepared):
+        verdict, lines = got
+        return {"status": verdict, "hooks_removed": 0, "error": "; ".join(lines)}
+    return _commit_unregistration(got, dry)
 
 
 # ---------------------------------------------------------------- main -------------------
@@ -1269,6 +1497,9 @@ def main(argv: list[str]) -> int:
     global FORCE_LINE_SCAN
     only = None
     plan = False
+    remove = False
+    machine = False
+    owned_targets = []
     # --raise-timeouts: an accepted no-op alias since the reconcile (dp 2026-10-06) sets every owned
     # timeout to the template's value.
     argv = [a for a in argv if a != "--raise-timeouts"]
@@ -1285,12 +1516,25 @@ def main(argv: list[str]) -> int:
             only = next(it)
         elif a == "--plan":
             plan = True
+        elif a == "--remove":
+            remove = True
+        elif a == "--json":
+            machine = True
+        elif a == "--owned-target":
+            owned_targets.append(next(it))
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
     dry = ENV.get("DRY_RUN") == "1"
+    if remove and not only:
+        print("register-members: --remove requires --member", file=sys.stderr)
+        return 2
+    if (machine or owned_targets) and not remove:
+        print("register-members: --json and --owned-target require --remove", file=sys.stderr)
+        return 2
     rc = 0
-    if not plan:
+    acted = False
+    if not plan and not (remove and machine):
         log(f"register-members: plugins={plugins} home={home}{' DRY RUN' if dry else ''}")
     for member in sorted(os.listdir(plugins)):
         if only and member != only:
@@ -1312,6 +1556,28 @@ def main(argv: list[str]) -> int:
             continue
         with open(tpl, encoding="utf-8") as fh:
             template = json.load(fh)
+        if remove:
+            acted = True
+            result = unregister_member(member, spec, template, home, dry,
+                                       owned_targets=owned_targets or None,
+                                       source=os.path.join(plugins, member))
+            result.update(member=member, dry_run=dry)
+            if machine:
+                print(json.dumps(result))
+            else:
+                for line in result.get("changes") or []:
+                    log(f"  {'would ' if dry else ''}{line}")
+                if result.get("error"):
+                    log(f"  {result['status'].upper()} {member}: {result['error']}")
+                else:
+                    log(f"  {result['status'].upper()} {member}: "
+                        f"{result['hooks_removed']} owned hook(s) removed"
+                        + (f"; backup {result['backup']}" if result.get("backup") else ""))
+            if result["status"] in ("failed",):
+                rc = 6
+            elif result["status"] not in ("ok", "unregistered"):
+                rc = rc or 7
+            continue
         verdict, lines = register_member(member, spec, template, home, dry, plan=plan,
                                          source=os.path.join(plugins, member))
         if plan:
@@ -1350,6 +1616,13 @@ def main(argv: list[str]) -> int:
         else:
             log(f"  FAILED {member} — {'; '.join(lines)}")
             rc = 6
+    if remove and not acted:
+        if machine:
+            print(json.dumps({"status": "refused", "member": only, "hooks_removed": 0,
+                              "error": "member has no readable expects.json and hooks template"}))
+        else:
+            log(f"  REFUSED {only} — member has no readable expects.json and hooks template")
+        return 2
     return rc
 
 

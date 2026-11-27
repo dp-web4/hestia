@@ -617,6 +617,39 @@
       "notes": "dp, 2026-09-28: \"this is useful for instances when an update locks out a member that we need to be active to fix the issues. happens frequently still\". Restore is the refusing direction and needs no reason."
     },
     {
+      "id": "agent-ungovern",
+      "title": "Unwire a governed harness: remove its seat authority and hestia-owned hooks, quarantine its projection",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/agents/:id/ungovern"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "member-id",
+        "confirm-irreversible",
+        "signed-in-only"
+      ],
+      "obligations": [
+        "offered only on a governed member the inventory fully classified, keyed by MEMBER id (the daemon derives the owned hook targets and the registrar from the inventory, never from the surface)",
+        "carries a stated reason; the confirm says the member is no longer configured or gated after it restarts, that the act is one recorded operator act and NOT atomic, and that a run which stops part-way leaves the member refused, not ungoverned, until it is run again",
+        "the result shows the daemon's own message: how many hestia-owned hooks were removed, whether authority and projection were removed, every hook left in place because hestia does not own it, and whether this run completed an earlier one",
+        "a refusal (nothing to unwire, an unclassified or ambiguous inventory record, a registrar refusal) is shown with the daemon's reason and is not retried",
+        "a terminal record that failed is shown as a warning beside the result, never hidden"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      },
+      "notes": "dp, 2026-09-07 (#998), verbatim: \"in govern screen i want to be able to ... choose to remove wired harnesses\". Until #1666 this route was listed under `unsurfaced` (\"removing a gate is the one act no view offers until the owner decides it should\"); #998 is that decision, and this entry is where a reviewer confirms it."
+    },
+    {
       "id": "orchestrator-connect",
       "title": "Govern a harness (install its hooks)",
       "place": "activity",
@@ -1028,10 +1061,6 @@
     {
       "route": "GET /",
       "why": "serves the dashboard itself"
-    },
-    {
-      "route": "POST /api/agents/:id/ungovern",
-      "why": "hardened for #1131 (a reason is required; the intent is recorded before any hook is touched; a failed terminal record is reported, not hidden). Still unsurfaced by choice: removing a gate is the one act no view offers until the owner decides it should"
     },
     {
       "route": "POST /api/scope/reroot",
