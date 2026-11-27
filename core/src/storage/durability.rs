@@ -286,7 +286,8 @@ impl Durability {
         if self.fail_next_sync.swap(false, Ordering::AcqRel) {
             return Err(anyhow!("injected fsync failure"));
         }
-        match std::fs::File::open(&self.wal_path) {
+        // Windows requires a write handle for FlushFileBuffers; Unix also accepts read-only handles.
+        match std::fs::OpenOptions::new().write(true).open(&self.wal_path) {
             Ok(f) => {
                 f.sync_data()?;
                 // A freshly created WAL needs its directory entry durable too.
@@ -302,7 +303,7 @@ impl Durability {
             // No WAL file: everything committed is already in the main database (a
             // checkpoint truncated it); sync that instead.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::File::open(&self.db_path)?.sync_data()?;
+                std::fs::OpenOptions::new().write(true).open(&self.db_path)?.sync_data()?;
             }
             Err(e) => return Err(e.into()),
         }
