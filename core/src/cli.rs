@@ -1585,14 +1585,13 @@ fn resolve_home(cli: &Cli) -> AnyResult<PathBuf> {
     default_hestia_home().context("could not resolve hestia home directory")
 }
 
-/// THE HOME IS OWNER-ONLY ON WINDOWS (hestia #342). On Unix the installer and the per-file modes keep
-/// the vault, operator.key and .passphrase to the owning user, and that is unchanged. On Windows a
-/// home under the user's profile inherits the profile's ACL, but HESTIA_HOME can name anywhere
-/// (C:\ProgramData is readable by every local user), so the daemon cuts inheritance and leaves one
-/// inheritable ACE for the current user: every file inside, existing or new, becomes owner-only.
+/// Before using a Windows home, remove inherited access at its root and verify the whole tree.
+/// Existing explicit grants survive parent ACL changes, and protected child directories may not
+/// inherit at all: refuse those exceptions (and reparse points), including an unused .passphrase.
+/// Every accepted directory must pass owner-only access to future children. Unix is unchanged.
 fn restrict_home_on_windows(home: &std::path::Path) -> AnyResult<()> {
     #[cfg(windows)]
-    hestia::fsperm::restrict_dir(home)
+    hestia::fsperm::restrict_private_tree(home)
         .with_context(|| format!("restricting {} to its owner", home.display()))?;
     let _ = home;
     Ok(())
@@ -2369,12 +2368,7 @@ fn cmd_witness_confer(
         return Ok(());
     }
 
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
-    let path = vault_path(home);
-    if !path.exists() {
-        anyhow::bail!("no vault at {} — run `hestia init` first", path.display());
-    }
-    let vault = Vault::open(path, passphrase.clone())?;
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let state = hestia::server::ServerState::open(vault, home, &passphrase)?;
 
     match state.confer_citizenship(
@@ -2742,6 +2736,7 @@ fn open_vault_with_passphrase(home: &std::path::Path) -> AnyResult<(Vault, Strin
             path.display()
         );
     }
+    restrict_home_on_windows(home)?;
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
     let vault = Vault::open(path, passphrase.clone())?;
     Ok((vault, passphrase))

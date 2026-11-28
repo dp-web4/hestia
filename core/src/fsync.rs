@@ -6,8 +6,9 @@
 //!   read-only handle it fails with ACCESS_DENIED. Before this module the witness chain opened its
 //!   WAL read-only to fsync it, so on Windows the first sync at open failed, the chain poisoned
 //!   itself, and the daemon could not start.
-//! - A directory is not opened for flushing, and NTFS journals directory entries itself, so a
-//!   directory sync is a no-op there.
+//! - Directory sync is not implemented on Windows. The helper is a no-op there, so callers do not
+//!   get a post-create or post-rename persistence barrier. NTFS journaling alone does not establish
+//!   that a particular namespace change is durable when this helper returns.
 
 use std::fs::File;
 use std::io;
@@ -32,8 +33,9 @@ pub fn sync_file_data(path: &Path) -> io::Result<()> {
     open_for_sync(path)?.sync_data()
 }
 
-/// Make the entries of `dir` (a create or rename in it) durable: fsync the directory on Unix; a
-/// no-op on Windows, where NTFS journals directory metadata.
+/// On Unix, fsync `dir` to persist its entries after a create or rename. On Windows this is a no-op:
+/// success does not establish namespace durability, and a Windows publication protocol is still
+/// needed wherever surviving power loss is part of the caller's contract.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

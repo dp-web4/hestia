@@ -36,6 +36,14 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
     imp::restrict(path, true)
 }
 
+/// Prepare an existing Windows home before reading secrets or writing state. Reject reparse points
+/// before changing inheritance, restrict the root, then verify every existing entry. Explicit child
+/// grants and protected directories that cannot pass private access to new children are refused.
+#[cfg(windows)]
+pub fn restrict_private_tree(path: &Path) -> io::Result<()> {
+    imp::restrict_private_tree(path)
+}
+
 /// Create `path` (it must not exist), owner-only from the first byte, write `bytes`, and sync.
 pub fn write_private_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
@@ -46,7 +54,8 @@ pub fn write_private_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Whether only the owner can reach `path`. Unix: no group or other permission bits. Windows: the
 /// DACL (explicit and inherited ACEs alike) is present, non-empty, and every ACE in it is an allow
-/// ACE for the current user.
+/// ACE for the current user. The object's owner must also be this user, SYSTEM or Administrators;
+/// a foreign ordinary owner could otherwise grant itself access through its implicit WRITE_DAC.
 pub fn is_private(path: &Path) -> io::Result<bool> {
     imp::is_private(path)
 }
@@ -84,8 +93,9 @@ mod imp {
     use std::fs::File;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::FromRawHandle;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{
@@ -99,13 +109,14 @@ mod imp {
         AclSizeInformation, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
         GetTokenInformation, InitializeAcl,
-        InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
+        InitializeSecurityDescriptor, INHERIT_ONLY_ACE, IsWellKnownSid, NO_PROPAGATE_INHERIT_ACE,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
         SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+        CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
@@ -224,6 +235,65 @@ mod imp {
         Ok(())
     }
 
+    pub fn restrict_private_tree(path: &Path) -> io::Result<()> {
+        // Inspect first: SetNamedSecurityInfoW propagates inheritable ACEs, so a junction must be
+        // rejected before that call can affect a target outside the home. Do not follow links.
+        tree_entries(path)?;
+        restrict(path, true)?;
+        // Inspect again after propagation; do not validate only the names from the first scan.
+        for (entry, directory) in tree_entries(path)? {
+            let private = private_acl(&entry, directory).map_err(|e| {
+                io::Error::new(e.kind(), format!("checking permissions on {}: {e}", entry.display()))
+            })?;
+            if !private {
+                let why = if directory {
+                    "requires a trusted owner and owner-only access inheritable by files and directories"
+                } else {
+                    "requires a trusted owner and no access grants to other accounts"
+                };
+                return Err(not_private(&entry, why));
+            }
+        }
+        Ok(())
+    }
+
+    fn tree_entries(path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        let mut pending = vec![path.to_path_buf()];
+        let mut entries = Vec::new();
+        while let Some(entry) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&entry).map_err(|e| {
+                io::Error::new(e.kind(), format!("checking {}: {e}", entry.display()))
+            })?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(not_private(&entry, "reparse points are not supported in a private home"));
+            }
+            if entry.as_path() == path && !metadata.is_dir() {
+                return Err(not_private(&entry, "the home must be a directory"));
+            }
+            if metadata.is_dir() {
+                for child in std::fs::read_dir(&entry).map_err(|e| {
+                    io::Error::new(e.kind(), format!("listing {}: {e}", entry.display()))
+                })? {
+                    let child = child.map_err(|e| {
+                        io::Error::new(e.kind(), format!("listing {}: {e}", entry.display()))
+                    })?;
+                    pending.push(child.path());
+                }
+            } else if !metadata.is_file() {
+                return Err(not_private(&entry, "expected a regular file or directory"));
+            }
+            entries.push((entry, metadata.is_dir()));
+        }
+        Ok(entries)
+    }
+
+    fn not_private(path: &Path, why: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not owner-only: {why}", path.display()),
+        )
+    }
+
     pub fn create_private_new(path: &Path) -> io::Result<File> {
         let acl = OwnerAcl::new(false)?;
         let name = wide(path);
@@ -262,16 +332,21 @@ mod imp {
     }
 
     pub fn is_private(path: &Path) -> io::Result<bool> {
+        private_acl(path, false)
+    }
+
+    fn private_acl(path: &Path, require_inheritance: bool) -> io::Result<bool> {
         let user = CurrentUser::get()?;
         let name = wide(path);
         unsafe {
             let mut dacl: *mut ACL = ptr::null_mut();
+            let mut owner: *mut c_void = ptr::null_mut();
             let mut psd: PSECURITY_DESCRIPTOR = ptr::null_mut();
             let r = GetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
                 ptr::null_mut(),
@@ -281,6 +356,15 @@ mod imp {
                 return Err(io::Error::from_raw_os_error(r as i32));
             }
             let verdict = (|| -> io::Result<bool> {
+                // An ordinary foreign owner has implicit WRITE_DAC even with no ACE of its own.
+                // SYSTEM/Administrators remain within the documented privileged-admin exception.
+                if owner.is_null()
+                    || (EqualSid(owner, user.sid()) == 0
+                        && IsWellKnownSid(owner, WinLocalSystemSid) == 0
+                        && IsWellKnownSid(owner, WinBuiltinAdministratorsSid) == 0)
+                {
+                    return Ok(false);
+                }
                 // A NULL DACL grants everyone everything.
                 if dacl.is_null() {
                     return Ok(false);
@@ -298,6 +382,7 @@ mod imp {
                 if info.AceCount == 0 {
                     return Ok(false);
                 }
+                let mut inherits_full_access = false;
                 for i in 0..info.AceCount {
                     let mut ace: *mut c_void = ptr::null_mut();
                     check(GetAce(dacl, i, &mut ace))?;
@@ -310,8 +395,16 @@ mod imp {
                     if EqualSid(sid, user.sid()) == 0 {
                         return Ok(false);
                     }
+                    let flags = header.AceFlags as u32;
+                    let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+                    if flags & inherit == inherit
+                        && flags & (INHERIT_ONLY_ACE | NO_PROPAGATE_INHERIT_ACE) == 0
+                        && allowed.Mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
+                    {
+                        inherits_full_access = true;
+                    }
                 }
-                Ok(true)
+                Ok(!require_inheritance || inherits_full_access)
             })();
             LocalFree(psd as _);
             verdict
@@ -414,6 +507,108 @@ mod tests {
         }
         // Windows: a fresh file in the temp dir inherits the parent's DACL, which is not protected.
         assert!(!is_private(&p).unwrap());
+    }
+
+    #[cfg(windows)]
+    fn everyone_read(path: &Path, inheritable: bool) {
+        let grant = if inheritable { "*S-1-1-0:(OI)(CI)R" } else { "*S-1-1-0:R" };
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/grant", grant])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_preflight_removes_inherited_grants_from_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let nested = home.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        everyone_read(&home, true);
+        let file = nested.join("existing");
+        std::fs::write(&file, b"unchanged").unwrap();
+        assert!(!is_private(&file).unwrap());
+        restrict_private_tree(&home).unwrap();
+        assert!(is_private(&home).unwrap());
+        assert!(is_private(&nested).unwrap());
+        assert!(is_private(&file).unwrap());
+        assert_eq!(std::fs::read(&file).unwrap(), b"unchanged");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_preflight_refuses_an_explicit_grant_on_an_existing_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let key = home.join("operator.key");
+        std::fs::write(&key, b"unchanged").unwrap();
+        everyone_read(&key, false);
+        let error = restrict_private_tree(&home).unwrap_err().to_string();
+        assert!(error.contains("not owner-only") && error.contains("operator.key"), "{error}");
+        assert!(!is_private(&key).unwrap());
+        assert_eq!(std::fs::read(&key).unwrap(), b"unchanged");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_preflight_refuses_a_protected_directory_without_inheritance() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let keys = home.join("router-memberships");
+        std::fs::create_dir_all(&keys).unwrap();
+        // A private DACL on the directory itself is insufficient: new children would receive no
+        // owner-only ACE. Deliberately use the noninheritable file ACL on this directory.
+        restrict_file(&keys).unwrap();
+        assert!(is_private(&keys).unwrap());
+        let error = restrict_private_tree(&home).unwrap_err().to_string();
+        assert!(error.contains("not owner-only") && error.contains("router-memberships"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_accepted_protected_directory_keeps_future_descendants_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let keys = home.join("router-memberships");
+        std::fs::create_dir_all(&keys).unwrap();
+        restrict_dir(&keys).unwrap();
+        restrict_private_tree(&home).unwrap();
+        let nested = keys.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let key = nested.join("new.key");
+        std::fs::write(&key, b"secret").unwrap();
+        assert!(is_private(&nested).unwrap());
+        assert!(is_private(&key).unwrap());
+        restrict_private_tree(&home).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_preflight_refuses_a_junction_before_changing_the_home_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        everyone_read(&home, true);
+        everyone_read(&outside, true);
+        let link = home.join("junction");
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink: {}", String::from_utf8_lossy(&out.stderr));
+        let error = restrict_private_tree(&home).unwrap_err().to_string();
+        assert!(error.contains("reparse") && error.contains("junction"), "{error}");
+        assert!(!is_private(&home).unwrap(), "reparse refusal precedes inheritance changes");
+        assert!(!is_private(&outside).unwrap(), "the junction target's ACL is untouched");
+        std::fs::remove_dir(&link).unwrap();
     }
 
     #[test]

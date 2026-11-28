@@ -54,8 +54,15 @@ jobs:
         working-directory: hestia/core
         run: |
           cargo test --locked --lib fsperm -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "fsperm tests failed: $LASTEXITCODE" }
           cargo test --locked --lib fsync -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "fsync tests failed: $LASTEXITCODE" }
           cargo test --locked --bin hestia passphrase_file_tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "passphrase-file tests failed: $LASTEXITCODE" }
+
+      - name: existing secrets are private before use
+        working-directory: hestia/core
+        run: cargo test --locked --test windows_home_permissions -- --nocapture
 
       - name: init locks the home and the vault to this user
         working-directory: hestia/core
@@ -67,6 +74,7 @@ jobs:
           # Before: grant Everyone (by SID) read, so the test proves init REMOVES access, not that
           # the runner's temp dir happened to be private already.
           icacls $home342 /grant "*S-1-1-0:(OI)(CI)R" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "could not create the shared-home fixture: $LASTEXITCODE" }
           Set-Content -Path (Join-Path $home342 "preexisting.txt") -Value "made before init"
           Write-Host "--- before init"; icacls $home342
           .\target\debug\hestia.exe --home $home342 init --ai
