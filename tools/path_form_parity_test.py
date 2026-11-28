@@ -73,15 +73,34 @@ def test_the_host_dialect_is_never_git_bash():
     assert pf.host_dialect() in (pf.POSIX, pf.WINDOWS)
 
 
-if __name__ == "__main__":
+TESTS = [
+    test_every_canonical_case_holds,
+    test_every_same_and_within_case_holds,
+    test_every_refusal_code_is_exercised_and_matches_rust,
+    test_a_canonical_path_is_its_own_canonical_form,
+    test_the_host_dialect_is_never_git_bash,
+]
+
+
+def main() -> int:
+    defined = {k for k in globals() if k.startswith("test_")}
+    listed = {t.__name__ for t in TESTS}
+    if defined != listed:
+        # An explicit list can go stale; that is a red, not a silently smaller run.
+        print(f"FAIL TESTS is stale: defined-not-listed={sorted(defined - listed)} "
+              f"listed-not-defined={sorted(listed - defined)}")
+        return 1
     failed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"ok   {name}")
-            except AssertionError as e:
-                failed += 1
-                print(f"FAIL {name}: {e}")
+    for fn in TESTS:
+        try:
+            fn()
+            print(f"ok   {fn.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"FAIL {fn.__name__}: {e}")
     print("all passed" if not failed else f"{failed} failed")
-    sys.exit(1 if failed else 0)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
