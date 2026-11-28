@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Comment/quote desynchronization must fail closed before Bash hides a write (#485)."""
+import importlib.util
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+MODULE = pathlib.Path(os.environ.get("CLOSURE_MODULE") or
+                      ROOT / "plugins" / "_shared" / "hestia_governance_closure.py")
+spec = importlib.util.spec_from_file_location("closure_comment_quote", MODULE)
+g = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = g
+spec.loader.exec_module(g)
+
+HOOK = "pre_" + "tool_use.py"
+TARGET = f"plugins/kimi/hooks/{HOOK}"
+WRITE = f"printf x > {TARGET}"
+CASES = [
+    ("single_quote_comment", f"echo x # it's\n{WRITE}\necho done # '", 0),
+    ("double_quote_comment", f"echo x # say \"hi\n{WRITE}\n: \"", 2),
+    ("arithmetic_then_comment", f"echo $(( 1 )) # it's\n{WRITE}\n: '", 2),
+]
+
+
+def check(name, condition, detail=""):
+    if not condition:
+        raise AssertionError(f"{name}: {detail}")
+
+
+def classify(command, cwd):
+    return g.classify("Bash", {"command": command}, cwd=cwd, closure=g.LITERAL_FLOOR)
+
+
+def test_comment_quote_desync_is_fail_closed_and_matches_bash():
+    for name, command, expected_rc in CASES:
+        with tempfile.TemporaryDirectory(prefix=f"closure-comment-{name}-") as raw:
+            root = pathlib.Path(raw)
+            hook = root / TARGET
+            hook.parent.mkdir(parents=True)
+            hook.write_text("orig\n", encoding="utf-8")
+            verdict = classify(command, root)
+            result = subprocess.run(["bash", "-c", command], cwd=root,
+                                    capture_output=True, text=True, timeout=30)
+            check(f"{name}: bash wrote", hook.read_text(encoding="utf-8") == "x",
+                  f"rc={result.returncode} stderr={result.stderr!r}")
+            check(f"{name}: bash rc", result.returncode == expected_rc, result.returncode)
+            check(f"{name}: classifier fails closed",
+                  verdict.classification == "write" and verdict.rule == g.RULE_OUT_OF_GRAMMAR,
+                  str(verdict))
+
+
+def test_midword_hash_is_not_a_comment():
+    with tempfile.TemporaryDirectory(prefix="closure-comment-midword-") as raw:
+        root = pathlib.Path(raw)
+        hook = root / TARGET
+        hook.parent.mkdir(parents=True)
+        hook.write_text("orig\n", encoding="utf-8")
+        command = f"echo a#'b'\n{WRITE}"
+        verdict = classify(command, root)
+        result = subprocess.run(["bash", "-c", command], cwd=root,
+                                capture_output=True, text=True, timeout=30)
+        check("midword: bash wrote", hook.read_text(encoding="utf-8") == "x", result.stderr)
+        check("midword: classifier write", verdict.classification == "write", str(verdict))
+
+
+def test_ordinary_comments_and_quoted_hashes_stay_readable():
+    for command in (
+        f"echo # plain comment\ncat {TARGET}",
+        f"echo \"#x\"\ncat {TARGET}",
+        f"echo a#b\ncat {TARGET}",
+    ):
+        with tempfile.TemporaryDirectory(prefix="closure-comment-control-") as raw:
+            verdict = classify(command, raw)
+            check(f"control stays read: {command!r}", verdict.classification != "write", str(verdict))
+
+
+def test_fallback_cost_for_a_quoted_hash_is_explicit():
+    command = f"echo \"#x\" \"a\nb\"\ncat {TARGET}"
+    with tempfile.TemporaryDirectory(prefix="closure-comment-cost-") as raw:
+        verdict = classify(command, raw)
+        check("quoted-hash fallback cost is visible",
+              verdict.classification == "write" and verdict.rule == g.RULE_OUT_OF_GRAMMAR,
+              str(verdict))
+
+
+ALL = [
+    test_comment_quote_desync_is_fail_closed_and_matches_bash,
+    test_midword_hash_is_not_a_comment,
+    test_ordinary_comments_and_quoted_hashes_stay_readable,
+    test_fallback_cost_for_a_quoted_hash_is_explicit,
+]
+
+if __name__ == "__main__":
+    failed = []
+    for test in ALL:
+        try:
+            test()
+            print("PASS", test.__name__)
+        except AssertionError as error:
+            failed.append(test.__name__)
+            print("FAIL", test.__name__, "::", error)
+    if failed:
+        print(f"FAILURES: {failed}")
+        sys.exit(1)
+    print(f"OK — {len(ALL)} comment/quote tests")
