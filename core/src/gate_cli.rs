@@ -466,6 +466,19 @@ pub fn scope_escalate(endpoint: &str, as_member: &str, refusal_id: &str, reason:
     Ok(())
 }
 
+/// `hestia scope withdraw <request_id> --as <member> --reason '...'` — abandon this member's
+/// own still-pending request (#1297). The daemon checks the live session and writes the terminal
+/// withdrawal; it never grants reach.
+pub fn scope_withdraw(endpoint: &str, as_member: &str, request_id: &str, reason: &str) -> Result<()> {
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, as_member, "role:constellation:member")?;
+    banner(&who);
+    let r = m.tool("hestia_scope_withdraw", json!({"session_id": sid, "request_id": request_id,
+                                                   "reason": reason}))?;
+    println!("{}", serde_json::to_string_pretty(&r).context("encoding the withdrawal")?);
+    Ok(())
+}
+
 /// `hestia gate escalate` — the member's deliberate escalation of one governance-write refusal.
 pub fn gate_escalate(endpoint: &str, as_member: &str, role: &str, refusal_id: &str, reason: &str) -> Result<()> {
     let mut m = Mcp::connect(endpoint)?;
