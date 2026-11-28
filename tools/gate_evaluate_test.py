@@ -117,6 +117,8 @@ class _Stub(http.server.BaseHTTPRequestHandler):
                       "generation": 1, "snapshot_expires_at": int(time.time()) + 3600,
                       "caller_bound": (bool(who and who[0] == arguments.get("plugin_id"))
                                        and _Stub.fault != "unbound_scope")}
+            elif name == "hestia_request_witness":
+                sc = {"ok": True, "witnessEntryHash": "c" * 64}
             else:
                 sc = {"sessionId": "minted-by-a-real-connect", "ok": True} \
                     if name == "hestia_connect" else {"ok": True, "recorded": name}

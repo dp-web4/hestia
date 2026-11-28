@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""The RECORDED bar of a real escalation, opened by every seat's real gate on a real daemon.
+"""The RECORDED bar of a real escalation after every seat's real gate refuses a write.
 
 Why this exists. The seat-boundary suite asserts that a write to a member's gate entry is
 REFUSED, against a stub daemon whose escalation reply is canned, so it cannot see the price the
 daemon records. An escalation that opens at one approver where two factors were owed is refused
 just the same, and is weaker. This file runs each seat's real gate against an ISOLATED daemon,
-lets the daemon open the escalation for real, then reads the escalation back
+deliberately escalates the recorded refusal, then reads the real escalation back
 (`hestia://escalation/<id>`) and asserts the bar it recorded.
 
 It covers the spellings whose summary cannot carry the entry's location: a write relative to the
@@ -85,7 +85,15 @@ def read_escalation(url, esc_id):
     _, out = _post(url, {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
                          "params": {"uri": f"hestia://escalation/{esc_id}"}}, sid)
     contents = ((out or {}).get("result") or {}).get("contents") or []
-    return json.loads(contents[0]["text"]) if contents else {"_raw": out}
+    rec = json.loads(contents[0]["text"]) if contents else {"_raw": out}
+    _, opened = _post(url, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "hestia_query_history", "arguments": {"filter": {
+            "event_type": "gate_escalation_opened", "limit": 500}}}}, sid)
+    opened_content = ((opened or {}).get("result") or {}).get("content") or []
+    history = json.loads(opened_content[0]["text"]) if opened_content else {}
+    rec["_opened"] = next((e.get("eventData") or {} for e in history.get("entries") or []
+                           if (e.get("eventData") or {}).get("escalation_id") == esc_id), {})
+    return rec
 
 
 ESC_ID = re.compile(r"Escalation ([0-9a-f]{8,}) is open")
@@ -113,11 +121,13 @@ def escalate(url, member, refusal_id):
 
 def open_and_read(seat, home, event, label, shim_path=None):
     # A cold daemon (a debug build's first claims) can miss the gate's claim deadline: the gate
-    # then says OUTCOME UNKNOWN and that re-issuing the identical act is safe (it returns the
-    # same escalation). Re-issue, bounded; the refusal itself never depends on it.
+    # then says OUTCOME UNKNOWN and that re-issuing the identical act is safe. Its first
+    # witness can likewise miss the connect deadline before any claim: refusal_unwitnessed
+    # says so explicitly. Re-issue, bounded, to refresh the recorded refusal once the session
+    # is warm; only the deliberate escalate call below opens an escalation.
     for _attempt in range(3):
         v, text, _ = sb.run(seat, home, event, shim_path=shim_path)
-        if "OUTCOME UNKNOWN" not in text:
+        if "OUTCOME UNKNOWN" not in text and "refusal_unwitnessed" not in text:
             break
     check(f"{seat}-{label}-refused", v == "deny" and "gate.self_access" in text, text)
     # The deny opens nothing on its own: no "Escalation X is open" (a regression guard).
@@ -129,7 +139,15 @@ def open_and_read(seat, home, event, label, shim_path=None):
     opened = escalate(ENDPOINT, sb.SEATS[seat]["member"], r.group(1))
     esc_id = opened.get("escalation_id")
     check(f"{seat}-{label}-escalation-opened", esc_id, opened)
-    return read_escalation(ENDPOINT, esc_id) if esc_id else {}
+    rec = read_escalation(ENDPOINT, esc_id) if esc_id else {}
+    answers_deny = (rec.get("_opened") or {}).get("answers_deny") or ""
+    check(f"{seat}-{label}-answers-deny", re.fullmatch(r"[0-9a-f]{64}", answers_deny), rec)
+    # Every not_asked reissue refreshes the refusal's claim args. This fresh escalation
+    # therefore answers the final refusal even when the gate needed a bounded retry.
+    denial = re.search(r"DENY ([0-9a-f]{64}) — appeal", text)
+    check(f"{seat}-{label}-answers-deny-matches-refusal",
+          denial and answers_deny == denial.group(1), (text, rec))
+    return rec
 
 
 @reported
