@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 1a0dd14132a26e7f0e5a0467dfad958fe1d975837247a82a8016bc677cc6e8d0  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 9e757dc71988f7032082d6c478256906530f2198ab0446308b4da94f57f19a5a  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1118,7 +1118,8 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
             # cut a filename out (or withhold the whole command); these are carried
             # independently of it. An unenumerable write set is said as such, and priced highest.
-            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
+            resolved_targets=write_set[0], resolved_targets_complete=write_set[1],
+            refusal_rule=cv.rule)
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.
@@ -1320,9 +1321,14 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
             inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
         return None
 
-    notes, first_id = [], None
+    notes, first_id, refusals = [], None, []
     for t, verdict, detail, rid in answers:
         if verdict in ("approved", "in_force"):
+            continue
+        if verdict == "not_asked":
+            # dp, 2026-11-05: the gate asks nobody on the member's behalf. Say so, and name the
+            # deliberate door; the refusal id is not an escalation id (nothing is pending).
+            refusals.append((t, rid))
             continue
         if rid and first_id is None:
             first_id = rid
@@ -1345,6 +1351,14 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
         else:
             notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
                          f"hestia_request_scope (one path, with a reason).")
+    if refusals:
+        member = prof.member_id
+        door = "; ".join(f"'{t}': hestia scope escalate {rid} --as {member} --reason '...'"
+                         for t, rid in refusals)
+        notes.append("Nothing was sent to the operator or to any peer. If the work does not need "
+                     "this, nothing more is owed. If it does, escalate it as a deliberate act, "
+                     "saying what you are doing and why it needs the path: " + door
+                     + " (or hestia_scope_escalate with that refusal_id).")
     reason = v.reason + " " + " ".join(notes)
     return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
                         escalation_id=first_id)

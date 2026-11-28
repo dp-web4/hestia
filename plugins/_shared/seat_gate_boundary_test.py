@@ -770,9 +770,41 @@ def test_no_event_and_no_projection_are_refused_first():
     _each_seat(arm)
 
 
+def test_stated_detail_names_the_actual_refusal_rule_608():
+    def arm(seat, fx):
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            target = gate_file(fx, seat)
+            v, text, _ = run(seat, home, native(seat, "Write", {"file_path": target, "content": "x"}))
+            check(f"{seat}-denied", v == "deny", text)
+            claims = stub.args("hestia_gate_escalation_claim")
+            detail = claims and claims[0].get("detail", "")
+            check(f"{seat}-real-write-rule", "governance-closure-write" in detail, detail)
+            check(f"{seat}-not-auto-opened", "Auto-opened" not in detail, detail)
+            check(f"{seat}-deliberate-escalation",
+                  "Nothing is asked unless the member escalates" in detail, detail)
+
+            mark = len(stub.calls)
+            command = f"bash -c 'cat {target}'"
+            v2, text2, _ = run(seat, home, native(seat, "Bash", {"command": command}, n=2))
+            check(f"{seat}-read-loop-denied", v2 == "deny", text2)
+            followup = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
+            detail2 = followup and followup[0].get("detail", "")
+            check(f"{seat}-read-fp-rule", "governance-closure-out-of-grammar" in detail2, detail2)
+            check(f"{seat}-read-fp-not-asserted-a-write", "write" not in detail2, detail2)
+            check(f"{seat}-read-fp-not-auto-opened", "Auto-opened" not in detail2, detail2)
+            check(f"{seat}-read-fp-deliberate-escalation",
+                  "Nothing is asked unless the member escalates" in detail2, detail2)
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
 ALL = [
     test_gate_file_write_refused_before_the_daemon,
     test_gate_file_shell_write_refused,
+    test_stated_detail_names_the_actual_refusal_rule_608,
     test_every_declared_member_is_exercised_here,
     test_installed_gate_entry_witness_and_registration_refused,
     test_installed_entry_claim_carries_the_resolved_location,
