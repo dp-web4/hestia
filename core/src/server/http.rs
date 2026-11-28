@@ -10256,6 +10256,7 @@ mod disposition_tests {
     /// this filesystem it reaches the same file. The report under-claims; it never infers
     /// reach, and the "Path overlap" label says which relation it is.
     #[tokio::test]
+    #[cfg(unix)]
     async fn coverage_does_not_resolve_symlinks() {
         let (_dir, state) = test_state().await;
         register_member(&state, "hub-being").await;
@@ -12408,6 +12409,7 @@ mod disposition_tests {
     /// A failed vault commit leaves the chain holding the INTENT and no terminal record,
     /// and the store bit-identical — the record can never say reach changed when it did not.
     #[tokio::test]
+    #[cfg(unix)]
     async fn recursive_failed_commit_leaves_intent_only_and_store_untouched() {
         use std::os::unix::fs::PermissionsExt;
         let (dir, state) = test_state().await;
@@ -13514,6 +13516,7 @@ mod disposition_tests {
     /// Injected failure at the COMMIT stage: the chain holds the intent and no terminal
     /// record, and the store is byte-identical — both grants where they were.
     #[tokio::test]
+    #[cfg(unix)]
     async fn reassign_failed_commit_leaves_intent_only_and_store_untouched() {
         use std::os::unix::fs::PermissionsExt;
         let (dir, state) = test_state().await;

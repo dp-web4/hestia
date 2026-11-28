@@ -765,12 +765,11 @@ fn refuse_snapshot_alias(source: &Path, destination: &Path) -> Result<()> {
             Path::new(&side).display()
         );
     }
-    #[cfg(unix)]
-    if let Ok(dest_meta) = std::fs::metadata(&destination_real) {
-        use std::os::unix::fs::MetadataExt;
-        let src_meta = std::fs::metadata(&source_real)?;
+    // (dev, ino) on Unix, (volume serial, file index) on Windows: a hard link is caught on both
+    // (hestia #342; this check was Unix-only).
+    if destination_real.exists() {
         anyhow::ensure!(
-            (dest_meta.dev(), dest_meta.ino()) != (src_meta.dev(), src_meta.ino()),
+            !crate::fsperm::same_file(&destination_real, &source_real)?,
             "chain snapshot destination {} is a hard link to the source {}",
             destination.display(),
             source_real.display()

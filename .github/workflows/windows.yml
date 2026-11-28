@@ -1,0 +1,113 @@
+name: windows
+
+# hestia #342: the daemon on Windows, and the owner-only protection of its secrets checked on a real
+# Windows filesystem rather than inferred from code that compiles.
+#
+# Two jobs:
+#   permissions (gating): builds the `hestia` binary, runs the fsperm and passphrase-file tests, then
+#     runs `hestia init` into a home that someone else was first granted read on, and reads the ACLs
+#     back with PowerShell: the home and the vault must hold one rule, for this user, and the home must
+#     not inherit from its parent.
+#   full-suite (informational, continue-on-error): the whole `cargo test` on Windows, to learn what
+#     else assumes Unix (paths, symlinks, process groups). Its failures are a list to work through, not
+#     a gate, until it is green once.
+#
+# Same sibling layout as ci.yml: hestia/core has path dependencies into ../../web4.
+
+on:
+  pull_request:
+    paths:
+      - "core/**"
+      - "wire/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  permissions:
+    name: build + owner-only permissions
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hestia/core -> target
+
+      - name: build the daemon
+        working-directory: hestia/core
+        run: cargo build --locked --bin hestia
+
+      - name: fsperm and passphrase-file tests
+        working-directory: hestia/core
+        run: |
+          cargo test --locked --lib fsperm -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "fsperm tests failed: $LASTEXITCODE" }
+          cargo test --locked --lib fsync -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "fsync tests failed: $LASTEXITCODE" }
+          cargo test --locked --bin hestia passphrase_file_tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "passphrase-file tests failed: $LASTEXITCODE" }
+
+      - name: existing secrets are private before use
+        working-directory: hestia/core
+        run: cargo test --locked --test windows_home_permissions -- --nocapture
+
+      - name: init locks the home and the vault to this user
+        working-directory: hestia/core
+        env:
+          HESTIA_PASSPHRASE: ci-throwaway-342
+        run: |
+          $home342 = Join-Path $env:RUNNER_TEMP "hestia-home-342"
+          New-Item -ItemType Directory -Force -Path $home342 | Out-Null
+          # Before: grant Everyone (by SID) read, so the test proves init REMOVES access, not that
+          # the runner's temp dir happened to be private already.
+          icacls $home342 /grant "*S-1-1-0:(OI)(CI)R" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "could not create the shared-home fixture: $LASTEXITCODE" }
+          Set-Content -Path (Join-Path $home342 "preexisting.txt") -Value "made before init"
+          Write-Host "--- before init"; icacls $home342
+          .\target\debug\hestia.exe --home $home342 init --ai
+          if ($LASTEXITCODE -ne 0) { throw "hestia init failed: $LASTEXITCODE" }
+          $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          foreach ($p in @($home342, (Join-Path $home342 "vault.enc"), (Join-Path $home342 "preexisting.txt"))) {
+            Write-Host "--- after init: $p"; icacls $p
+            $acl = Get-Acl $p
+            $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            $others = @($rules | Where-Object { $_.IdentityReference.Value -ne $me })
+            if ($rules.Count -lt 1 -or $others.Count -gt 0) {
+              throw "$p is not owner-only: $($rules | ForEach-Object { $_.IdentityReference.Value + ' ' + $_.FileSystemRights })"
+            }
+          }
+          if (-not (Get-Acl $home342).AreAccessRulesProtected) { throw "the home still inherits from its parent" }
+          Write-Host "owner-only: home, vault.enc, and a file that existed before init"
+
+  full-suite:
+    name: full cargo test (informational)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hestia/core -> target
+      - name: cargo test (every target, no fail-fast)
+        working-directory: hestia/core
+        run: cargo test --locked --no-fail-fast

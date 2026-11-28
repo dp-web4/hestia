@@ -1740,7 +1740,6 @@ impl ServerState {
         if self.vault.policy().operator_access_bootstrapped() {
             return Ok(None); // window shut — no re-entry
         }
-        use std::os::unix::fs::PermissionsExt;
         let kp = web4_core::crypto::KeyPair::generate();
         let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
         // Self-contained credential the operator loads into their client: the
@@ -1768,14 +1767,18 @@ impl ServerState {
             "secret_key_hex": hex::encode(kp.secret_key_bytes()),
             "note": "genesis operator credential — load into your dashboard client to sign in; keep private; rotate to a hardware key when able",
         });
-        std::fs::write(
-            &key_path,
-            serde_json::to_vec_pretty(&cred).unwrap_or_default(),
-        )
-        .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
-        let mut perms = std::fs::metadata(&key_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&key_path, perms)?;
+        // PRIVATE FROM THE FIRST BYTE (hestia #342). This used to write the seed with the umask's
+        // mode and chmod it 0600 afterwards, so for a moment it was readable by other accounts, and on
+        // Windows the chmod did not compile at all. Now a sibling is created owner-only (0o600 /
+        // owner-only DACL), written, synced, and renamed over operator.key: a retried genesis still
+        // replaces a key left by an earlier attempt, as the plain write did.
+        let staged = self.home.join(format!(".operator.key.{}", uuid::Uuid::new_v4()));
+        crate::fsperm::write_private_new(&staged, &serde_json::to_vec_pretty(&cred).unwrap_or_default())
+            .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
+        if let Err(e) = std::fs::rename(&staged, &key_path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(anyhow::anyhow!("placing operator.key: {e}"));
+        }
 
         let mut policy = self.vault.policy().clone();
         policy.operator_access.push(crate::vault::OperatorIdentity {
@@ -3946,11 +3949,18 @@ mod tests {
         // valid {lct_id, secret_key_hex} the client can sign with
         let key = state.home.join("operator.key");
         assert!(key.exists());
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(crate::fsperm::is_private(&key).unwrap(), "operator.key is owner-only");
+        let staged: Vec<_> = std::fs::read_dir(&state.home)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".operator.key."))
+            .collect();
+        assert!(staged.is_empty(), "no staged operator key is left behind");
         let cred: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
         assert_eq!(cred["lct_id"], first.clone().unwrap());

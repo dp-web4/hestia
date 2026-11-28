@@ -930,6 +930,7 @@ dependencies = [
  "web4-hub-plugin",
  "web4-policy",
  "web4-trust-core",
+ "windows-sys 0.59.0",
  "x25519-dalek",
  "zeroize",
 ]

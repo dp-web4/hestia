@@ -105,3 +105,15 @@ chrono-tz = "0.10"
 
 # Private, exclusively created scratch dirs (chain-verify snapshot)
 tempfile = "3"
+
+# Owner-only files on Windows (fsperm.rs, hestia #342): a protected DACL for the current user, the
+# Windows equivalent of the 0o600/0o700 modes. Version already in Cargo.lock.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }

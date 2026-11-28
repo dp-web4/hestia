@@ -5,6 +5,9 @@
 //! These tests run the real binary against a throwaway vault: CLI commands must
 //! still stop at the human-presence prompt, and `serve` must still unlock.
 
+// Unix-only: process groups and SIGTTIN are how these tests keep the binary off a TTY (hestia #342).
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};

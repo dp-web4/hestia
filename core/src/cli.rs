@@ -1585,11 +1585,35 @@ fn resolve_home(cli: &Cli) -> AnyResult<PathBuf> {
     default_hestia_home().context("could not resolve hestia home directory")
 }
 
+/// Before using a Windows home, remove inherited access at its root and verify the whole tree.
+/// Existing explicit grants survive parent ACL changes, and protected child directories may not
+/// inherit at all: refuse those exceptions (and reparse points), including an unused .passphrase.
+/// Every accepted directory must pass owner-only access to future children. Unix is unchanged.
+fn restrict_home_on_windows(home: &std::path::Path) -> AnyResult<()> {
+    #[cfg(windows)]
+    hestia::fsperm::restrict_private_tree(home)
+        .with_context(|| format!("restricting {} to its owner", home.display()))?;
+    let _ = home;
+    Ok(())
+}
+
 /// Read `$HESTIA_HOME/.passphrase` without putting its value in the daemon environment.
 fn read_passphrase_file(home: &std::path::Path) -> AnyResult<Option<String>> {
     let path = home.join(".passphrase");
     if !path.exists() {
         return Ok(None);
+    }
+    // Windows: refuse a passphrase another account can read. After restrict_home_on_windows the file
+    // inherits owner-only, unless it carries its own explicit grant to someone else (hestia #342).
+    #[cfg(windows)]
+    if !hestia::fsperm::is_private(&path).with_context(|| format!("checking {}", path.display()))? {
+        anyhow::bail!(
+            "{} is readable by accounts other than this one; refusing to unlock the vault with it. \
+             Remove its extra permissions (icacls \"{}\" /reset, then restart) or delete it and \
+             use HESTIA_PASSPHRASE.",
+            path.display(),
+            path.display()
+        );
     }
     let pp = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?
@@ -1674,6 +1698,7 @@ fn prompt_secret() -> AnyResult<String> {
 
 fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
     std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
+    restrict_home_on_windows(home)?;
     let path = vault_path(home);
     if path.exists() && !force {
         anyhow::bail!(
@@ -1808,6 +1833,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
             path.display()
         );
     }
+    restrict_home_on_windows(home)?;
     let passphrase = serve_passphrase(home, "Vault passphrase: ")?;
     let vault = hestia::Vault::open(path, passphrase.clone())?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
@@ -2342,12 +2368,7 @@ fn cmd_witness_confer(
         return Ok(());
     }
 
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
-    let path = vault_path(home);
-    if !path.exists() {
-        anyhow::bail!("no vault at {} — run `hestia init` first", path.display());
-    }
-    let vault = Vault::open(path, passphrase.clone())?;
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let state = hestia::server::ServerState::open(vault, home, &passphrase)?;
 
     match state.confer_citizenship(
@@ -2715,6 +2736,7 @@ fn open_vault_with_passphrase(home: &std::path::Path) -> AnyResult<(Vault, Strin
             path.display()
         );
     }
+    restrict_home_on_windows(home)?;
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
     let vault = Vault::open(path, passphrase.clone())?;
     Ok((vault, passphrase))
@@ -3916,34 +3938,18 @@ fn write_new_router_channel_key(
     member_lct: uuid::Uuid,
     seed: &[u8; 32],
 ) -> AnyResult<String> {
-    use std::io::Write;
-
     let dir = home.join("router-memberships");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating router membership directory {}", dir.display()))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("securing router membership directory {}", dir.display()))?;
-    }
+    // Owner-only directory and key on every platform (hestia #342): 0o700/0o600 on Unix as before,
+    // an owner-only protected DACL on Windows, where these calls used to be skipped.
+    hestia::fsperm::restrict_dir(&dir)
+        .with_context(|| format!("securing router membership directory {}", dir.display()))?;
 
     let path = dir.join(format!("{member_lct}.key"));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts
-        .open(&path)
+    hestia::fsperm::write_private_new(&path, seed)
         .with_context(|| format!("creating dedicated router key {}", path.display()))?;
-    file.write_all(seed)
-        .with_context(|| format!("writing dedicated router key {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing dedicated router key {}", path.display()))?;
     #[cfg(unix)]
     {
         // The vault record written next makes this pathname authoritative.
@@ -4254,9 +4260,7 @@ fn write_public_evidence_atomic(path: &std::path::Path, bytes: &[u8]) -> AnyResu
     drop(file);
     std::fs::rename(&tmp, path)
         .with_context(|| format!("publishing router certificate {}", path.display()))?;
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    let _ = hestia::fsync::sync_dir(parent);
     Ok(())
 }
 
@@ -6781,11 +6785,18 @@ mod member_key_source_tests {
 
 #[cfg(test)]
 mod passphrase_file_tests {
-    use super::read_passphrase_file;
+    use super::{read_passphrase_file, restrict_home_on_windows};
+
+    /// A throwaway home, owner-only on Windows as `init`/`serve` leave it (a no-op on Unix).
+    fn home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        restrict_home_on_windows(dir.path()).unwrap();
+        dir
+    }
 
     #[test]
     fn a_missing_file_is_not_a_source_and_crlf_is_only_a_line_ending() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = home();
         assert_eq!(read_passphrase_file(dir.path()).unwrap(), None);
         std::fs::write(dir.path().join(".passphrase"), " value with spaces \r\n").unwrap();
         assert_eq!(
@@ -6796,10 +6807,28 @@ mod passphrase_file_tests {
 
     #[test]
     fn an_empty_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = home();
         std::fs::write(dir.path().join(".passphrase"), "\r\n").unwrap();
         let error = read_passphrase_file(dir.path()).unwrap_err().to_string();
         assert!(error.contains(".passphrase") && error.contains("empty"), "{error}");
+    }
+    /// Windows (hestia #342): a passphrase file someone else may read is refused, never used.
+    #[cfg(windows)]
+    #[test]
+    fn a_passphrase_readable_by_others_is_refused_on_windows() {
+        let dir = home();
+        let path = dir.path().join(".passphrase");
+        std::fs::write(&path, "pp\n").unwrap();
+        assert_eq!(read_passphrase_file(dir.path()).unwrap().as_deref(), Some("pp"));
+        // S-1-1-0 is Everyone, named by SID so the test does not depend on the system language.
+        let out = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:R"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls: {}", String::from_utf8_lossy(&out.stderr));
+        let error = read_passphrase_file(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("readable by accounts other than this one"), "{error}");
     }
 }
 

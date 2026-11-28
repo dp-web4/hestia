@@ -32,6 +32,9 @@
 //!   without its baseline), and an entity whose cache file is missing or set aside is loaded from
 //!   its baseline, then replayed from the epoch. A baseline that does not read fails startup
 //!   rather than serving fresh trust as a reconstruction (Codex P1, #1271 review 19164).
+//! These epoch/baseline publication guarantees currently require Unix directory fsync. Windows
+//! flushes file contents but has no post-rename persistence barrier, so the equivalent power-loss
+//! guarantee is not established there (see `write_durable`).
 //! Requests no longer wait on trust I/O at all: the fact they report is the chain row, which is
 //! durable before the reply (group commit).
 //!
@@ -338,8 +341,7 @@ impl TrustStore {
             let sealed = crypto::seal(&self.dk(), &json).context("sealing trust baseline")?;
             write_durable(&dir.join(name), &sealed)?;
         }
-        std::fs::File::open(&self.base_dir)
-            .and_then(|d| d.sync_all())
+        crate::fsync::sync_dir(&self.base_dir)
             .with_context(|| format!("syncing {}", self.base_dir.display()))
     }
 
@@ -537,8 +539,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// [`write_atomic`] made durable: the data, then the rename (the directory), are fsynced. For the
-/// write-once epoch only — the cache files stay unsynced by design.
+/// Flush the data before publication; on Unix, also fsync the directory after the rename. Windows
+/// currently has no post-rename persistence barrier (`fsync::sync_dir` is a no-op), so this does not
+/// establish power-loss durability of the filename there. For the write-once epoch only — the cache
+/// files stay unsynced by design.
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
@@ -548,8 +552,7 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
+        crate::fsync::sync_dir(dir)
             .with_context(|| format!("syncing {}", dir.display()))?;
     }
     Ok(())
