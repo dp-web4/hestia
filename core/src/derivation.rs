@@ -2,9 +2,9 @@
 //!
 //! The value proposition is AUDITABLE trust: every displayed score must be a
 //! pure function over witnessed evidence, with receipts (score → formula →
-//! chain pointers → acts). This module computes that function at READ TIME —
-//! nothing here is stored, so the derivation can improve and be recomputed
-//! over the same immutable events.
+//! chain pointers → acts). Derived dimensions are computed at READ TIME;
+//! `replay_outcomes` also rebuilds the stored execution scalar after a witnessed
+//! revision. Both are deterministic over the same immutable events.
 //!
 //! v1 scope (plan: private-context/plans/t3-from-v3-synthesis-2026-07-24.md):
 //! - **Adjudicated V3** (validity/veracity/valuation): read straight off the
@@ -56,6 +56,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::chain::ChainEntry;
 
@@ -257,19 +258,21 @@ fn ema_fold(scores: &[f64]) -> Option<f64> {
 /// A projection that silently omits a key does not fail; it derives a WRONG number and
 /// looks fine, so this list is load-bearing and belongs next to the code that reads it.
 pub const DERIVATION_KEYS: &[&str] = &[
-    "about_deny_hash", "alias", "alias_of", "answers_deny", "attempted", "axis", "data",
-    "decision", "deny_hash", "enforced", "escalation_id", "method", "plugin_id", "reason",
-    "ref", "requested_by", "role_lct", "score", "session_id", "status",
-    "subject_plugin_id", "subject_role", "success", "target", "tool_name", "upheld",
-    "verdict", "verdict_available",
+    "about_deny_hash", "action_id", "adjudicator", "alias", "alias_of", "answers_deny",
+    "attempted", "axis", "before_position", "charge", "charge_held_by", "class", "data",
+    "decision", "deny_hash", "enforced", "escalation_id", "magnitude", "member", "method",
+    "outcome_hash", "plugin_id", "reason", "ref", "requested_by", "role_lct", "row", "score",
+    "session_id", "status", "subject_plugin_id", "subject_role", "success", "target",
+    "tool_name", "upheld", "verdict", "verdict_available",
 ];
 
 /// Event types derivation folds. Lets the reader filter in SQL rather than scanning the
 /// whole window — `IDENTITY_ALIAS_EVENT` is included because `alias_target` and
 /// `aliased_identities` need it even though no dimension folds it.
 pub const DERIVATION_EVENT_TYPES: &[&str] = &[
-    "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
-    "gate_escalation_opened", "gate_escalation_withdrawn", "outcome", "policy_decision", "scope_attestation",
+    "adjudication", "amnesty", "appeal", "decision_charge_settled", "exoneration",
+    "exoneration_correction", "gate_escalation_decided", "gate_escalation_opened",
+    "gate_escalation_withdrawn", "outcome", "policy_decision", "refutation", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -281,8 +284,9 @@ pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
 /// not be crowded out of the window by another member's routine traffic — a trust level
 /// that depends on how busy your peers are is not a trust level.
 pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
-    "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
-    "gate_escalation_opened", "gate_escalation_withdrawn", "policy_decision", "scope_attestation",
+    "adjudication", "amnesty", "appeal", "decision_charge_settled", "exoneration",
+    "exoneration_correction", "gate_escalation_decided", "gate_escalation_opened",
+    "gate_escalation_withdrawn", "policy_decision", "refutation", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -510,6 +514,142 @@ pub(crate) fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEnt
     ids
 }
 
+fn nested_event_data(e: &ChainEntry) -> &Value {
+    e.event_data.get("data").unwrap_or(&e.event_data)
+}
+
+fn sovereign_amnesty(e: &ChainEntry) -> bool {
+    e.event_type == "amnesty"
+        && e.event_data.pointer("/declared_by/operator").and_then(Value::as_bool) == Some(true)
+}
+
+/// Replay one grain's outcome history in chain order, honoring witnessed exclusions.
+///
+/// The chain remains immutable: independently witnessed exonerations and refutations withdraw
+/// specific rows, and a sovereign amnesty withdraws its named deny class before a position.
+/// Decision charges use the same `ChargeSpec` shape as live projection, including warn charges,
+/// evidence-only `charge_held_by` rows, and separately settled charges.
+pub fn replay_outcomes(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -> Vec<(bool, f64)> {
+    let mut entries: Vec<&ChainEntry> = window.iter().collect();
+    entries.sort_by_key(|e| e.chain_position);
+    let identities = aliased_identities(plugin_id, &entries);
+    let is_member = |p: Option<&str>| p.is_some_and(|p| identities.iter().any(|id| id == p));
+    let on_grain = |plugin: Option<&str>, role: Option<&str>| {
+        is_member(plugin) && role.map_or(true, |role| role == role_lct)
+    };
+    let independent = |e: &ChainEntry| {
+        e.event_data.pointer("/declared_by/operator").and_then(Value::as_bool) == Some(true)
+            || e.event_data
+                .get("requested_by")
+                .and_then(|who| who.get("plugin_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|reporter| !identities.iter().any(|id| id == reporter))
+    };
+
+    let mut exonerated: HashSet<&str> = HashSet::new();
+    let mut refuted_successes: HashSet<&str> = HashSet::new();
+    for e in &entries {
+        if !independent(e) {
+            continue;
+        }
+        match e.event_type.as_str() {
+            "exoneration" | "exoneration_correction" => {
+                if let Some(hash) = nested_event_data(e).get("deny_hash").and_then(Value::as_str) {
+                    exonerated.insert(hash);
+                }
+            }
+            "refutation" => {
+                if let Some(hash) = nested_event_data(e).get("outcome_hash").and_then(Value::as_str) {
+                    refuted_successes.insert(hash);
+                }
+            }
+            _ => {}
+        }
+    }
+    let amnesty_before = entries
+        .iter()
+        .filter(|e| sovereign_amnesty(e))
+        .filter_map(|e| {
+            let data = nested_event_data(e);
+            (data.get("class").and_then(Value::as_str) == Some("deny"))
+                .then(|| data.get("before_position").and_then(Value::as_u64))
+                .flatten()
+        })
+        .max();
+    let deny_positions: HashMap<&str, u64> = entries
+        .iter()
+        .filter(|e| {
+            e.event_type == "policy_decision" && entry_str(e, "decision") == Some("deny")
+        })
+        .map(|e| (e.hash.as_str(), e.chain_position))
+        .collect();
+
+    entries
+        .into_iter()
+        .filter_map(|e| match e.event_type.as_str() {
+            "outcome" => {
+                if !on_grain(entry_str(e, "plugin_id"), entry_str(e, "role_lct")) {
+                    return None;
+                }
+                let success = e.event_data.get("success").and_then(Value::as_bool).unwrap_or(false);
+                if success && refuted_successes.contains(e.hash.as_str()) {
+                    return None;
+                }
+                let magnitude = e.event_data.get("magnitude").and_then(Value::as_f64).unwrap_or(0.5);
+                Some((success, magnitude))
+            }
+            "policy_decision" => {
+                if !on_grain(entry_str(e, "plugin_id"), entry_str(e, "role_lct"))
+                    || e.event_data.get("enforced").and_then(Value::as_bool) == Some(false)
+                    || has_no_verdict_entry(e)
+                    || e.event_data.get("charge_held_by").is_some()
+                {
+                    return None;
+                }
+                let deny = entry_str(e, "decision") == Some("deny");
+                if deny
+                    && (exonerated.contains(e.hash.as_str())
+                        || amnesty_before.is_some_and(|before| e.chain_position < before))
+                {
+                    return None;
+                }
+                let has_action = e.event_data.get("action_id").and_then(Value::as_str).is_some();
+                if !has_action && entry_str(e, "adjudicator").is_none() {
+                    return None;
+                }
+                let charge = crate::server::decision_witness::ChargeSpec::from_row(&e.event_data)?;
+                Some((false, charge.magnitude))
+            }
+            "decision_charge_settled" => {
+                let charge = crate::server::decision_witness::ChargeSpec::from_settle(
+                    e.event_data.get("charge")?,
+                )?;
+                if !on_grain(entry_str(e, "member"), Some(&charge.role_lct)) {
+                    return None;
+                }
+                let original = entry_str(e, "row")?;
+                if exonerated.contains(original)
+                    || amnesty_before.is_some_and(|before| {
+                        deny_positions.get(original).is_some_and(|pos| *pos < before)
+                    })
+                {
+                    return None;
+                }
+                Some((false, charge.magnitude))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A deny that carried no verdict is infrastructure evidence, never member conduct.
+fn has_no_verdict_entry(e: &ChainEntry) -> bool {
+    if e.event_data.get("verdict_available").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    entry_str(e, "reason")
+        .is_some_and(|r| r.contains("no policy verdict") || r.contains("daemon path failed"))
+}
 
 /// Specific-enough tokens from a command to say two commands touch the same thing.
 ///
@@ -646,14 +786,6 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
     // Structural, not operator-driven: no exoneration needs filing, because there was never
     // conduct to exonerate. Matched on the explicit flag going forward, and on the gate's
     // stable marker text for entries already on the chain.
-    let has_no_verdict = |e: &ChainEntry| -> bool {
-        if e.event_data.get("verdict_available").and_then(Value::as_bool) == Some(false) {
-            return true;
-        }
-        entry_str(e, "reason").is_some_and(|r| {
-            r.contains("no policy verdict") || r.contains("daemon path failed")
-        })
-    };
     let denies: Vec<&&ChainEntry> = entries
         .iter()
         .filter(|e| {
@@ -662,7 +794,7 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
                 && e.event_data.get("enforced").and_then(Value::as_bool) != Some(false)
                 && is_grain(e)
                 && !is_probe(e)
-                && !has_no_verdict(e)
+                && !has_no_verdict_entry(e)
         })
         .collect();
     // Rehab/repair mechanics (dp 2026-07-24: "when it's infrastructure fault
@@ -678,14 +810,14 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
     //   conduct (e.g. "all denies before gate-fix X"). Society-law scale.
     let exonerated: std::collections::HashMap<&str, &ChainEntry> = entries
         .iter()
-        .filter(|e| e.event_type == "exoneration")
+        .filter(|e| matches!(e.event_type.as_str(), "exoneration" | "exoneration_correction"))
         .filter(|e| {
             // not-the-subject: an actor cannot exonerate its own denies.
             e.event_data
                 .get("requested_by")
                 .and_then(|w| w.get("plugin_id"))
                 .and_then(Value::as_str)
-                .is_some_and(|p| p != plugin_id)
+                .is_some_and(|p| !identities.iter().any(|id| id == p))
         })
         .filter_map(|e| {
             e.event_data
@@ -697,7 +829,7 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         .collect();
     let amnesty_before: Option<(u64, &ChainEntry)> = entries
         .iter()
-        .filter(|e| e.event_type == "amnesty")
+        .filter(|e| sovereign_amnesty(e))
         .filter_map(|e| {
             let d = e.event_data.get("data").unwrap_or(&e.event_data);
             if d.get("class").and_then(Value::as_str) != Some("deny") {
@@ -1883,6 +2015,73 @@ mod tests {
     }
 
     #[test]
+    fn replay_preserves_alias_role_and_live_charge_rules() {
+        let role = "role:constellation:member";
+        let charge = json!({"magnitude":0.5,"conduct":false,"role_lct":role,"tool_name":"Bash",
+                            "rule_id":"r","reason":"gate:deny (peer)"});
+        let mut window = vec![
+            entry(1, 0, "outcome", json!({"plugin_id":"kimi-code","role_lct":role,"success":true,"magnitude":0.8})),
+            entry(2, 0, "outcome", json!({"plugin_id":"kimi-cli","role_lct":role,"success":true,"magnitude":0.6})),
+            entry(3, 0, "outcome", json!({"plugin_id":"kimi-code","role_lct":"role:constellation:reviewer","success":true})),
+            entry(4, 0, "outcome", json!({"plugin_id":"codex","role_lct":role,"success":true})),
+            entry(5, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,"decision":"deny","action_id":"a","verdict_available":false})),
+            entry(6, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,"decision":"deny"})),
+            entry(7, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,"decision":"deny","adjudicator":"peer"})),
+            entry(8, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,"decision":"warn","action_id":"b"})),
+            entry(9, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,"decision":"deny","action_id":"c","charge_held_by":"hash-7"})),
+            entry(10, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,"decision":"deny","action_id":"d"})),
+            entry(11, 0, "decision_charge_settled", json!({"member":"kimi-cli","row":"hash-6","charge":charge})),
+            entry(12, 0, IDENTITY_ALIAS_EVENT, json!({"alias":"kimi-cli","alias_of":"kimi-code"})),
+        ];
+        window.reverse();
+        assert_eq!(
+            replay_outcomes("kimi-code", role, &window),
+            vec![(true, 0.8), (true, 0.6), (false, 0.5), (false, 0.2), (false, 0.5), (false, 0.5)]
+        );
+    }
+
+    #[test]
+    fn replay_honors_nested_revisions_without_erasing_failure_or_self_exonerating() {
+        let role = "role:constellation:member";
+        let deny = |pos| {
+            entry(pos, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,
+                "decision":"deny","action_id":format!("a-{pos}")}))
+        };
+        let charge = json!({"magnitude":0.5,"conduct":false,"role_lct":role,"tool_name":"Bash",
+                            "rule_id":"r","reason":"gate:deny (peer)"});
+        let window = vec![
+            entry(1, 0, "outcome", json!({"plugin_id":"kimi-code","role_lct":role,"success":true})),
+            entry(2, 0, "outcome", json!({"plugin_id":"kimi-code","role_lct":role,"success":false,"magnitude":0.4})),
+            deny(3), deny(4), deny(5),
+            entry(6, 0, "exoneration_correction", json!({"requested_by":{"plugin_id":"codex"},"data":{"deny_hash":"hash-3"}})),
+            entry(7, 0, "exoneration", json!({"requested_by":{"plugin_id":"kimi-code"},"data":{"deny_hash":"hash-4"}})),
+            entry(8, 0, "refutation", json!({"requested_by":{"plugin_id":"codex"},"data":{"outcome_hash":"hash-1"}})),
+            entry(9, 0, "refutation", json!({"requested_by":{"plugin_id":"codex"},"data":{"outcome_hash":"hash-2"}})),
+            entry(10, 0, "amnesty", json!({"declared_by":{"operator":true},"data":{"class":"deny","before_position":4}})),
+            entry(11, 0, "decision_charge_settled", json!({"member":"kimi-code","row":"hash-5","charge":charge})),
+            entry(12, 0, "exoneration", json!({"requested_by":{"plugin_id":"codex"},"data":{"deny_hash":"hash-5"}})),
+        ];
+        assert_eq!(
+            replay_outcomes("kimi-code", role, &window),
+            vec![(false, 0.4), (false, 0.5)],
+            "only the failure and deny #4 remain; refuting failure cannot improve the scalar, \
+             self-exoneration is inert, and withdrawing #5 also withdraws its settled charge"
+        );
+    }
+
+    #[test]
+    fn replay_requires_sovereign_amnesty() {
+        let role = "role:constellation:member";
+        let deny = entry(1, 0, "policy_decision", json!({"plugin_id":"kimi-code","role_lct":role,
+            "decision":"deny","action_id":"a"}));
+        let forged = entry(2, 0, "amnesty", json!({"data":{"class":"deny","before_position":2}}));
+        assert_eq!(replay_outcomes("kimi-code", role, &[deny.clone(), forged]), vec![(false, 0.5)]);
+        let sovereign = entry(3, 0, "amnesty", json!({"declared_by":{"operator":true},
+            "data":{"class":"deny","before_position":2}}));
+        assert!(replay_outcomes("kimi-code", role, &[deny, sovereign]).is_empty());
+    }
+
+    #[test]
     fn unmeasured_grain_is_unmeasured_never_low() {
         // THE footgun (dp 2026-07-24): a grain with zero derived evidence must
         // say "unmeasured", never inherit a low/high verdict from anywhere.
@@ -2134,7 +2333,8 @@ mod tests {
             "exclusion carries its evidence");
         // Sovereign amnesty: all denies before #3 excluded.
         let am = entry(12, 2, "amnesty", json!({
-            "data": {"class":"deny","before_position":3,"reason":"gate-bug era","ref":"hestia@192c896"}}));
+            "data": {"class":"deny","before_position":3,"reason":"gate-bug era","ref":"hestia@192c896"},
+            "declared_by": {"operator": true}}));
         let w2 = vec![deny(1), deny(2), deny(3), am];
         let d2 = derive("kimi-code", role, &w2);
         assert_eq!(d2.temperament.observations, 1, "only deny #3 remains conduct");

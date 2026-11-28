@@ -13,7 +13,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -2416,7 +2416,8 @@ impl ServerState {
         Ok(RetirementCommit { standing, live, delegations })
     }
 
-    /// Append a chain entry under the sovereign LCT.
+    /// Append a chain entry under the sovereign LCT. A law-enabled revision also rebuilds its
+    /// affected trust grains and appends one `trust_recomputed` receipt per changed grain.
     pub fn append_chain(
         &self,
         event_type: &str,
@@ -2426,10 +2427,35 @@ impl ServerState {
         if self.chain_fault_on.contains(event_type) {
             anyhow::bail!("injected chain fault on {event_type} (test seam)");
         }
-        super::state_lock::time_section("chain.append", || {
+        let entry = super::state_lock::time_section("chain.append", || {
             self.chain_store
                 .append(event_type, event_data, &self.sovereign_lct)
-        })
+        })?;
+        match self.recompute_trust_revision(&entry) {
+            Ok(recomputed) => {
+                for change in recomputed {
+                    let receipt = serde_json::json!({
+                        "trigger": entry.event_type,
+                        "trigger_entry": entry.hash,
+                        "subject_plugin_id": change.subject_plugin_id,
+                        "subject_role": change.subject_role,
+                        "replayed_outcomes": change.replayed_outcomes,
+                        "actions_before": change.before.action_count,
+                        "actions_after": change.after.action_count,
+                        "basis": "full chain-prefix replay through the trigger, honoring witnessed exclusions",
+                    });
+                    if let Err(e) = self.append_chain("trust_recomputed", receipt) {
+                        tracing::warn!("trust recompute receipt after {} failed: {e:#}", entry.event_type);
+                    }
+                }
+            }
+            Err(e) => {
+                // The revision is already durable. A cache projection failure must not tell the
+                // caller that its witnessed act did not commit; startup replay retries the rebuild.
+                tracing::warn!("trust recompute after {} failed: {e:#}", entry.event_type);
+            }
+        }
+        Ok(entry)
     }
 
     pub fn append_chain_once(
@@ -2777,6 +2803,103 @@ impl ServerState {
         self.apply_change(&key, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
     }
 
+    fn trust_revision_window(&self, through: u64) -> Result<Vec<ChainEntry>> {
+        let mut window = Vec::new();
+        let mut from = 0;
+        loop {
+            let rows = self.chain_store.read_from(from, 2_000)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                if row.chain_position > through {
+                    return Ok(window);
+                }
+                from = row.chain_position + 1;
+                if matches!(
+                    row.event_type.as_str(),
+                    "outcome"
+                        | "policy_decision"
+                        | "decision_charge_settled"
+                        | "identity_alias"
+                        | "exoneration"
+                        | "exoneration_correction"
+                        | "amnesty"
+                        | "refutation"
+                ) {
+                    window.push(row);
+                }
+            }
+        }
+        Ok(window)
+    }
+
+    fn recompute_trust_revision(&self, revision: &ChainEntry) -> Result<Vec<TrustRecomputation>> {
+        if !self
+            .vault
+            .policy()
+            .revision_events
+            .iter()
+            .any(|event| event == &revision.event_type)
+        {
+            return Ok(Vec::new());
+        }
+        let window = self.trust_revision_window(revision.chain_position)?;
+        let data = revision.event_data.get("data").unwrap_or(&revision.event_data);
+        let string = |key: &str| data.get(key).and_then(serde_json::Value::as_str);
+        let mut subjects = BTreeSet::new();
+        if let Some(plugin_id) = string("subject_plugin_id").or_else(|| string("plugin_id")) {
+            let role = string("subject_role")
+                .or_else(|| string("role_lct"))
+                .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+            subjects.insert((plugin_id.to_string(), role.to_string()));
+        } else if revision.event_type == "amnesty"
+            && revision.event_data.pointer("/declared_by/operator").and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            let before = data.get("before_position").and_then(serde_json::Value::as_u64);
+            if data.get("class").and_then(serde_json::Value::as_str) == Some("deny") {
+                for entry in &window {
+                    if entry.event_type != "policy_decision"
+                        || entry.event_data.get("decision").and_then(serde_json::Value::as_str) != Some("deny")
+                        || before.map_or(true, |before| entry.chain_position >= before)
+                    {
+                        continue;
+                    }
+                    if let Some(plugin_id) = entry.event_data.get("plugin_id").and_then(serde_json::Value::as_str) {
+                        let role = entry
+                            .event_data
+                            .get("role_lct")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+                        subjects.insert((plugin_id.to_string(), role.to_string()));
+                    }
+                }
+            }
+        }
+
+        let mut recomputed = Vec::new();
+        for (plugin_id, role) in subjects {
+            let plugin_id = crate::derivation::alias_target(&plugin_id, &window).unwrap_or(plugin_id);
+            let outcomes = crate::derivation::replay_outcomes(&plugin_id, &role, &window);
+            let key = self.trust_entity_key(&plugin_id, &role);
+            if let Some((before, after)) = self.trust_store.rebuild_from_outcomes(
+                &key,
+                &outcomes,
+                crate::storage::trust::RowAt { pos: revision.chain_position, ts: revision.timestamp },
+            )? {
+                recomputed.push(TrustRecomputation {
+                    subject_plugin_id: plugin_id,
+                    subject_role: role,
+                    replayed_outcomes: outcomes.len(),
+                    before,
+                    after,
+                });
+            }
+        }
+        Ok(recomputed)
+    }
+
     /// TRUST IS A PROJECTION OF THE CHAIN (#1271): re-apply every trust-affecting row from
     /// position `from`, through the same functions the live writes use. Idempotent per entity
     /// (`through`), so it is safe over rows the cache already holds. Returns rows applied.
@@ -2798,8 +2921,9 @@ impl ServerState {
         Ok(applied)
     }
 
-    /// The trust change one chain row carries, derived from the row's content alone — the same
-    /// rule every live write path follows. `true` if the row carries one.
+    /// The trust change one chain row carries. Ordinary rows use their own content; a revision
+    /// row replays its eligible prefix. Both are the same rules the live write paths follow.
+    /// `true` if the row carries a change.
     fn project_trust_row(&self, r: &ChainEntry) -> Result<bool> {
         use crate::reputation::{DeltaClass, RepContext};
         let d = &r.event_data;
@@ -2906,7 +3030,7 @@ impl ServerState {
                 self.apply_judgment_ctx(&plugin, false, magnitude, &ctx, Some(r))?;
                 Ok(true)
             }
-            _ => Ok(false),
+            _ => Ok(!self.recompute_trust_revision(r)?.is_empty()),
         }
     }
 
@@ -3039,6 +3163,14 @@ impl super::state_lock::Publish for ServerState {
             }
         }
     }
+}
+
+struct TrustRecomputation {
+    subject_plugin_id: String,
+    subject_role: String,
+    replayed_outcomes: usize,
+    before: EntityTrust,
+    after: EntityTrust,
 }
 
 /// One trust change, as a chain row carries it.
@@ -3228,6 +3360,61 @@ mod tests {
         let v = state.chain_store.verify_chain().unwrap();
         assert_eq!((v.legacy_unsigned, v.signed_valid), (state.chain_store.len().unwrap(), 0));
         assert!(v.link_intact() && v.signatures_authentic(), "{v:?}");
+    }
+
+    #[test]
+    fn sovereign_amnesty_recomputes_every_affected_grain() {
+        let (_dir, state) = make_state();
+        let role = crate::reputation::DEFAULT_CONSTELLATION_ROLE;
+        for member in ["kimi-code", "codex"] {
+            let deny = state.append_chain("policy_decision", serde_json::json!({
+                "plugin_id": member, "instance_lct": state.member_lct(member), "role_lct": role,
+                "decision": "deny", "adjudicator": "peer", "enforced": true
+            })).unwrap();
+            let updated = state.apply_outcome_ctx(member, false, 0.5, &ctx_for(role), Some(&deny)).unwrap();
+            let read_back = state.trust_for_role(member, role);
+            assert_eq!(read_back.entity_id, updated.entity_id, "the fixture reads the projected grain");
+            assert_eq!(read_back.action_count, 1);
+        }
+
+        let before = state.chain_len();
+        state.append_chain("amnesty", serde_json::json!({
+            "data": {"class":"deny","before_position":before,"reason":"gate fault","ref":"fix"},
+            "declared_by": {"operator":true}
+        })).unwrap();
+        assert_eq!(state.trust_for_role("kimi-code", role).action_count, 0);
+        assert_eq!(state.trust_for_role("codex", role).action_count, 0);
+        let receipts: Vec<_> = state.recent_chain(10).into_iter()
+            .filter(|entry| entry.event_type == "trust_recomputed")
+            .collect();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.iter().all(|entry| entry.event_data["actions_before"] == 1));
+        assert!(receipts.iter().all(|entry| entry.event_data["actions_after"] == 0));
+    }
+
+    #[test]
+    fn a_lost_cache_replays_refutation_without_resurrecting_success() {
+        let (dir, state) = make_state();
+        let role = crate::reputation::DEFAULT_CONSTELLATION_ROLE;
+        let outcome = state.append_chain("outcome", serde_json::json!({
+            "plugin_id":"kimi-code","instance_lct":state.member_lct("kimi-code"),
+            "role_lct":role,"success":true,"magnitude":0.8
+        })).unwrap();
+        state.apply_outcome_ctx("kimi-code", true, 0.8, &ctx_for(role), Some(&outcome)).unwrap();
+        assert_eq!(state.trust_for_role("kimi-code", role).action_count, 1);
+        state.append_chain("refutation", serde_json::json!({
+            "requested_by":{"plugin_id":"codex"},
+            "data":{"subject_plugin_id":"kimi-code","subject_role":role,"outcome_hash":outcome.hash}
+        })).unwrap();
+        assert_eq!(state.trust_for_role("kimi-code", role).action_count, 0);
+        let chain_len = state.chain_len();
+        drop(state);
+
+        std::fs::remove_dir_all(dir.path().join("trust")).unwrap();
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let reopened = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert_eq!(reopened.trust_for_role("kimi-code", role).action_count, 0);
+        assert_eq!(reopened.chain_len(), chain_len, "projection must not mint new receipts");
     }
 
     fn ctx_for(role: &'static str) -> crate::reputation::RepContext<'static> {

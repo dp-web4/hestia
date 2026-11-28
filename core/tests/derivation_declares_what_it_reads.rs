@@ -54,22 +54,318 @@ fn event_types_read_by_the_fold() -> BTreeSet<String> {
         .next()
         .expect("split always yields one element");
 
-    // The extractor understands `x.event_type == LIT`, `!=`, and an optional `.as_str()`.
-    // `matches!(e.event_type.as_str(), "a" | "b")` would parse as "no comparison" and be
-    // skipped, so refuse to run rather than under-read. Same for any other method chain
-    // between the field and the operator (see `unresolved` below).
-    for (i, line) in prod.lines().enumerate() {
-        assert!(
-            !(line.contains("event_type") && line.contains("matches!")),
-            "derivation.rs:{} dispatches on event_type through `matches!`, which this \
-             extractor does not parse. Teach it that form before trusting this guard: an \
-             unparsed dispatch site is a scorer this test claims to cover and does not.",
-            i + 1
-        );
-    }
+    let (names, unresolved) = extract(prod);
 
+    assert!(
+        unresolved.is_empty(),
+        "the extractor found event_type dispatch sites it cannot resolve to a name: \
+         {unresolved:?}. Resolve them here — a skipped dispatch site makes both assertions \
+         below vacuously weaker in the direction that hides a dead scorer."
+    );
+
+    // Positive control on the extractor itself. If the parse silently stops working — a
+    // refactor to a helper, a rename — the difference sets go empty and BOTH tests below
+    // pass while covering nothing. `policy_decision` is the fold's densest input
+    // (temperament reads it at four sites); if it is absent, the extractor is broken, not
+    // the code under test.
+    assert!(
+        names.contains("policy_decision"),
+        "extractor recovered {} names and none of them is `policy_decision` — the parse is \
+         broken, so an empty diff below would mean nothing. Names found: {names:?}",
+        names.len()
+    );
+
+    names
+}
+
+// ---------------------------------------------------------------------------------------
+// The extractor. It understands three dispatch forms, and each form it meets but cannot
+// resolve to a set of names is reported in `unresolved` rather than skipped:
+//
+//   1. `x.event_type == LIT`, `!=`, with an optional `.as_str()`;
+//   2. `matches!(x.event_type.as_str(), "a" | "b")`;
+//   3. `match x.event_type.as_str() { "a" | "b" => .., "c" => .., _ => .. }`.
+//
+// Forms 2 and 3 arrived with the revision-event fold (#689 stage 1). Before that, form 2
+// was refused outright and form 3 was SILENTLY skipped — the scrutinee has no `==`, so the
+// comparison scan read it as "not a dispatch". A `match` arm is exactly as much a read of
+// that name as a comparison is.
+//
+// What it still cannot see: a dispatch that never names `event_type` at the site (a helper
+// that takes the string), and set-membership forms such as `[..].contains(&x.event_type)`.
+// Neither exists in derivation.rs today.
+// ---------------------------------------------------------------------------------------
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// If a comment, string literal or char literal starts at `i`, the index just past it.
+/// A lone `'` (a lifetime or a label) is stepped over as one byte.
+fn skip_non_code(b: &[u8], i: usize) -> Option<usize> {
+    let rest = &b[i..];
+    if rest.starts_with(b"//") {
+        return Some(i + rest.iter().position(|c| *c == b'\n').unwrap_or(rest.len()));
+    }
+    if rest.starts_with(b"/*") {
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"*/")
+            .expect("block comment in source is terminated");
+        return Some(i + end + 2);
+    }
+    if rest[0] == b'"' {
+        let mut j = i + 1;
+        loop {
+            match b.get(j) {
+                None => panic!("string literal opened at byte {i} is not terminated"),
+                Some(b'\\') => j += 2,
+                Some(b'"') => return Some(j + 1),
+                Some(_) => j += 1,
+            }
+        }
+    }
+    if rest[0] == b'r' && (i == 0 || !is_ident_byte(b[i - 1])) {
+        let hashes = rest[1..].iter().take_while(|c| **c == b'#').count();
+        if rest.get(1 + hashes) == Some(&b'"') {
+            let mut j = i + 2 + hashes;
+            loop {
+                assert!(j < b.len(), "raw string opened at byte {i} is not terminated");
+                if b[j] == b'"'
+                    && b.len() >= j + 1 + hashes
+                    && b[j + 1..j + 1 + hashes].iter().all(|c| *c == b'#')
+                {
+                    return Some(j + 1 + hashes);
+                }
+                j += 1;
+            }
+        }
+    }
+    if rest[0] == b'\'' {
+        if rest.get(1) == Some(&b'\\') {
+            let close = rest[3..]
+                .iter()
+                .position(|c| *c == b'\'')
+                .expect("escaped char literal in source is terminated");
+            return Some(i + 3 + close + 1);
+        }
+        let width = match rest.get(1) {
+            Some(c) if *c >= 0xF0 => 4,
+            Some(c) if *c >= 0xE0 => 3,
+            Some(c) if *c >= 0xC0 => 2,
+            _ => 1,
+        };
+        if rest.get(1 + width) == Some(&b'\'') {
+            return Some(i + 2 + width);
+        }
+        return Some(i + 1);
+    }
+    None
+}
+
+/// The index just past the delimiter that closes the `(`, `[` or `{` at `open`.
+fn close_of(b: &[u8], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        if let Some(j) = skip_non_code(b, i) {
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("delimiter opened at byte {open} is never closed");
+}
+
+/// First occurrence of `needle` in `b[from..to]` that sits outside every nested delimiter,
+/// comment and literal.
+fn find_top_level(b: &[u8], from: usize, to: usize, needle: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < to {
+        if let Some(j) = skip_non_code(b, i) {
+            i = j;
+            continue;
+        }
+        if depth == 0 && b[i..to].starts_with(needle) {
+            return Some(i);
+        }
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `None`: the expression is not about `event_type`. `Some(true)`: it is exactly
+/// `<path>.event_type` or `<path>.event_type.as_str()`. `Some(false)`: it mentions
+/// `event_type` through something else (`.to_lowercase()`, a call, a tuple), so the arms
+/// cannot be read as event-type names.
+fn event_type_scrutinee(expr: &str) -> Option<bool> {
+    let expr = expr.trim();
+    if !expr.contains("event_type") {
+        return None;
+    }
+    let core = expr.strip_suffix(".as_str()").unwrap_or(expr);
+    let core = core.trim_start_matches(['&', '*']);
+    Some(
+        core.ends_with(".event_type")
+            && core.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.'),
+    )
+}
+
+/// Resolve one pattern (`"a" | "b"`) to names. Anything that is not a string literal or a
+/// known constant — a binding, a guard, a range — is unresolved. `_` is accepted only as a
+/// `match` arm, where it names nothing; in `matches!` it would match every event type.
+fn pattern_names(
+    pat: &str,
+    wildcard_ok: bool,
+    names: &mut BTreeSet<String>,
+    unresolved: &mut Vec<String>,
+) {
+    for alt in pat.split('|') {
+        let alt = alt.trim();
+        if alt == "_" && wildcard_ok {
+            continue;
+        }
+        let literal = alt
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .filter(|s| !s.contains('"') && !s.contains('\\'));
+        match (literal, alt) {
+            (Some(lit), _) => {
+                names.insert(lit.to_string());
+            }
+            (None, "IDENTITY_ALIAS_EVENT") => {
+                names.insert(IDENTITY_ALIAS_EVENT.to_string());
+            }
+            (None, other) => unresolved.push(format!("<pattern `{other}`>")),
+        }
+    }
+}
+
+/// Read every arm pattern of the `match` block whose `{` is at `open`.
+fn match_arm_names(
+    src: &str,
+    open: usize,
+    names: &mut BTreeSet<String>,
+    unresolved: &mut Vec<String>,
+) {
+    let b = src.as_bytes();
+    let end = close_of(b, open) - 1;
+    let mut i = open + 1;
+    loop {
+        loop {
+            while i < end && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < end && (b[i..].starts_with(b"//") || b[i..].starts_with(b"/*")) {
+                i = skip_non_code(b, i).expect("a comment starts here");
+            } else {
+                break;
+            }
+        }
+        if i >= end {
+            break;
+        }
+        let Some(arrow) = find_top_level(b, i, end, b"=>") else {
+            unresolved.push("<match arm without `=>`>".to_string());
+            break;
+        };
+        pattern_names(&src[i..arrow], true, names, unresolved);
+        i = arrow + 2;
+        while i < end && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < end && b[i] == b'{' {
+            i = close_of(b, i);
+            while i < end && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < end && b[i] == b',' {
+                i += 1;
+            }
+        } else {
+            i = find_top_level(b, i, end, b",").map_or(end, |c| c + 1);
+        }
+    }
+}
+
+/// Forms 2 and 3: `matches!(..)` and `match .. { .. }` whose scrutinee is the event type.
+fn extract_match_forms(prod: &str, names: &mut BTreeSet<String>, unresolved: &mut Vec<String>) {
+    let b = prod.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_non_code(b, i) {
+            i = j;
+            continue;
+        }
+        let at_word_start = i == 0 || !is_ident_byte(b[i - 1]);
+        if at_word_start && b[i..].starts_with(b"matches!(") {
+            let open = i + "matches!".len();
+            let (lo, hi) = (open + 1, close_of(b, open) - 1);
+            match find_top_level(b, lo, hi, b",") {
+                Some(comma) => match event_type_scrutinee(&prod[lo..comma]) {
+                    None => {}
+                    Some(false) => unresolved
+                        .push(format!("<matches! scrutinee `{}`>", prod[lo..comma].trim())),
+                    Some(true) => {
+                        let pat = prod[comma + 1..hi].trim().trim_end_matches(',');
+                        pattern_names(pat, false, names, unresolved);
+                    }
+                },
+                None => {
+                    if prod[lo..hi].contains("event_type") {
+                        unresolved.push(format!("<matches! `{}`>", prod[lo..hi].trim()));
+                    }
+                }
+            }
+            i = open + 1;
+            continue;
+        }
+        if at_word_start
+            && b[i..].starts_with(b"match")
+            && b.get(i + 5).is_some_and(|c| c.is_ascii_whitespace())
+        {
+            let from = i + 5;
+            if let Some(open) = find_top_level(b, from, b.len(), b"{") {
+                match event_type_scrutinee(&prod[from..open]) {
+                    None => {}
+                    Some(false) => unresolved
+                        .push(format!("<match scrutinee `{}`>", prod[from..open].trim())),
+                    Some(true) => match_arm_names(prod, open, names, unresolved),
+                }
+            }
+            i = from;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Every event type the given source dispatches on, and every dispatch site that could not
+/// be resolved to names.
+fn extract(prod: &str) -> (BTreeSet<String>, Vec<String>) {
     let mut names = BTreeSet::new();
     let mut unresolved: Vec<String> = Vec::new();
+
+    extract_match_forms(prod, &mut names, &mut unresolved);
+
+    // Form 1: `x.event_type == LIT`, `!=`, and an optional `.as_str()`. Any other method
+    // chain between the field and the operator is unresolved (see below).
     let mut rest = prod;
     while let Some(i) = rest.find("event_type") {
         rest = &rest[i + "event_type".len()..];
@@ -123,26 +419,102 @@ fn event_types_read_by_the_fold() -> BTreeSet<String> {
         }
     }
 
-    assert!(
-        unresolved.is_empty(),
-        "the extractor found event_type comparisons it cannot resolve to a name: {unresolved:?}. \
-         Resolve them here — a skipped dispatch site makes both assertions below vacuously \
-         weaker in the direction that hides a dead scorer."
-    );
+    (names, unresolved)
+}
 
-    // Positive control on the extractor itself. If the parse silently stops working — a
-    // refactor to a helper, a rename — the difference sets go empty and BOTH tests below
-    // pass while covering nothing. `policy_decision` is the fold's densest input
-    // (temperament reads it at four sites); if it is absent, the extractor is broken, not
-    // the code under test.
-    assert!(
-        names.contains("policy_decision"),
-        "extractor recovered {} names and none of them is `policy_decision` — the parse is \
-         broken, so an empty diff below would mean nothing. Names found: {names:?}",
-        names.len()
-    );
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|s| (*s).to_string()).collect()
+}
 
-    names
+/// The extractor against source it has never seen: all three forms, with the things that
+/// break a naive brace counter (a `}` in a string, a nested block, a char literal, a
+/// comment) inside the arm bodies.
+#[test]
+fn the_extractor_reads_comparisons_matches_and_match_arms() {
+    let src = r##"
+        fn f(e: &E) -> Option<u8> {
+            if e.event_type == "cmp_a" || e.event_type.as_str() != "cmp_b" { return None; }
+            let hit = matches!(e.event_type.as_str(), "mac_a" | "mac_b");
+            let alias = matches!(&e.event_type, IDENTITY_ALIAS_EVENT);
+            match e.event_type.as_str() {
+                // a comment with a brace } and an arrow =>
+                "arm_a" | "arm_b" => {
+                    if hit { log("} => \"not_a_name\""); }
+                    let c = '}';
+                    Some(1)
+                }
+                "arm_c" => inner(|| { 2 }),
+                "arm_d" => match e.kind { "not_an_event_type" => Some(3), _ => None },
+                _ => None,
+            }
+        }
+    "##;
+    let (names, unresolved) = extract(src);
+    assert!(unresolved.is_empty(), "unresolved: {unresolved:?}");
+    assert_eq!(
+        names,
+        set(&[
+            "cmp_a", "cmp_b", "mac_a", "mac_b", IDENTITY_ALIAS_EVENT, "arm_a", "arm_b", "arm_c",
+            "arm_d",
+        ])
+    );
+}
+
+/// The other half of the contract: a dispatch the extractor cannot turn into names is
+/// REPORTED. Each line below is one way a scorer could read an event type that this guard
+/// would otherwise claim to cover and not cover.
+#[test]
+fn the_extractor_reports_every_dispatch_it_cannot_resolve() {
+    let cases = [
+        // a binding arm reads every event type
+        r#"match e.event_type.as_str() { other => score(other) }"#,
+        // a guard: the name is read only sometimes
+        r#"match e.event_type.as_str() { "a" if strict => 1, _ => 0 }"#,
+        // the scrutinee is transformed, so the arms are not event-type names
+        r#"match e.event_type.to_lowercase().as_str() { "a" => 1, _ => 0 }"#,
+        r#"match (e.event_type.as_str(), e.ok) { ("a", true) => 1, _ => 0 }"#,
+        // matches! with a guard, a wildcard, a constant this file does not know
+        r#"matches!(e.event_type.as_str(), "a" if strict)"#,
+        r#"matches!(e.event_type.as_str(), _)"#,
+        r#"matches!(e.event_type.as_str(), SOME_OTHER_CONST)"#,
+        r#"matches!(e.event_type.trim(), "a")"#,
+        // the comparison form's own refusals, unchanged
+        r#"e.event_type.to_lowercase() == "a""#,
+        r#"e.event_type == SOME_OTHER_CONST"#,
+    ];
+    for case in cases {
+        let (names, unresolved) = extract(case);
+        assert!(
+            !unresolved.is_empty(),
+            "`{case}` was read as fully resolved (names {names:?}); it must be reported"
+        );
+    }
+}
+
+/// A red control for the guard itself: remove one dispatch form from the source and the
+/// name it carried must drop out of the read set. Run against the real file, so this fails
+/// if a refactor leaves the extractor reading nothing through `match` or `matches!`.
+#[test]
+fn the_match_forms_carry_names_the_comparison_form_does_not() {
+    let prod = SRC
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields one element");
+    let (all, _) = extract(prod);
+    let mut by_match = BTreeSet::new();
+    let mut ignored = Vec::new();
+    extract_match_forms(prod, &mut by_match, &mut ignored);
+    assert!(
+        by_match.is_subset(&all),
+        "match-form names must be part of the read set: {by_match:?} vs {all:?}"
+    );
+    // If derivation.rs stops using these forms, this test has nothing to say and should be
+    // deleted with them — it must not go quietly green.
+    assert!(
+        !by_match.is_empty(),
+        "derivation.rs no longer dispatches on event_type through `match` or `matches!`; \
+         delete this test (and, if nothing else uses them, the match-form parser)."
+    );
 }
 
 fn declared() -> BTreeSet<String> {
