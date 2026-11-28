@@ -71,7 +71,8 @@ fn assert_refused(home: &Path, args: &[&str], offending: &Path, reason: &str) {
 fn existing_explicit_secret_grants_are_refused_by_serve_and_cli() {
     for relative in ["vault.enc", "operator.key", ".passphrase", "router-memberships/member.key"] {
         let home = existing_home();
-        let secret = home.path().join(relative);
+        // Match the native spelling returned by read_dir in the refusal diagnostic.
+        let secret = relative.split('/').fold(home.path().to_path_buf(), |path, part| path.join(part));
         std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
         if relative != "vault.enc" {
             std::fs::write(&secret, b"existing secret must remain unchanged").unwrap();
