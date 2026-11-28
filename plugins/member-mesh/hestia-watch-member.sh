@@ -1052,20 +1052,16 @@ STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 # role, which is why the accident worked; it is still only an accident, because
 # `role` is caller-supplied and any member that loses `HESTIA_ROLE` collides with
 # it silently. Do NOT build a detector on this field alone (see the note on the
-# `#undelivered:` marker at `report_unreachable`) — the durable fix is a reserved
-# KIND for a non-delivery report, which is vocabulary work in KINDS.md. Still
-# owed as of 2026-09-05: the report moved from `reply` to `forum-note` that day
-# (see branch 4 below), which stops it being booked as the sender's debt but
-# does NOT make it reserved — `forum-note` is an ordinary member kind, so it is
-# no more a detector than `reply` was.
+# `#undelivered:` marker at `report_unreachable`) — #758 now reserves
+# `delivery-status` for these reports. Legacy `reply` and `forum-note` rows remain readable
+# as legacy artifacts; the new kind is not peer speech and never enters response debt.
 #
-# `plugin_id` is still the member's: the watcher genuinely acts on that member's
-# mailbox, and a distinct gateway identity is a daemon-side enrolment question.
-# Role is the one grain the watcher can correct today, from its own side.
+# `plugin_id` is `watch-<member>` on this path, distinct from the watched member. The daemon
+# binds it to the exact original destination; role remains the separate mesh-worker grain.
 WATCH_ROLE="${HESTIA_WATCH_ROLE:-role:constellation:mesh-worker}"
 
 mesh_rpc() {
-python3 - "$PLUGIN" "$HOST_AGENT" "$EP" "$1" "${2:-}" "$WATCH_ROLE" <<'PY'
+python3 - "${MESH_RPC_PLUGIN:-$PLUGIN}" "$HOST_AGENT" "$EP" "$1" "${2:-}" "$WATCH_ROLE" <<'PY'
 import json, sys, urllib.request
 plugin, host_agent, ep, tool, extra = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 watch_role = sys.argv[6]
@@ -1190,7 +1186,7 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # "delivered, unanswered" for mail the member never saw (41 fires / 3 dead /
 # all reported success).
 #
-# THE REPORT RIDES `forum-note`, AND UNTIL 2026-09-05 IT RODE `reply`. That was
+# THE REPORT NOW RIDES `delivery-status`; LEGACY ROWS RODE `forum-note` AND `reply`. That was
 # a deliberate choice with a stated reason, reversed here on measurement rather
 # than on taste, so the reason is kept rather than deleted:
 #
@@ -1234,9 +1230,8 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # 2026-07-26): the daemon derives the instance LCT from plugin_id alone and
 # drops `instance_name` on connect, so on the chain an unreachable report is
 # indistinguishable from the member itself having replied — the router forging
-# the destination's source address, not ICMP. The real fix (a gateway identity
-# distinct from the member's) is daemon vocabulary and its own thread; the
-# honest-today fix is the one field the watcher fully controls: the pointer
+# the destination's source address, not ICMP. #758 makes the producer the distinct
+# `watch-<destination>` gateway and keeps the original destination in the pointer:
 # fragment names the OBSERVER as well as the verdict,
 # `#undelivered:fire-rc=3;via=watch-$PLUGIN`. The binding is legal because the
 # notice was addressed to this plugin. Two ICMP-style suppressions: never
@@ -1926,19 +1921,16 @@ for n in d.get("notices",[]):
     # remove. The reserved region is the whole fragment, observer included.
     frag=f"#undelivered:{why};via={via}".encode()[:512]
     p=p.encode()[:512-len(frag)].decode(errors="ignore")+frag.decode(errors="ignore")
-    # `forum-note`, NOT `reply` — see the branch-4 block above. The kind must
-    # stay OUT of handler.rs's MEMBER_KINDS_AWAIT_RESPONSE, which is what makes
-    # a non-delivery report an announcement rather than a debt booked against
-    # the member whose mail died. The binding is kept: `in_reply_to` is what
-    # names WHICH notice failed, and it is legal on every kind.
-    print(json.dumps({"to_plugin_id":sender,"kind":"forum-note",
+    # Reserved gateway vocabulary: exact-notice binding with no peer-response semantics.
+    # `delivery-status` stays OUT of MEMBER_KINDS_AWAIT_RESPONSE and is not a disposition.
+    print(json.dumps({"to_plugin_id":sender,"kind":"delivery-status",
                       "pointer_uri":p,"in_reply_to":nid}))
 PY
 ) || ROWS=""
   [ -n "$ROWS" ] || return 0
   while IFS= read -r ARGS; do
     [ -n "$ARGS" ] || continue
-    if OUT=$(mesh_rpc hestia_member_notify "$ARGS" 2>/dev/null) \
+    if OUT=$(MESH_RPC_PLUGIN="watch-$PLUGIN" mesh_rpc hestia_member_notify "$ARGS" 2>/dev/null) \
        && printf '%s' "$OUT" | grep -q '"queued_id"' \
        && ! printf '%s' "$OUT" | grep -q '_hestia_error'; then
       # CBP review §5: the report of an unreachable can itself be unreachable —

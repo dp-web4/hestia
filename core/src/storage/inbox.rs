@@ -120,6 +120,14 @@ pub(crate) fn is_disposition_kind(kind: &str) -> bool {
         .any(|d| kind == *d || kind.starts_with(&format!("{d}.")))
 }
 
+pub(crate) fn is_delivery_status_kind(kind: &str) -> bool {
+    kind == "delivery-status" || kind.starts_with("delivery-status.")
+}
+
+pub(crate) fn delivery_gateway_id(addressee: &str) -> String {
+    format!("watch-{}", addressee.replace('/', "--"))
+}
+
 impl SqliteInboxStore {
     /// Open or create the SQLCipher-encrypted inbox. `key` is the stable
     /// storage key (see [`crate::storage::storage_key`]) — the same key that
@@ -1224,10 +1232,13 @@ impl SqliteInboxStore {
                 .optional()
                 .context("resolving in_reply_to addressee")?;
             if let Some(addressee) = addressee {
+                let gateway_bound = is_delivery_status_kind(kind)
+                    && from_plugin == delivery_gateway_id(&addressee);
                 anyhow::ensure!(
-                    addressee == from_plugin,
+                    addressee == from_plugin || gateway_bound,
                     "notice {rid} was addressed to '{addressee}', not to '{from_plugin}' — \
-                     a member can only answer its own mail"
+                     a member can only answer its own mail, and delivery-status requires \
+                     the exact watch-<destination> gateway"
                 );
                 // #1115: the addressee side of the same binding. A disposition
                 // (`reply`/`ack`/`review_done`, fractally) DISCHARGES the notice it
@@ -2194,7 +2205,9 @@ impl SqliteInboxStore {
     /// watcher announced it never arrived. The only structural discriminator
     /// today is the pointer fragment `#undelivered:` (the report borrows the
     /// member's identity — Defect 2/3 of the same thread — so sender and role
-    /// cannot separate it). A report ABOUT a notice is not a response TO it.
+    /// cannot separate it). Reserved `delivery-status` reports are now excluded by kind;
+    /// legacy `reply` reports still use the pointer fragment. A report ABOUT a notice is
+    /// not a response TO it.
     pub fn member_unanswered(
         &self,
         plugin: &str,
@@ -2218,7 +2231,7 @@ impl SqliteInboxStore {
         //
         // `substr(...) = ? || '.'`, NOT `LIKE ? || '.%'`, and the difference is not
         // style. `_` is a single-character WILDCARD in SQL LIKE, and four of the
-        // seven roots contain one — `LIKE 'review_request.%'` also matches
+        // eight roots contain one — `LIKE 'review_request.%'` also matches
         // `reviewXrequest.pr`, a kind the send gate refuses. The obvious spelling
         // would have made the ledger LOOSER than the gate in exactly the direction
         // that lets a refused kind be counted. `substr`/`length` has no wildcard
@@ -2240,6 +2253,11 @@ impl SqliteInboxStore {
                AND ({placeholders})
                AND NOT EXISTS (SELECT 1 FROM member_notices r
                                WHERE r.in_reply_to = n.id
+                                 -- #758: reserved gateway evidence is never a peer answer,
+                                 -- whether or not the legacy pointer fragment is present.
+                                 AND r.kind <> 'delivery-status'
+                                 AND substr(r.kind, 1, length('delivery-status') + 1)
+                                     <> 'delivery-status.'
                                  AND (r.pointer_uri IS NULL
                                       OR r.pointer_uri NOT LIKE '%#undelivered:%')
                                  -- #1115: a response discharges the debt only when it is
@@ -5096,6 +5114,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delivery_gateway_ids_are_distinct_and_routable() {
+        assert_eq!(delivery_gateway_id("kimi-code"), "watch-kimi-code");
+        assert_eq!(delivery_gateway_id("thor/kimi-code"), "watch-thor--kimi-code");
+        assert_ne!(delivery_gateway_id("thor-kimi-code"), delivery_gateway_id("thor/kimi-code"));
+        assert!(!delivery_gateway_id("thor/kimi-code").contains('/'));
+        assert!(is_delivery_status_kind("delivery-status"));
+        assert!(is_delivery_status_kind("delivery-status.retry"));
+        assert!(!is_delivery_status_kind("delivery-statusX"));
+    }
+
     /// ACCEPTANCE TEST for F1 (CBP 2026-08-03, notice 699 thread: "the
     /// undelivered report discharges the notice it reports on"). RED before the
     /// `NOT LIKE '%#undelivered:%'` predicate landed.
@@ -5112,11 +5141,10 @@ mod tests {
     /// the false report still cleared the row. The alarm silenced the
     /// instrument it exists to feed.
     ///
-    /// The marker is the pointer fragment `#undelivered:` — today the ONLY
-    /// structural difference between the report and a genuine reply, since the
-    /// report borrows the member's identity (Defect 2/3 in the same thread:
-    /// watcher connects as the member, no role). A genuine reply must still
-    /// clear; the report must not.
+    /// Legacy `reply` reports are excluded by the pointer fragment `#undelivered:`.
+    /// Reserved `delivery-status` reports are excluded by kind instead, so missing or
+    /// altered pointer text cannot turn them into peer answers. A genuine reply must
+    /// still clear; a non-delivery report must not.
     #[test]
     fn an_undelivered_report_does_not_discharge_the_notice_it_reports() {
         let (_tmp, store) = fresh();
@@ -5162,6 +5190,24 @@ mod tests {
                 .unwrap().is_empty(),
             "a genuine reply still discharges the notice"
         );
+    }
+
+    #[test]
+    fn delivery_status_without_legacy_fragment_never_discharges_the_original() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        store
+            .enqueue_member("claude-code", "watch-kimi-code", "role:constellation:mesh-worker",
+                            "delivery-status", Some("pr/1#transport-failure"), "h2", Some(asked))
+            .unwrap();
+        let owed = store
+            .member_unanswered("claude-code", &["review_request"], -1)
+            .unwrap();
+        assert_eq!(owed.len(), 1, "reserved status is never a peer answer, even with no legacy marker");
+        assert_eq!(owed[0].id, asked);
     }
 
     /// ACCEPTANCE TEST for the git-manager increment (CBP 2026-07-28, re: notice 305;
