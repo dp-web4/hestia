@@ -4,9 +4,9 @@
 Registration is execution truth. Consumers must not rediscover it from convention
 paths or grow harness-specific parsers beside one another.
 
-This first increment extracts the read side only. It does not install, compare,
-monitor, or mutate anything. `deploy/install-members.sh`, `fleet_manifest.py`, and
-the daemon monitor can consume this contract in later increments.
+The resolver only reports facts; it does not install, compare, monitor, or mutate
+anything. `deploy/install-members.sh` and `fleet_manifest.py` consume this contract;
+the daemon monitor and law/deploy bootstrap remain later consumers.
 
 Machine result states are deliberately not collapsed:
 
@@ -25,6 +25,7 @@ as exhaustive.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -58,11 +59,19 @@ def _result(state: str, **extra: Any) -> dict[str, Any]:
     return {"state": state, **extra}
 
 
+def _command_with_args(command: str, args: Any) -> str:
+    if args is None:
+        return command
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise ValueError("command args must be a list of strings")
+    return " ".join([command, *(shlex.quote(arg) for arg in args)])
+
+
 def _commands_from_json(obj: Any, out: list[tuple[str | None, str]], event: str | None = None) -> None:
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "command" and isinstance(v, str):
-                out.append((event, v))
+                out.append((event, _command_with_args(v, obj.get("args"))))
             else:
                 next_event = k if event is None and k != "hooks" else event
                 _commands_from_json(v, out, next_event)
@@ -71,19 +80,90 @@ def _commands_from_json(obj: Any, out: list[tuple[str | None, str]], event: str 
             _commands_from_json(v, out, event)
 
 
+def _toml_array_end(text: str) -> int | None:
+    depth = 0
+    quote = None
+    escaped = False
+    for index, char in enumerate(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _toml_args(lines: list[str], index: int) -> tuple[list[str], int]:
+    fragments = [lines[index]]
+    while True:
+        candidate = "\n".join(fragments).split("=", 1)[1].strip()
+        end = _toml_array_end(candidate)
+        if end is not None:
+            trailing = candidate[end + 1:].strip()
+            if trailing and not trailing.startswith("#"):
+                raise ValueError("unexpected text after command args")
+            try:
+                parsed = ast.literal_eval(candidate[:end + 1])
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError("unparseable command args") from exc
+            if not isinstance(parsed, list) or not all(isinstance(arg, str) for arg in parsed):
+                raise ValueError("command args must be a list of strings")
+            return parsed, index + 1
+        index += 1
+        if index >= len(lines):
+            raise ValueError("unterminated command args")
+        fragments.append(lines[index])
+
+
 def _commands_from_toml_text(text: str) -> list[tuple[str | None, str]]:
-    """Read event and command assignments used by Codex/Kimi registrations.
+    """Read event, command and argument assignments used by Codex/Kimi registrations.
 
     This deliberately remains dependency-free rather than requiring Python 3.11's
     tomllib on operator hosts. A line that purports to declare `command = ...` but
     cannot be read by the supported quoted-string grammar is UNPARSEABLE, never
     silently ignored.
+
+    `command` and `args` are keys of ONE table, in either order (TOML key order is
+    not significant). They are collected per table and flushed at the next table
+    header or EOF, so `args` can never attach to a command from another table.
     """
     out: list[tuple[str | None, str]] = []
     event = None
-    for raw in text.splitlines():
+    # The current table's own command/args; None means "not assigned here".
+    command: str | None = None
+    args: list[str] | None = None
+
+    def flush() -> None:
+        nonlocal command, args
+        if args is not None and command is None:
+            raise ValueError("command args have no command in their table")
+        if command is not None:
+            out.append((event, _command_with_args(command, args)))
+        command = None
+        args = None
+
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        index += 1
+        if re.match(r"^\s*\[[^\[\]]+\]\s*(?:#.*)?$", raw):
+            # A standard `[table]` header also ends the previous table.
+            flush()
+            continue
         table = re.match(r"^\s*\[\[([^\]]+)\]\]\s*$", raw)
         if table:
+            flush()
             name = table.group(1)
             if name == "hooks":
                 event = "unparsed"
@@ -100,12 +180,20 @@ def _commands_from_toml_text(text: str) -> list[tuple[str | None, str]]:
         if assigned_event:
             event = assigned_event.group(2)
             continue
+        if re.match(r"^\s*args\s*=", raw):
+            if args is not None:
+                raise ValueError("duplicate command args in one table")
+            args, index = _toml_args(lines, index - 1)
+            continue
         if not re.match(r"^\s*command\s*=", raw):
             continue
         m = _TOML_COMMAND.match(raw)
         if not m:
             raise ValueError(f"unparseable command assignment: {raw!r}")
-        out.append((event, m.group(2)))
+        if command is not None:
+            raise ValueError("duplicate command in one table")
+        command = m.group(2)
+    flush()
     return out
 
 
@@ -229,10 +317,7 @@ def _command_target(command: str) -> tuple[str | None, str | None]:
 
     head = tokens[0]
     expanded_head = os.path.expandvars(os.path.expanduser(head))
-    if os.path.isabs(expanded_head):
-        return _expand_path(expanded_head), None
-
-    if os.path.basename(head).lower() in _INTERPRETERS:
+    if os.path.basename(expanded_head).lower() in _INTERPRETERS:
         script = _interpreter_script(tokens)
         if script is None:
             return None, "interpreter invocation has no safely classifiable script operand"
@@ -240,6 +325,9 @@ def _command_target(command: str) -> tuple[str | None, str | None]:
         if os.path.isabs(expanded):
             return _expand_path(expanded), None
         return None, "interpreter script operand is not absolute"
+
+    if os.path.isabs(expanded_head):
+        return _expand_path(expanded_head), None
 
     # Do not scan arbitrary arguments for absolute paths. That was the CBP
     # `--workspace /abs/dir` phantom. A command whose executable is not itself an

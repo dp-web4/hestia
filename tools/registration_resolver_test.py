@@ -77,6 +77,96 @@ class RegistrationResolverTests(unittest.TestCase):
         self.assertEqual({x["path"] for x in r["targets"]}, {str(a), str(b)})
         self.assertTrue(r["complete"])
 
+    def test_absolute_interpreter_resolves_its_script_not_the_interpreter(self):
+        hook = self.touch("hooks/absolute.py")
+        rel = [".claude", "settings.json"]
+        e = self.expects(path=rel)
+        self.reg_json(rel, [f"{sys.executable} {hook}"])
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual([x["path"] for x in r["targets"]], [str(hook)])
+
+    def test_json_bare_interpreter_uses_separate_args(self):
+        hook = self.touch("hooks/arguments.py")
+        rel = [".gemini", "settings.json"]
+        e = self.expects(member="gemini", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"mcpServers": {"example": {
+            "command": "python3", "args": ["-u", str(hook)],
+        }}}), encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 1)
+        self.assertEqual(r["targets"][0]["path"], str(hook))
+        self.assertEqual(r["targets"][0]["event"], "mcpServers")
+
+    def test_toml_bare_interpreter_uses_separate_args(self):
+        hook = self.touch("hooks/session-end.js")
+        rel = [".codex", "config.toml"]
+        e = self.expects(member="codex", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            '[[hooks.SessionEnd]]\ncommand = "node"\n'
+            f'args = [\n  "{hook}",\n]\n',
+            encoding="utf-8",
+        )
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 1)
+        self.assertEqual(r["targets"][0]["path"], str(hook))
+        self.assertEqual(r["targets"][0]["event"], "SessionEnd")
+
+    def test_toml_multiline_args_does_not_consume_the_next_hook(self):
+        first = self.touch("hooks/first.js")
+        second = self.touch("hooks/second.js")
+        rel = [".codex", "config.toml"]
+        e = self.expects(member="codex", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            '[[hooks.SessionEnd]]\ncommand = "node"\n'
+            f'args = [\n  "{first}",\n]\n'
+            '[[hooks.PostToolUse]]\ncommand = "node"\n'
+            f'args = ["{second}"]\n',
+            encoding="utf-8",
+        )
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 2)
+        self.assertEqual(
+            [(target["event"], target["path"]) for target in r["targets"]],
+            [("SessionEnd", str(first)), ("PostToolUse", str(second))],
+        )
+
+    def test_bare_interpreter_without_args_remains_unclassified(self):
+        rel = [".codex", "config.toml"]
+        e = self.expects(member="codex", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('[[hooks.SessionEnd]]\ncommand = "node"\n', encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertFalse(r["complete"])
+        self.assertEqual(r["targets"], [])
+
+    def test_non_string_args_are_unparseable(self):
+        hook = self.touch("hooks/arguments.py")
+        rel = [".gemini", "settings.json"]
+        e = self.expects(member="gemini", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"mcpServers": {"example": {
+            "command": "python3", "args": [str(hook), 7],
+        }}}), encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "unparseable")
+
     def test_node_value_option_is_unclassified_not_a_phantom_hook(self):
         module = self.touch("node/preload.js")
         script = self.touch("node/hook.js")
@@ -373,6 +463,81 @@ timeout = 15
             [(t["event"], t["path"]) for t in r["targets"]],
             [("PostToolUse", str(shared)), ("PreToolUse", str(shared))],
         )
+
+    def reg_toml(self, rel, text, member="codex"):
+        e = self.expects(member=member, reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return rr.resolve_registration(e, self.home)
+
+    def test_toml_args_before_command_in_one_table(self):
+        # NOVA 11-25: TOML key order is not significant; args may precede command.
+        inline = self.touch("hooks/inline.js")
+        multi = self.touch("hooks/multi.js")
+        for shape, text, hook in (
+            ("inline", f'[[hooks.SessionEnd]]\nargs = ["{inline}"]\ncommand = "node"\n', inline),
+            ("multiline", f'[[hooks.SessionEnd]]\nargs = [\n  "{multi}",\n]\ncommand = "node"\n', multi),
+        ):
+            with self.subTest(shape=shape):
+                r = self.reg_toml([".codex", shape + ".toml"], text)
+                self.assertEqual(r["state"], "ok", r)
+                self.assertTrue(r["complete"])
+                self.assertEqual(r["commands_seen"], 1)
+                self.assertEqual(
+                    [(t["event"], t["path"]) for t in r["targets"]],
+                    [("SessionEnd", str(hook))],
+                )
+
+    def test_toml_two_tables_only_the_first_has_args(self):
+        first = self.touch("hooks/first.js")
+        second = self.touch("hooks/second.sh")
+        r = self.reg_toml([".codex", "config.toml"],
+            '[[hooks.SessionEnd]]\n'
+            f'args = [\n  "{first}",\n]\n'
+            'command = "node"\n'
+            '[[hooks.PostToolUse]]\n'
+            f'command = "{second}"\n',
+        )
+        self.assertEqual(r["state"], "ok", r)
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 2)
+        self.assertEqual(
+            [(t["event"], t["path"]) for t in r["targets"]],
+            [("SessionEnd", str(first)), ("PostToolUse", str(second))],
+        )
+
+    def test_toml_args_never_attach_to_the_preceding_table(self):
+        # The old global out[-1] attachment gave table 2's args to table 1's
+        # command, producing `bash /abs/a.sh /abs/b.js` and losing hook b.
+        a = self.touch("hooks/a.sh")
+        b = self.touch("hooks/b.js")
+        r = self.reg_toml([".codex", "config.toml"],
+            f'[[hooks.PreToolUse]]\ncommand = "bash {a}"\n'
+            f'[[hooks.PostToolUse]]\nargs = ["{b}"]\ncommand = "node"\n',
+        )
+        self.assertEqual(r["state"], "ok", r)
+        self.assertTrue(r["complete"])
+        self.assertEqual(
+            [(t["event"], t["path"]) for t in r["targets"]],
+            [("PreToolUse", str(a)), ("PostToolUse", str(b))],
+        )
+
+    def test_toml_args_without_a_command_in_their_table_are_unparseable(self):
+        a = self.touch("hooks/a.sh")
+        b = self.touch("hooks/b.js")
+        r = self.reg_toml([".codex", "config.toml"],
+            f'[[hooks.PreToolUse]]\ncommand = "bash {a}"\n'
+            f'[[hooks.PostToolUse]]\nargs = ["{b}"]\n',
+        )
+        self.assertEqual(r["state"], "unparseable", r)
+
+    def test_toml_duplicate_command_in_one_table_is_unparseable(self):
+        a = self.touch("hooks/a.sh")
+        r = self.reg_toml([".codex", "config.toml"],
+            f'[[hooks.PreToolUse]]\ncommand = "bash {a}"\ncommand = "bash {a}"\n',
+        )
+        self.assertEqual(r["state"], "unparseable", r)
 
     def test_malformed_toml_command_assignment_is_unparseable(self):
         rel = [".codex", "config.toml"]
