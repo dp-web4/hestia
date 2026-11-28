@@ -270,7 +270,7 @@ pub struct LedgerRow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<String>,
     /// A scope request's rulings the decide endpoint ACCEPTS (#1287 part 2), from
-    /// `state::scope_allowed_decisions` over the asked path and whether the gate opened it — the
+    /// `state::scope_allowed_decisions` over the asked path and its complete-act digest — the
     /// function the endpoint's refusal reads. The ledger's buttons render exactly these. Empty on
     /// every other kind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -426,11 +426,11 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     coalesced: 0,
                     payload_flags: Vec::new(),
         advisories: Vec::new(),
-                    // #1287 part 2: the chain row carries the asked path and the origin, the
-                    // two inputs the decide endpoint's check reads off the live request.
+                    // #1287 part 2: the chain row carries the asked path and the complete-act
+                    // digest, the two inputs the decide endpoint's check reads off the live request.
                     allowed_decisions: crate::server::state::scope_allowed_decisions(
                         s(d, "path").as_deref().unwrap_or(""),
-                        d.get("origin").and_then(|v| v.as_str()) == Some("gate_deny"),
+                        d.get("act_digest").and_then(|v| v.as_str()).is_some_and(|h| !h.is_empty()),
                     )
                     .into_iter()
                     .map(String::from)

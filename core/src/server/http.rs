@@ -3405,7 +3405,7 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
                 // #1287 part 2: what a surface may offer, from the decide endpoint's own source.
                 "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
                 "allowed_decisions": crate::server::state::scope_allowed_decisions(
-                    &r.path, r.ext.gate.is_some()),
+                    &r.path, r.ext.gate.as_ref().is_some_and(|g| !g.act_digest.is_empty())),
             })
         })
         .collect();
@@ -3606,9 +3606,13 @@ pub(crate) async fn scope_decide_as(
     // (#1287 part 2: dp clicked a plain grant on an unenumerated request and learnt the rule
     // from this error).
     let kind = crate::server::state::scope_decision_kind(granted, once, standing);
-    let allowed = crate::server::state::scope_allowed_decisions(&path, gate_origin.is_some());
+    let allowed = crate::server::state::scope_allowed_decisions(
+        &path, gate_origin.as_ref().is_some_and(|g| !g.act_digest.is_empty()));
     if !allowed.contains(&kind) {
-        let error = if kind == "once" {
+        let error = if kind == "once" && gate_origin.is_some() {
+            "a one-time approval needs the gate's complete-act authorization digest, which this \
+             deny record does not carry. Grant it for the session or standing instead"
+        } else if kind == "once" {
             "a one-time approval binds to the act the gate refused, and this request was filed by \
              the member — it names no act. Grant it for the session or standing instead"
         } else {
@@ -3657,11 +3661,16 @@ pub(crate) async fn scope_decide_as(
     // A glob reach (`dir/*`) is covered only by a recursive grant; an exact grant would be
     // spent without ever admitting the act, so it is refused here with the reason.
     if granted && !once && !recursive && gate_origin.as_ref().is_some_and(|g| g.subtree) {
+        let once_alternative = if gate_origin.as_ref().is_some_and(|g| !g.act_digest.is_empty()) {
+            " (or approve the act once)"
+        } else {
+            ""
+        };
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "the refused act was a glob over this directory; only a RECURSIVE grant \
-                          reaches it (or approve the act once)"
+                "error": format!("the refused act was a glob over this directory; only a \
+                                  RECURSIVE grant reaches it{once_alternative}")
             })),
         );
     }

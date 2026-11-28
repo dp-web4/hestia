@@ -334,7 +334,9 @@ pub struct GateDenyOrigin {
     /// The attempted act as the gate rendered it (masked, truncated at the gate). This is what
     /// the operator rules on — not a rationale: the member did not choose to ask.
     pub act: String,
-    /// sha256 over `tool \x1f act`: a one-time approval is spent only by the act it was shown.
+    /// The gate's complete-act authorization digest: a one-time approval is spent only by the
+    /// act it was shown. Empty for a dispatcher-after-deny request, whose policy row carries a
+    /// display act but no such digest; decision surfaces must not offer ONCE for that request.
     pub act_digest: String,
     /// sha256 over `"hestia:scope-request-key" \x1f member \x1f path` — re-issues find this row.
     pub request_key: String,
@@ -1172,8 +1174,8 @@ pub fn scope_decision_kind(granted: bool, once: bool, standing: bool) -> &'stati
 /// endpoint's refusal and every operator surface's offer read, so the UI cannot offer a ruling
 /// the endpoint then refuses after the click.
 ///
-/// * `once` only when the GATE opened the request: it binds to the act the gate refused, and a
-///   member-filed ask names no act.
+/// * `once` only when the request carries the gate's complete-act authorization digest. A
+///   display act alone is not a binding; a member-filed ask names neither.
 /// * `session` and `standing` only when the request names a PATH: an act whose reach the gate
 ///   could not enumerate (`is_unpriceable_scope_path`, #1232) names none a grant could reach.
 /// * `refuse` always.
