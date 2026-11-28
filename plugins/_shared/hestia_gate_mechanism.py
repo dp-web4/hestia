@@ -1653,13 +1653,16 @@ def resolved_targets_for_claim(targets, complete=True):
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
                      supersession=None, deadline=None, resolved_targets=None,
-                     resolved_targets_complete=True):
+                     resolved_targets_complete=True, refusal_rule=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
-    Never waits. The first attempt is refused and the refusal opens an escalation; a human
-    decides out of band; the member RE-ISSUES the write and the second attempt claims the
-    approval. Every failure — unreachable, malformed, a daemon with no escalation channel —
+    Never waits, and never ASKS on the member's behalf (dp, 2026-11-05: "all escalations should
+    be deliberate acts by agent, with reason"). With no approval and nothing of the member's own
+    pending for this act, the daemon records the refusal and answers `not_asked` with a refusal
+    id; nothing is opened and nobody is told. The member escalates as a deliberate act
+    (`hestia gate escalate <refusal_id> --as <member> --reason '...'`), a human decides out of
+    band, and the member RE-ISSUES the write byte-for-byte, which claims the approval. Every failure — unreachable, malformed, a daemon with no escalation channel —
     is a refusal: a daemon that cannot answer must not be a way to get a governance write
     through.
 
@@ -1679,13 +1682,13 @@ def claim_self_write(marker, tool_name, attempted, *,
         "role": role,
         "tool_name": tool_name,
         "marker": marker,
-        # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
-        # stated why — the member did not choose to escalate; the gate opened it on a refused
-        # write. Presenting the act as though it were a rationale would look like the member had
-        # explained itself. A member that wants to state a why opens the escalation itself.
+        # `reason` carries the ATTEMPTED ACT, not a rationale: the gate states no why, because
+        # it asks nothing. The member's own why arrives only with its deliberate escalation,
+        # which the daemon builds from this call's act and the member's reason.
         "reason": attempted or f"{tool_name} -> {marker}",
-        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
-                   "because it did not choose to escalate. Approving authorises this one write."),
+        "detail": ("The gate's record of a refused act"
+                   + (f" ({refusal_rule})" if refusal_rule else "")
+                   + ". Nothing is asked unless the member escalates it as a deliberate act."),
     }
     # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
     # namespaces in a claim window, only the per-wake host session appears on the outcome rows
@@ -1733,6 +1736,15 @@ def claim_self_write(marker, tool_name, attempted, *,
                     "spent (its first answer was lost)", None, None)
         return ("approved",
                 f"claimed an approval from {who} via {via} (single use, now spent)", None, None)
+    if r.get("not_asked") is True and isinstance(r.get("refusal_id"), str) and r["refusal_id"]:
+        # Recorded, not asked (dp, 2026-11-05). The daemon's detail names the deliberate door.
+        rid = r["refusal_id"]
+        return ("not_asked",
+                r.get("detail") or (
+                    "refused; nothing was sent to the operator or to any peer. If the work needs "
+                    f"this write, escalate it as a deliberate act: hestia gate escalate {rid} "
+                    f"--as {plugin_id} --reason '<what you are doing, and why>'"),
+                None, None)
     esc_id = r.get("escalation_id")
     if not esc_id:
         # An old daemon answers {} to a tool it does not know — which must not permit a write by
@@ -1902,7 +1914,10 @@ def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_nam
     Verdicts — the daemon owns every one; this function re-derives nothing:
       * "approved"   — an operator granted THIS act once; spent now (single use, claim window).
       * "in_force"   — a live or standing grant already covers the path (the snapshot raced).
-      * "opened"     — no request stood; one was opened on the operator's queue.
+      * "not_asked"  — nothing stood, and NOTHING WAS OPENED (dp, 2026-11-05: the gate does not
+                       ask on the member's behalf). The third element is the REFUSAL id the
+                       member may escalate deliberately (`hestia scope escalate`).
+      * "opened"     — a request was opened (only a daemon older than 2026-11-05 does this).
       * "pending"    — the request for this path is still waiting; same id, no new record.
       * "refused"    — the operator refused it; re-issuing does not re-open it inside the window.
       * "not_opened" — the daemon declined to open one (its cap, or it predates the verb).
@@ -1949,6 +1964,9 @@ def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_nam
         return verdict, str(r.get("detail") or verdict), rid
     if verdict in ("opened", "pending", "refused") and isinstance(rid, str) and rid:
         return verdict, str(r.get("detail") or verdict), rid
+    refusal_id = r.get("refusal_id")
+    if verdict == "not_asked" and isinstance(refusal_id, str) and refusal_id:
+        return verdict, str(r.get("detail") or verdict), refusal_id
     why = r.get("detail") or r.get("error") or "this daemon has no scope-claim verb (is it upgraded?)"
     return "not_opened", str(why), None
 
