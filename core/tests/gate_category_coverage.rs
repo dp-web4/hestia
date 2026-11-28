@@ -204,6 +204,9 @@ const CATEGORY_COVERAGE: &[(&str, Coverage, &[&str])] = &[
         &[
             "policy/extract.rs::classify",
             "server/handler.rs::tool_request_witness",
+            // history_witness v1 (entity accounts S2a): the same act, a structured append.
+            // Same coverage, same pending law change.
+            "server/handler.rs::tool_witness_history_append",
         ],
     ),
 ];

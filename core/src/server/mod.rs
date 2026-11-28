@@ -14,6 +14,7 @@ pub mod gate_escalation;
 pub mod governance_ledger;
 pub mod grant_modes;
 pub mod grant_target;
+pub mod history_witness;
 pub mod repository_target;
 mod handler;
 mod http;
