@@ -20540,6 +20540,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scope_withdrawal_queued_across_expiry_leaves_the_request_expired() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let (_dir, shared, asker, _peer, request_id) = pending_scope_withdrawal().await;
+        let args = json!({
+            "request_id": request_id, "session_id": asker,
+            "reason": "withdrawal must not win after waiting past the request expiry",
+        });
+        let mut held = shared.lock().await;
+        assert_eq!(shared.stats().report()["waiting_now"], 0);
+        let expires_at = crate::server::gate_escalation::now_secs() + 2;
+        held.scope_requests.get_mut(&request_id).unwrap().expires_at = expires_at;
+        let request_before = serde_json::to_value(&held.scope_requests[&request_id]).unwrap();
+        let chain_before = held.chain_len();
+
+        // Poll the real handler while holding its first awaited lock. StateCell's queued
+        // counter proves it entered lock acquisition, rather than merely being scheduled.
+        let withdrawal = tool_scope_withdraw(&shared, &args);
+        tokio::pin!(withdrawal);
+        poll_fn(|cx| {
+            assert!(withdrawal.as_mut().poll(cx).is_pending(), "the state lock is held");
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            shared.stats().report()["waiting_now"],
+            1,
+            "the withdrawal must actually be queued for the held state lock"
+        );
+        assert!(
+            crate::server::gate_escalation::now_secs() < expires_at,
+            "the withdrawal must have reached the held lock before expiry",
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while crate::server::gate_escalation::now_secs() < expires_at {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the short request deadline must pass while the lock remains held");
+        drop(held);
+        let withdrawn = tokio::time::timeout(Duration::from_secs(2), withdrawal)
+            .await
+            .expect("the queued withdrawal must finish after the lock is released")
+            .unwrap();
+        assert_eq!(
+            withdrawn["_hestia_error"]["code"],
+            "hestia.scope_withdraw_not_pending",
+            "{withdrawn}"
+        );
+        assert_eq!(
+            withdrawn["_hestia_error"]["data"]["status"],
+            "expired",
+            "{withdrawn}"
+        );
+
+        let s = shared.lock().await;
+        let req = &s.scope_requests[&request_id];
+        assert_eq!(req.status(crate::server::gate_escalation::now_secs()), "expired");
+        assert_eq!(
+            serde_json::to_value(req).unwrap(),
+            request_before,
+            "refusal must not mutate the request"
+        );
+        assert_eq!(
+            s.chain_len(),
+            chain_before,
+            "refusal must not append a terminal witness"
+        );
+        assert!(s.recent_chain(50).iter().all(|e| e.event_type != "scope_withdrawn"));
+        assert!(!s.has_scope_grant("kimi-code", &req.path));
+    }
+
+    #[tokio::test]
     async fn a_failed_withdrawal_append_restores_the_pending_request() {
         let (_dir, shared, asker, _peer, request_id) = pending_scope_withdrawal().await;
         shared.lock().await.chain_fault_on.insert("scope_withdrawn".into());
@@ -31076,8 +31153,9 @@ pub(crate) async fn tool_scope_withdraw(state: &SharedState, args: &Value) -> To
         return Err(anyhow::anyhow!("reason is too thin — say why this request is no longer needed"));
     }
     let session_id_arg = optional_session_id(args);
-    let now = crate::server::gate_escalation::now_secs();
     let mut s = state.lock().await;
+    // A request may expire while queued for state; expiry is checked at the mutation boundary.
+    let now = crate::server::gate_escalation::now_secs();
     let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
         return Err(anyhow::anyhow!(
             "withdrawing a scope request requires the asker's live session_id from hestia_connect"
