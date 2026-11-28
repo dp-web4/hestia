@@ -1958,6 +1958,64 @@ impl SqliteChainStore {
         Ok(stmt.query_row(params![plugin_id], |row| row.get(0)).optional()?)
     }
 
+    /// How many rows of `event_types` name `plugin_id` as `$.plugin_id` at or after `since` (#1748).
+    ///
+    /// The retire guard's count. It replaces one global page of `ROUTINE_CHAIN_MAX` rows that was
+    /// filtered afterwards: once a machine had more acts than that in the window, every id came
+    /// back unmeasurable, phantoms included, and the refusal called each of them LIVE. The count
+    /// is per member, and bounded like [`Self::latest_actor_act_since`]: the window's lowest
+    /// position comes from `idx_chain_timestamp`, then the rowid range from there is read, with
+    /// `timestamp` re-checked so the count stays exact if the clock ever stepped backwards.
+    pub fn count_member_acts_since(
+        &self,
+        plugin_id: &str,
+        since: &str,
+        event_types: &[&str],
+    ) -> Result<u64> {
+        if event_types.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.observed(&self.read_conn)?;
+        // The floor is the LOWEST POSITION of any in-window row, not the position of the
+        // earliest in-window timestamp, and the count re-checks `timestamp`. That is exact
+        // whatever the clock did. "Earliest timestamp" assumes timestamps rise with position:
+        // after a backward step (an NTP correction, a restored VM) a row written before the step
+        // sits at a lower position than the earliest timestamp, and was skipped. An uncounted
+        // act is the unsafe direction for a retire guard (mcnugget-claude, #1749). MIN over the
+        // index range is index-only, and the count below reads that same range of rows anyway.
+        // INDEXED BY: without it the planner may walk rowids from 0 looking for the first match.
+        let floor: Option<i64> = conn.query_row(
+            "SELECT MIN(chain_position) FROM chain_entries INDEXED BY idx_chain_timestamp
+             WHERE timestamp >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        let Some(floor) = floor else {
+            return Ok(0);
+        };
+        let placeholders = (0..event_types.len())
+            .map(|i| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        // `+event_type` keeps the planner on the rowid range, as in `latest_actor_act_since`.
+        let sql = format!(
+            "SELECT COUNT(*) FROM chain_entries
+             WHERE chain_position >= ?2
+               AND timestamp >= ?3
+               AND +event_type IN ({placeholders})
+               AND json_extract(event_data, '$.plugin_id') = ?1"
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(plugin_id.to_string()), Box::new(floor), Box::new(since.to_string())];
+        for t in event_types {
+            binds.push(Box::new(t.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     /// The newest actor act of `plugin_id` at or after `since` (an RFC 3339 timestamp in the
     /// chain's own format), or `None` if there is none in that window.
     ///
@@ -1969,56 +2027,6 @@ impl SqliteChainStore {
     /// distinguishes the last hour, the last day, and older, so nothing before the window can
     /// change its answer. Positions grow with time, so the window's first position is one
     /// seek on `idx_chain_timestamp`, and the scan stops there.
-    /// How many rows of `event_types` name `plugin_id` as `$.plugin_id` at or after `since` (#1748).
-    ///
-    /// The retire guard's count. It replaces one global page of `ROUTINE_CHAIN_MAX` rows that was
-    /// filtered afterwards: once a machine had more acts than that in the window, every id came
-    /// back unmeasurable, phantoms included, and the refusal called each of them LIVE. The count
-    /// is per member, and bounded the way [`Self::latest_actor_act_since`] is: one seek on
-    /// `idx_chain_timestamp` for the window's first position, then the rowid range from there.
-    pub fn count_member_acts_since(
-        &self,
-        plugin_id: &str,
-        since: &str,
-        event_types: &[&str],
-    ) -> Result<u64> {
-        if event_types.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.observed(&self.read_conn)?;
-        let floor: Option<i64> = conn
-            .query_row(
-                "SELECT chain_position FROM chain_entries WHERE timestamp >= ?1
-                 ORDER BY timestamp ASC LIMIT 1",
-                params![since],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(floor) = floor else {
-            return Ok(0);
-        };
-        let placeholders = (0..event_types.len())
-            .map(|i| format!("?{}", i + 3))
-            .collect::<Vec<_>>()
-            .join(",");
-        // `+event_type` keeps the planner on the rowid range, as in `latest_actor_act_since`.
-        let sql = format!(
-            "SELECT COUNT(*) FROM chain_entries
-             WHERE chain_position >= ?2
-               AND +event_type IN ({placeholders})
-               AND json_extract(event_data, '$.plugin_id') = ?1"
-        );
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(plugin_id.to_string()), Box::new(floor)];
-        for t in event_types {
-            binds.push(Box::new(t.to_string()));
-        }
-        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let n: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
-        Ok(u64::try_from(n).unwrap_or(0))
-    }
-
     pub fn latest_actor_act_since(&self, plugin_id: &str, since: &str) -> Result<Option<String>> {
         let conn = self.observed(&self.read_conn)?;
         let floor: Option<i64> = conn
@@ -3796,6 +3804,43 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(indexed, 1);
+    }
+
+    /// A backward clock step must not hide in-window acts (mcnugget-claude, #1749). Rows 0-1
+    /// were written before the clock stepped back, rows 2-3 after: row 2 is before the window,
+    /// row 3 is in it. The earliest in-window TIMESTAMP is row 3's, so a floor taken from it
+    /// counted 1. The lowest in-window POSITION is row 0's, and the count is 3.
+    #[test]
+    fn member_count_is_exact_across_a_backward_clock_step_1749() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        for _ in 0..4 {
+            store.append("outcome", json!({"plugin_id": "kimi-code"}), "lct:test").unwrap();
+        }
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let at = |secs: i64| (since + chrono::Duration::seconds(secs)).to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            let positions: Vec<i64> = conn
+                .prepare("SELECT chain_position FROM chain_entries ORDER BY chain_position")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(std::result::Result::unwrap)
+                .collect();
+            assert_eq!(positions.len(), 4);
+            for (pos, ts) in positions.iter().zip([at(60), at(120), at(-60), at(30)]) {
+                conn.execute(
+                    "UPDATE chain_entries SET timestamp = ?1 WHERE chain_position = ?2",
+                    params![ts, pos],
+                )
+                .unwrap();
+            }
+        }
+        let n = store
+            .count_member_acts_since("kimi-code", &since.to_rfc3339(), &["outcome"])
+            .unwrap();
+        assert_eq!(n, 3, "rows 0, 1 and 3 are in the window; row 2 is not");
     }
 
     #[test]

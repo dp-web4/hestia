@@ -88,10 +88,17 @@ def source_contract() -> None:
     # characters ("act(s)"), which defeated the first pattern -- and a pattern that cannot match
     # is a check that cannot fail.
     lines = blk.splitlines()
+    # EVERY re-send, not exactly one (#1749): single retire now has two refusals the operator can
+    # override, a measured live member and an unmeasurable count, and each re-sends after its own
+    # confirm. The property is consent before every confirm_active, and none from bulk retire.
     resend = [i for i, l in enumerate(lines) if "= await send(true)" in l]
-    check("the confirmed re-send happens exactly once", len(resend), 1)
-    guarded = resend and "if (!confirm(" in lines[resend[0] - 1] and "return;" in lines[resend[0] - 1]
-    check("...and only on the line after an explicit confirm that returns on refusal", bool(guarded))
+    check("a confirmed re-send exists", len(resend) >= 1)
+    unguarded = [lines[i].strip() for i in resend
+                 if not ("if (!confirm(" in lines[i - 1] and "return;" in lines[i - 1])]
+    check("...and every one is on the line after an explicit confirm that returns on refusal",
+          unguarded, [])
+    check("bulk retire never re-sends with confirm_active",
+          "send(true)" in fn("retireNeverActed", "reinstateAgent"), False)
     check("the confirm names the act count, which is what identifies the live id",
           "out.acts_recently" in blk and "acts_recently}" in blk)
     check("confirm_active is never sent on the first attempt", "send(false)" in blk)
@@ -135,12 +142,23 @@ def source_contract() -> None:
     # the first cut pinned a constant and a response literal, both of which survived the
     # sabotage that mattered.
     check("the route refuses without reason and ref", "reason and ref are required" in RS)
-    check("the guard's scan is RESTRICTED to the agent's own act types",
-          "scan_recent_page(Some(cutoff), Some(AGENT_ACT_EVENTS), None," in RS)
-    check("...the types the operator's own act count is built from",
-          'const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];' in RS)
-    check("a bounded page cannot silently truncate retirement activity",
-          "page.before_position.is_some()" in RS and "ROUTINE_CHAIN_MAX" in RS)
+    # #1749 moved the decision from a filtered page in http.rs to a per-member COUNT in chain.rs,
+    # so the pins moved with it, to the lines that now decide.
+    CH = (ROOT / "core/src/storage/chain.rs").read_text()
+    count_fn = CH[CH.index("pub fn count_member_acts_since("):CH.index("pub fn latest_actor_act_since(")]
+    acts_fn = RS[RS.index("fn agent_acts_since("):RS.index("fn retire_guard(")]
+    check("the guard counts THIS id's acts, restricted to the agent's own act types",
+          ".count_member_acts_since(plugin_id.trim(), cutoff, AGENT_ACT_EVENTS)" in acts_fn)
+    check("...the restriction lives in the count: per id and per event type",
+          "json_extract(event_data, '$.plugin_id') = ?1" in count_fn and "+event_type IN (" in count_fn)
+    check("...the types are the agent's own record, allows included",
+          'const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", super::decision_witness::ALLOW_EVENT, "outcome"];' in RS)
+    check("retirement activity is COUNTED, never paged (a page truncated it: #1748)",
+          "SELECT COUNT(*) FROM chain_entries" in count_fn and "WHERE chain_position >= ?2" in count_fn)
+    check("...and the truncating page cannot come back", "scan_recent_page" in acts_fn, False)
+    check("the window floor is the lowest in-window position, exact across a clock step",
+          "SELECT MIN(chain_position) FROM chain_entries INDEXED BY idx_chain_timestamp" in count_fn
+          and "AND timestamp >= ?3" in count_fn)
     # The guard must not fail open (cbp, PR #1100, finding 4): unmeasurable is a refusal.
     check("an unreadable chain is Err, never zero", "-> Result<usize, String> {" in RS and ".map_err(|e| e.to_string())" in RS)
     check("...and the guard names it", '"unmeasurable": true' in RS)

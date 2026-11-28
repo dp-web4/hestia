@@ -8172,11 +8172,14 @@ async fn agent_delegation_revoke(
 /// on his screen -- read as LIVE members and the guard refused exactly the case it exists to
 /// permit. Caught by this function's own test before it shipped.
 ///
-/// `policy_decision` and `outcome` are the agent's own record: the gate ruling on a tool call
-/// it attempted, and the result. They are also what the trust list's `action_count` is built
-/// from, so the number in a refusal is the number on the operator's screen -- a guard that
-/// argued with the column next to it would be worse than none.
-const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
+/// `policy_decision`, `policy_allow` and `outcome` are the agent's own record: the gate ruling
+/// on a tool call it attempted, and the result. Since `decision_witness`, an ALLOW is its own
+/// event type (`decision_witness::ALLOW_EVENT`), so a member whose recent acts were all
+/// allowed and wrote no `outcome` row would count zero without it, and retire with no confirm.
+/// Under-counting is the unsafe direction for this guard, so allows count (mcnugget-claude,
+/// #1749). The refusal therefore reports this window's acts, which is not the trust list's
+/// lifetime `action_count`; the confirm names them as recent acts, not as that column.
+const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", super::decision_witness::ALLOW_EVENT, "outcome"];
 
 /// `Err` when the chain could not be read. NOT zero: the first cut wrote `.unwrap_or(0)`, which
 /// turned a scan failure into "never acted" and let the live seat retire with no confirm (cbp,
@@ -12908,6 +12911,29 @@ mod disposition_tests {
         let (st, b) = retire(&state, "no-such-member", serde_json::json!({"reason": "phantom", "ref": "#1748"})).await;
         assert_eq!(st, StatusCode::OK, "a phantom retires without confirm_active: {b}");
         assert!(state.lock().await.retired_members.is_retired("no-such-member"));
+    }
+
+    /// An ALLOW is its own event type since `decision_witness`. A member whose recent acts were
+    /// all allowed, with no `outcome` row, is live and must be refused without a confirm, not
+    /// counted zero and retired (mcnugget-claude's review of #1749).
+    #[tokio::test]
+    async fn a_member_whose_acts_were_all_allowed_is_live_1749() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "kimi-code").await;
+        {
+            let s = state.lock().await;
+            s.append_chain(
+                crate::server::decision_witness::ALLOW_EVENT,
+                serde_json::json!({ "plugin_id": "kimi-code", "tool_name": "Read", "target": "/x" }),
+            )
+            .unwrap();
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(agent_acts_since(&*state.lock().await, "kimi-code", &cutoff), Ok(1));
+        let (st, b) = retire(&state, "kimi-code", serde_json::json!({"reason": "x", "ref": "#1749"})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "an allow-only member is live: {b}");
+        assert_eq!(b["acts_recently"], serde_json::json!(1));
+        assert!(!state.lock().await.retired_members.is_retired("kimi-code"));
     }
 
     /// Acts before the window do not count: the window's floor is the first row at or after it.
