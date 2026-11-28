@@ -75,6 +75,32 @@ pub struct ChallengeResponse {
     pub expires_at: DateTime<Utc>,
 }
 
+pub(crate) const HUB_ERROR_BODY_CAP: usize = 16 * 1024;
+/// Appended by [`bounded_error_text`] when the body was cut. A caller that classifies an error by
+/// its text must treat a body ending in this as incomplete.
+pub(crate) const HUB_ERROR_BODY_TRUNCATED: &str = "…[truncated]";
+
+/// Read an upstream error body without letting an unbounded stream exhaust memory.
+pub(crate) async fn bounded_error_text(mut resp: reqwest::Response) -> String {
+    let mut bytes = Vec::with_capacity(HUB_ERROR_BODY_CAP + 1);
+    while bytes.len() <= HUB_ERROR_BODY_CAP {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = HUB_ERROR_BODY_CAP + 1 - bytes.len();
+                bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let truncated = bytes.len() > HUB_ERROR_BODY_CAP;
+    bytes.truncate(HUB_ERROR_BODY_CAP);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(HUB_ERROR_BODY_TRUNCATED);
+    }
+    text
+}
+
 /// An established end-to-end encrypted channel to a hub (the member side).
 ///
 /// Per the hub authz/confidentiality model, every citizen-tier+ request and
@@ -625,7 +651,7 @@ impl HubClient {
             .await
             .with_context(|| format!("posting withdraw to {url}"))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = bounded_error_text(resp).await;
         let body: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         // The route's own 404 for "not a member" carries that phrase; its 404 for a mismatched
@@ -1532,6 +1558,24 @@ fn channel_inner_request(tool: &str, args: serde_json::Value) -> serde_json::Val
 mod tests {
     use super::*;
     use web4_core::crypto::KeyPair;
+
+    #[tokio::test]
+    async fn an_upstream_error_body_is_read_to_a_fixed_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async { "x".repeat(HUB_ERROR_BODY_CAP + 4096) });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/error"))
+            .send()
+            .await
+            .unwrap();
+        let text = bounded_error_text(resp).await;
+        server.abort();
+        assert!(text.ends_with("…[truncated]"), "the cut must be visible");
+        assert_eq!(text.len(), HUB_ERROR_BODY_CAP + "…[truncated]".len());
+        assert!(text.is_char_boundary(HUB_ERROR_BODY_CAP));
+    }
 
     #[test]
     fn member_identity_provisions_all_three_entries_or_none() {
