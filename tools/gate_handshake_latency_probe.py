@@ -195,6 +195,7 @@ def one_run(url: str, role: str, plugin_id: str) -> dict:
     try:
         res = unwrap(c.call_tool("hestia_record_outcome", {
             "action_id": action_id, "success": True, "magnitude": 0.0,
+            **({"session_id": session_id} if session_id else {}),
         }))
         # A daemon rejection arrives as a parsed error envelope, not an
         # exception -- only the witness entry hash proves the action closed.

@@ -114,7 +114,8 @@ def handshake(url: str, role: str, plugin_id: str) -> dict:
     # witness entry hash that proves them.
     try:
         res = unwrap(c.call_tool("hestia_record_outcome",
-                                 {"action_id": aid, "success": True, "magnitude": 0.0}))
+                                 {"action_id": aid, "success": True, "magnitude": 0.0,
+                                  **({"session_id": sid} if sid else {})}))
         steps["_closed"] = isinstance(res, dict) and "witnessEntryHash" in res
     except Exception:  # noqa: BLE001
         steps["_closed"] = False

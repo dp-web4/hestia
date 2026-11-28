@@ -91,6 +91,7 @@ Submits the outcome of a previously-begun R6 action. Hestia updates trust state 
 ```json
 {
   "action_id": "uuid (required) — from begin_action",
+  "session_id": "uuid (required) — the live session that began this action",
   "success": "boolean (required)",
   "magnitude": "number (required, 0..1)",
   "error": "string (optional)",
@@ -109,6 +110,10 @@ Submits the outcome of a previously-begun R6 action. Hestia updates trust state 
 `closure_claims` is optional and uses schema
 `hestia.closure-claims/v1`. A generic result or successful execution is never
 converted into an implied claim.
+
+A missing, unresolvable, or non-owning `session_id` returns
+`hestia.action_not_owned`. The action remains available to its rightful owner;
+the daemon records `outcome_refused`, but no outcome or trust delta.
 
 **Returns:**
 ```json

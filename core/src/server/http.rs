@@ -13606,7 +13606,7 @@ mod disposition_tests {
             "tool_name": "Bash", "target": "ls -la", "session_id": sid})).await.unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
         super::super::handler::tool_record_outcome(&state, &serde_json::json!({
-            "action_id": aid, "success": true})).await.unwrap();
+            "action_id": aid, "session_id": sid, "success": true})).await.unwrap();
         {
             let now = crate::server::gate_escalation::now_secs();
             let mut s = state.lock().await;
