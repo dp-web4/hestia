@@ -94,6 +94,9 @@ pub enum Refusal {
     DeviceNamespace,
     /// A segment ending in `.` or space under `\\?\`, where it is literal rather than stripped.
     VerbatimTrailing,
+    /// A name ending in `.` or space that is not the last name in the path, or a last name made
+    /// only of dots and spaces. Win32 strips trailing dots and spaces from the last name only.
+    TrailingDotSpace,
 }
 
 impl Refusal {
@@ -112,6 +115,7 @@ impl Refusal {
             Refusal::Unc => "unc",
             Refusal::DeviceNamespace => "device_namespace",
             Refusal::VerbatimTrailing => "verbatim_trailing",
+            Refusal::TrailingDotSpace => "trailing_dot_space",
         }
     }
 
@@ -156,6 +160,11 @@ impl Refusal {
                 "under \\\\?\\ a trailing '.' or space is part of the name, so it names a different \
                  file from the one without it; remove it or drop the \\\\?\\ prefix"
             }
+            Refusal::TrailingDotSpace => {
+                "a folder name ending in '.' or a space, or a name made only of dots and spaces, \
+                 can name a different folder from the one without them: Windows strips them from \
+                 the last name in a path only. Name each folder as it appears on disk"
+            }
         }
     }
 }
@@ -176,13 +185,32 @@ pub fn canonical(raw: &str, dialect: Dialect) -> Result<String, Refusal> {
     if raw.contains('\0') {
         return Err(Refusal::NulByte);
     }
-    let raw = raw.trim();
+    let raw = trim_input(raw, dialect);
     if raw.is_empty() {
         return Err(Refusal::Empty);
     }
     match dialect {
         Dialect::Posix => canonical_posix(raw),
         Dialect::Windows | Dialect::GitBash => canonical_windows(raw, dialect),
+    }
+}
+
+/// What surrounding whitespace is dropped before conversion.
+///
+/// - POSIX: Unicode whitespace at both ends, as `normalize_scope_path` does.
+/// - Windows: ASCII whitespace only. Win32 keeps every other character, so `file\u{3000}` names
+///   a different file from `file`. Under `\\?\` the end is never trimmed: a verbatim name may end
+///   in a space, which then reaches the segment rules and is refused (Nova, #1745), instead of
+///   being trimmed into the name without it.
+fn trim_input(raw: &str, dialect: Dialect) -> &str {
+    if !dialect.is_windows() {
+        return raw.trim();
+    }
+    let s = raw.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if strip_prefix_either(s, "\\\\?\\").is_some() {
+        s
+    } else {
+        s.trim_end_matches(|c: char| c.is_ascii_whitespace())
     }
 }
 
@@ -259,7 +287,8 @@ fn canonical_windows(raw: &str, dialect: Dialect) -> Result<String, Refusal> {
         return Err(Refusal::Relative);
     };
 
-    let mut out: Vec<String> = Vec::new();
+    // Pass 1: `.` and `..` resolve first, as Win32 does, so a name `..` removes is never opened.
+    let mut out: Vec<&str> = Vec::new();
     for seg in rest.split('/') {
         match seg {
             "" | "." => continue,
@@ -275,20 +304,29 @@ fn canonical_windows(raw: &str, dialect: Dialect) -> Result<String, Refusal> {
         if seg.chars().any(is_invalid_windows_char) {
             return Err(Refusal::InvalidChar);
         }
+        out.push(seg);
+    }
+    // Pass 2: trailing dots and spaces. Win32 strips them from the LAST name only, and only when
+    // no separator follows it: `Windows.` opens `Windows`, but `a.\b`, `...\b` and `a \` keep
+    // the name as written, which can be a different folder (Nova, #1745). Those are refused,
+    // not guessed. A path ending in `.`, `..` or a separator has no last name to strip.
+    let last_raw = rest.rsplit('/').next().unwrap_or("");
+    let ends_in_name = !matches!(last_raw, "" | "." | "..");
+    let n = out.len();
+    let mut canon: Vec<&str> = Vec::with_capacity(n);
+    for (i, seg) in out.into_iter().enumerate() {
         let trimmed = seg.trim_end_matches(['.', ' ']);
         if trimmed.len() != seg.len() {
             if verbatim {
                 return Err(Refusal::VerbatimTrailing);
             }
-            // Win32 strips trailing dots and spaces, so `Windows.` opens `Windows`. A segment of
-            // only dots and spaces (`...`) strips to nothing and names the directory it sits in.
-            if trimmed.is_empty() {
-                continue;
+            if i + 1 != n || !ends_in_name || trimmed.is_empty() {
+                return Err(Refusal::TrailingDotSpace);
             }
         }
-        out.push(trimmed.to_string());
+        canon.push(trimmed);
     }
-    Ok(format!("{drive}:/{}", out.join("/")))
+    Ok(format!("{drive}:/{}", canon.join("/")))
 }
 
 fn strip_prefix_either<'a>(s: &'a str, backslashed: &str) -> Option<&'a str> {
@@ -455,6 +493,7 @@ mod tests {
             Refusal::Unc,
             Refusal::DeviceNamespace,
             Refusal::VerbatimTrailing,
+            Refusal::TrailingDotSpace,
         ] {
             assert!(
                 used.contains(r.code()),
@@ -544,6 +583,52 @@ mod tests {
         assert_eq!(
             canonical(&git_bash, Dialect::Windows),
             Err(Refusal::CurrentDrive)
+        );
+    }
+
+    /// The other half, also against NTFS (Nova, #1745): spellings the table REFUSES for a
+    /// trailing dot or space really can name a different file or folder, so stripping them
+    /// would have pointed a grant or a deny at the wrong one.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_kept_trailing_dot_or_space_is_a_different_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let v = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let v = v.to_str().expect("utf-8").to_string();
+        assert!(v.starts_with(r"\\?\"), "canonicalize returned {v:?}");
+        let native = v[4..].to_string();
+
+        // A verbatim file name ending in a space is its own file.
+        std::fs::write(format!(r"{v}\file "), b"with space").expect("write 'file '");
+        std::fs::write(format!(r"{v}\file"), b"plain").expect("write 'file'");
+        assert_eq!(std::fs::read(format!(r"{v}\file ")).unwrap(), b"with space");
+        assert_eq!(std::fs::read(format!(r"{v}\file")).unwrap(), b"plain");
+        assert_eq!(
+            canonical(&format!(r"{v}\file "), Dialect::Windows),
+            Err(Refusal::VerbatimTrailing),
+            "the input's end is not trimmed under \\\\?\\"
+        );
+        assert_eq!(
+            canonical(&format!(r"{native}\file"), Dialect::Windows)
+                .map(|c| match_key(&c, Dialect::Windows)),
+            canonical(&format!(r"{v}\file"), Dialect::Windows)
+                .map(|c| match_key(&c, Dialect::Windows)),
+        );
+
+        // A folder name ending in '.' is its own folder.
+        std::fs::create_dir(format!(r"{v}\dd.")).expect("mkdir 'dd.'");
+        std::fs::create_dir(format!(r"{v}\dd")).expect("mkdir 'dd'");
+        std::fs::write(format!(r"{v}\dd.\x"), b"dotted").expect("write in 'dd.'");
+        std::fs::write(format!(r"{v}\dd\x"), b"plain").expect("write in 'dd'");
+        assert_eq!(std::fs::read(format!(r"{v}\dd.\x")).unwrap(), b"dotted");
+        assert_eq!(std::fs::read(format!(r"{v}\dd\x")).unwrap(), b"plain");
+        assert_eq!(
+            canonical(&format!(r"{native}\dd.\x"), Dialect::Windows),
+            Err(Refusal::TrailingDotSpace)
+        );
+        assert_eq!(
+            canonical(&format!(r"{native}\dd \x"), Dialect::Windows),
+            Err(Refusal::TrailingDotSpace)
         );
     }
 

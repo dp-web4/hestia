@@ -88,15 +88,81 @@
   },
   {
    "dialect": "windows",
-   "raw": "C:\\a\\...\\b",
-   "ok": "C:/a/b",
-   "why": "a segment of only dots strips to nothing"
+   "raw": "C:\\a.\\..\\b",
+   "ok": "C:/b",
+   "why": "'..' resolves before trimming, so the name it removes is never opened"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\b. \\.",
+   "refused": "trailing_dot_space",
+   "why": "the path ends in '.', not a name, so 'b. ' is not the last name and keeps its trailing dot"
   },
   {
    "dialect": "windows",
    "raw": "  C:\\x  ",
    "ok": "C:/x",
-   "why": "surrounding whitespace trims, as normalize_scope_path does"
+   "why": "surrounding ASCII whitespace trims"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\x\r\n",
+   "ok": "C:/x",
+   "why": "a pasted trailing newline trims"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\file　",
+   "ok": "C:/a/file　",
+   "why": "Windows trims only ASCII spaces; U+3000 is part of the name"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\...\\b",
+   "refused": "trailing_dot_space",
+   "why": "an inner segment of only dots is a name, not an alias of its parent"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a.\\b",
+   "refused": "trailing_dot_space",
+   "why": "an inner name ending in '.' can be a different folder"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a \\b",
+   "refused": "trailing_dot_space",
+   "why": "an inner name ending in a space can be a different folder"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a \\",
+   "refused": "trailing_dot_space",
+   "why": "a trailing separator keeps the space: nothing after it is the last name"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\...",
+   "refused": "trailing_dot_space",
+   "why": "a last name of only dots strips to nothing"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\ . ",
+   "refused": "trailing_dot_space",
+   "why": "a last name of only dots and spaces strips to nothing"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\C:\\a\\file ",
+   "refused": "verbatim_trailing",
+   "why": "under \\\\?\\ a final space is literal; the input's end is not trimmed"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\C:\\a \\b",
+   "refused": "verbatim_trailing",
+   "why": "under \\\\?\\ an inner trailing space is literal"
   },
   {
    "dialect": "windows",
@@ -409,6 +475,18 @@
    "raw": "/a/Windows.",
    "ok": "/a/Windows.",
    "why": "on POSIX a trailing dot is part of the name"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a. /b",
+   "ok": "/a. /b",
+   "why": "on POSIX an inner trailing dot or space is part of the name"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/srv/app　",
+   "ok": "/srv/app",
+   "why": "POSIX trims Unicode whitespace, as normalize_scope_path does"
   },
   {
    "dialect": "posix",

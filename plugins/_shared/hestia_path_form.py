@@ -54,6 +54,11 @@ _REASONS = {
         "under \\\\?\\ a trailing '.' or space is part of the name, so it names a different file "
         "from the one without it; remove it or drop the \\\\?\\ prefix"
     ),
+    "trailing_dot_space": (
+        "a folder name ending in '.' or a space, or a name made only of dots and spaces, can name "
+        "a different folder from the one without them: Windows strips them from the last name in "
+        "a path only. Name each folder as it appears on disk"
+    ),
 }
 
 REFUSAL_CODES = tuple(_REASONS)
@@ -84,12 +89,28 @@ def canonical(raw: str, dialect: str) -> str:
         raise ValueError(f"unknown dialect {dialect!r}")
     if "\0" in raw:
         raise PathRefused("nul_byte")
-    raw = _rust_trim(raw)
+    raw = _trim_input(raw, dialect)
     if not raw:
         raise PathRefused("empty")
     if dialect == POSIX:
         return _canonical_posix(raw)
     return _canonical_windows(raw, dialect)
+
+
+# Rust's char::is_ascii_whitespace: space, \t, \n, \x0c, \r. Not \x0b.
+_ASCII_WHITE_SPACE = " \t\n\x0c\r"
+
+
+def _trim_input(raw: str, dialect: str) -> str:
+    """Mirror of Rust ``trim_input``. POSIX: Unicode whitespace at both ends, as
+    normalize_scope_path does. Windows: ASCII whitespace only, and never the end of a ``\\\\?\\``
+    path, where a final space is part of the name and must reach the refusal (Nova, #1745)."""
+    if dialect == POSIX:
+        return _rust_trim(raw)
+    s = raw.lstrip(_ASCII_WHITE_SPACE)
+    if _strip_prefix_either(s, "\\\\?\\") is not None:
+        return s
+    return s.rstrip(_ASCII_WHITE_SPACE)
 
 
 def _rust_trim(s: str) -> str:
@@ -170,6 +191,7 @@ def _canonical_windows(raw: str, dialect: str) -> str:
     else:
         raise PathRefused("relative")
 
+    # Pass 1: '.' and '..' resolve first, as Win32 does.
     out: list[str] = []
     for seg in rest.split("/"):
         if seg in ("", "."):
@@ -182,14 +204,20 @@ def _canonical_windows(raw: str, dialect: str) -> str:
             raise PathRefused("stream")
         if any(c in _INVALID or ord(c) < 0x20 for c in seg):
             raise PathRefused("invalid_char")
+        out.append(seg)
+    # Pass 2: Win32 strips trailing dots and spaces from the LAST name only, and only when no
+    # separator follows it. Any other kept trailing dot or space is refused (Nova, #1745).
+    ends_in_name = rest.rsplit("/", 1)[-1] not in ("", ".", "..")
+    canon: list[str] = []
+    for i, seg in enumerate(out):
         trimmed = seg.rstrip(". ")
         if len(trimmed) != len(seg):
             if verbatim:
                 raise PathRefused("verbatim_trailing")
-            if not trimmed:
-                continue
-        out.append(trimmed)
-    return f"{drive}:/" + "/".join(out)
+            if i + 1 != len(out) or not ends_in_name or not trimmed:
+                raise PathRefused("trailing_dot_space")
+        canon.append(trimmed)
+    return f"{drive}:/" + "/".join(canon)
 
 
 def match_key(canonical_path: str, dialect: str) -> str:
