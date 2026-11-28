@@ -349,6 +349,14 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_witness_decision", &[
         "let instance_lct = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
+    // ADDED 2026-11-28 (legion-claude, history_witness v1 / entity accounts S2a). NAMES the
+    // entity that owns the witnessed log, from the PROVEN session's plugin_id (never an
+    // argument); `None` (a synthetic member) refuses and records nothing. No derived name is
+    // compared to decide control flow: the witness key is per name, so two aliases of one
+    // member keep separate witness sequences — naming, not a gate. Naming.
+    ("server/handler.rs::tool_witness_history_append", &[
+        "let Some(entity_lct) = s.member_lct(&who.plugin_id) else {",
+    ], SiteClass::Naming),
     // ADDED 2026-07-28 (claude-code, #84 — the RDF projection). The census went red on this
     // site the moment it was written, which is the instrument working: it scheduled the
     // judgment call on the author, at write time, before the PR merged.

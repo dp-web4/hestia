@@ -132,6 +132,10 @@ impl ServerHandler for HestiaServer {
             "hestia_vault_set" => tool_vault_set(&self.state, &args).await,
             "hestia_query_history" => tool_query_history(&self.state, &args).await,
             "hestia_request_witness" => tool_request_witness(&self.state, &args).await,
+            "hestia_witness_history_append" => {
+                tool_witness_history_append(&self.state, &args).await
+            }
+            "hestia_history_witnesses" => tool_history_witnesses(&self.state, &args).await,
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
@@ -324,6 +328,11 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
             | "hestia_open_appeals"
             | "hestia_my_appeals"
             | "hestia_witness_decision"
+            // An idempotent history witness answers with a row an EARLIER request committed,
+            // and the read reports rows other requests committed: neither replies before
+            // those rows are durable.
+            | "hestia_witness_history_append"
+            | "hestia_history_witnesses"
             // #1232 on #1268's rules: a scope claim answers `approved` / `in_force` /
             // `pending` / `refused` / a reservation's state from rows OTHER requests
             // committed (a peer's or the operator's ruling, the request itself), and the
@@ -793,6 +802,40 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_request_witness",
             "Append a custom witness chain event",
+        ),
+        t_args(
+            "hestia_witness_history_append",
+            "Witness one record of YOUR OWN append-only JSONL log (schema hestia:history-witness:v1). The entity is your session's member LCT and the caller basis is 'token'; neither is an argument, and offering entity_lct or caller_uid is refused. seq is the log's own 0-based record index; entry_sha256 is the sha256 of the record's line WITHOUT its LF; prev_sha256 is the entry_sha256 of seq-1 (64 zeros at seq 0). The first witness for a log must be seq 0, and each later one must be last+1, else history_witness.gap. A prev_sha256 that disagrees with the witnessed seq-1, or a different hash at an already-witnessed seq, is history_witness.fork. An exact repeat returns the existing row (idempotent:true). Every refusal is recorded on the chain as a history_witness_refused row. Requires your own live session_id",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["log_name", "seq", "entry_sha256", "prev_sha256"],
+                "properties": {
+                    "log_name": {"type": "string", "enum": crate::server::history_witness::LOG_NAMES, "description": "The log, from the closed v1 set. A compacted or rotated log is a NEW name (v2)."},
+                    "seq": {"type": "integer", "minimum": 0, "description": "The log's own 0-based record index."},
+                    "entry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lowercase hex sha256 of the record's line without its terminating LF."},
+                    "prev_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "entry_sha256 of seq-1; 64 zeros at seq 0."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. The entity is derived from it."},
+                    "sessionId": {"type": "string", "description": "Camel-case spelling of session_id."}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_history_witnesses",
+            "Read the history_witness rows of one entity's log in seq order, from from_seq (default 0), at most limit rows (default and max 1000). Returns the rows, last_witnessed_seq over the whole log, and next_from_seq when more follow. A verifier compares them with the log: fewer records than last_witnessed_seq+1 is truncation, a hash mismatch at i is a rewrite, more records is an unwitnessed tail (pending, not tampering). Under caller_basis 'token' a matching chain proves integrity only, not which uid wrote the log",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["entity_lct", "log_name"],
+                "properties": {
+                    "entity_lct": {"type": "string", "minLength": 1, "description": "The entity whose log to read (the entity_lct a witness reply reported)."},
+                    "log_name": {"type": "string", "enum": crate::server::history_witness::LOG_NAMES, "description": "The log, from the closed v1 set."},
+                    "from_seq": {"type": "integer", "minimum": 0, "description": "First seq to return; default 0."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": crate::server::history_witness::READ_LIMIT_MAX, "description": "Most rows to return; default and max 1000."},
+                    "session_id": {"type": "string", "description": "Optional; the read is not session-bound."},
+                    "sessionId": {"type": "string", "description": "Camel-case spelling of session_id."}
+                }
+            }),
         ),
         t(
             "hestia_notify",
@@ -3127,6 +3170,10 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "channel_send_unrecorded",
     "channel_answer",
     "channel_binding_set",
+    // history_witness v1: daemon-written only. A forged witness would vouch for a log record
+    // the entity never offered; a forged refusal would fake a fork.
+    super::history_witness::WITNESS_EVENT,
+    super::history_witness::REFUSED_EVENT,
 ];
 
 /// Reversal kinds — the operational shape of a reversal, distinct from the
@@ -5516,6 +5563,219 @@ async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
         }),
     )?;
     Ok(json!({"witnessEntryHash": entry.hash}))
+}
+
+/// `hestia_witness_history_append` — witness one record of the caller's own append-only log
+/// (history_witness v1; the rules and the schema live in `super::history_witness`).
+///
+/// The entity is the SESSION's member LCT and the caller basis is `token`; neither is an
+/// argument. Order: prove the session (unproven → refused, NOT recorded: there is no entity to
+/// own a row), the law gate (`witness_append`, as `hestia_request_witness`; a deny records its
+/// own `policy_decision`), then the offer is validated and ruled under the state lock, so two
+/// appends to one log cannot both pass the `last + 1` test. Every refusal from there on is a
+/// `history_witness_refused` row.
+async fn tool_witness_history_append(state: &SharedState, args: &Value) -> ToolResult {
+    use super::history_witness as hw;
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            hw::code::UNATTRIBUTED,
+            "witnessing a history record requires your own live session_id (from \
+             hestia_connect): the entity whose log this is comes from the session, never \
+             from the arguments",
+            None,
+        ));
+    };
+    let Some(entity_lct) = s.member_lct(&who.plugin_id) else {
+        return Ok(hestia_error_envelope(
+            hw::code::NO_ENTITY,
+            "this session's member maps to no entity LCT (a synthetic member), so there is \
+             no entity whose history could be witnessed",
+            Some(json!({"plugin_id": who.plugin_id})),
+        ));
+    };
+    let gate_target: String = args
+        .get("log_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(hw::OFFERED_FIELD_MAX)
+        .collect();
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_witness_history_append",
+        "witness_append",
+        &gate_target,
+    ) {
+        return Ok(denied);
+    }
+
+    let ruled = match hw::parse_offer(args) {
+        Err(r) => Err(r),
+        Ok(offer) => {
+            let chain = s.chain_store.clone();
+            let decision = hw::decide(&offer, |seq| {
+                Ok(chain
+                    .event_by_key(&hw::event_key(&entity_lct, &offer.log_name, seq))?
+                    .and_then(hw::Witnessed::from_row))
+            })?;
+            match decision {
+                hw::Decision::Refuse(r) => Err(r),
+                hw::Decision::Existing(row) => Ok((row, true)),
+                hw::Decision::Append => {
+                    let key = hw::event_key(&entity_lct, &offer.log_name, offer.seq);
+                    let row = s.append_chain_once(
+                        &key,
+                        hw::WITNESS_EVENT,
+                        hw::witness_data(&entity_lct, &offer),
+                    )?;
+                    Ok((row, false))
+                }
+            }
+        }
+    };
+    match ruled {
+        Ok((row, idempotent)) => Ok(json!({
+            "witnessEntryHash": row.hash,
+            "chainPosition": row.chain_position,
+            "idempotent": idempotent,
+            "entityLct": entity_lct,
+            "witness": row.event_data,
+        })),
+        Err(refusal) => {
+            let offered = hw::offered_fields(args);
+            let recorded = s.append_chain(
+                hw::REFUSED_EVENT,
+                hw::refusal_data(&entity_lct, &refusal, offered.clone()),
+            );
+            let (hash, err) = match recorded {
+                Ok(e) => (Some(e.hash), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            };
+            Ok(hestia_error_envelope(
+                refusal.code,
+                &refusal.message,
+                Some(json!({
+                    "refusalEntryHash": hash,
+                    "refusalRecorded": hash.is_some(),
+                    "refusalRecordError": err,
+                    "entityLct": entity_lct,
+                    "offered": offered,
+                    "detail": refusal.detail,
+                })),
+            ))
+        }
+    }
+}
+
+/// `hestia_history_witnesses` — the witness rows of one `(entity, log)` in seq order.
+///
+/// Not session-bound: the rows hold hashes only, and the verifier reading them is usually not
+/// the entity. A malformed read is refused with the append's codes but records nothing — a
+/// read moves no state, so there is no act to witness.
+async fn tool_history_witnesses(state: &SharedState, args: &Value) -> ToolResult {
+    use super::history_witness as hw;
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !hw::READ_ACCEPTED_KEYS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            return Ok(hestia_error_envelope(
+                hw::code::UNKNOWN_ARGUMENT,
+                &format!(
+                    "unknown argument key(s): {}; accepted keys are: {}",
+                    unknown.join(", "),
+                    hw::READ_ACCEPTED_KEYS.join(", ")
+                ),
+                Some(json!({"unknown_keys": unknown})),
+            ));
+        }
+    }
+    let Some(entity_lct) = args
+        .get("entity_lct")
+        .and_then(Value::as_str)
+        .filter(|e| !e.trim().is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(hestia_error_envelope(
+            "history_witness.missing_entity",
+            "entity_lct is required: the entity whose log to read",
+            None,
+        ));
+    };
+    let log_name = match args.get("log_name").and_then(Value::as_str) {
+        Some(l) if hw::is_log_name(l) => l.to_string(),
+        _ => {
+            return Ok(hestia_error_envelope(
+                hw::code::UNKNOWN_LOG,
+                &format!("log_name must be one of {}", hw::LOG_NAMES.join(", ")),
+                Some(json!({"log_names": hw::LOG_NAMES})),
+            ));
+        }
+    };
+    let from_seq = match args.get("from_seq") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(n) => n,
+            None => {
+                return Ok(hestia_error_envelope(
+                    hw::code::MALFORMED_SEQ,
+                    "from_seq must be a non-negative integer",
+                    None,
+                ));
+            }
+        },
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => hw::READ_LIMIT_MAX,
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=hw::READ_LIMIT_MAX).contains(&n) => n,
+            _ => {
+                return Ok(hestia_error_envelope(
+                    "history_witness.malformed_limit",
+                    &format!("limit must be an integer in 1..={}", hw::READ_LIMIT_MAX),
+                    None,
+                ));
+            }
+        },
+    };
+
+    let chain = state.lock().await.chain_store.clone();
+    let at = |seq: u64| -> anyhow::Result<Option<crate::storage::chain::ChainEntry>> {
+        Ok(chain
+            .event_by_key(&hw::event_key(&entity_lct, &log_name, seq))?
+            .filter(|r| r.event_type == hw::WITNESS_EVENT))
+    };
+    let last = hw::last_witnessed(|i| Ok(at(i)?.is_some()))?;
+    let mut rows = Vec::new();
+    let mut seq = from_seq;
+    while (rows.len() as u64) < limit {
+        match at(seq)? {
+            Some(r) => rows.push(r),
+            None => break,
+        }
+        match seq.checked_add(1) {
+            Some(n) => seq = n,
+            None => break,
+        }
+    }
+    let next_from_seq = match last {
+        Some(l) if !rows.is_empty() && seq <= l => Some(seq),
+        _ => None,
+    };
+    Ok(json!({
+        "schema": hw::SCHEMA,
+        "entityLct": entity_lct,
+        "logName": log_name,
+        "fromSeq": from_seq,
+        "lastWitnessedSeq": last,
+        "nextFromSeq": next_from_seq,
+        "witnesses": rows,
+    }))
 }
 
 /// `hestia_notify` — the citizen side of an inbound HUB→citizen sealed notice.
@@ -40977,5 +41237,370 @@ mod verdict_feedback_tests {
         }
         assert_eq!(out["feedback"]["level"], json!("act"));
         assert_eq!(out["feedback"]["serves"], json!("unknown"));
+    }
+}
+
+/// history_witness v1 through the MCP tool functions (entity accounts S2a). The pure rules are
+/// pinned in `super::history_witness::tests`; these pin what only the daemon can show: the
+/// entity comes from the session, rows land on the real chain with the real framing, every
+/// refusal is a row, and the read returns rows in seq order.
+#[cfg(test)]
+mod history_witness_tool_tests {
+    use super::*;
+    use crate::server::history_witness as hw;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin_id: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": plugin_id, "host_agent": "t"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn h(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    /// The entry hash of record i in these tests: the hex digit i mod 16, repeated.
+    fn e(i: u64) -> String {
+        h(std::char::from_digit((i % 16) as u32, 16).unwrap())
+    }
+
+    fn prev(i: u64) -> String {
+        if i == 0 { hw::ZERO_SHA256.to_string() } else { e(i - 1) }
+    }
+
+    async fn append(state: &SharedState, sid: &str, log: &str, seq: u64, entry: &str, prev: &str) -> Value {
+        tool_witness_history_append(
+            state,
+            &json!({"session_id": sid, "log_name": log, "seq": seq, "entry_sha256": entry, "prev_sha256": prev}),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn witness_n(state: &SharedState, sid: &str, log: &str, n: u64) {
+        for i in 0..n {
+            let r = append(state, sid, log, i, &e(i), &prev(i)).await;
+            assert!(r.get("_hestia_error").is_none(), "seq {i}: {r}");
+        }
+    }
+
+    async fn rows_of(state: &SharedState, event_type: &str) -> Vec<crate::storage::chain::ChainEntry> {
+        let s = state.lock().await;
+        let mut rows: Vec<_> =
+            s.recent_chain(10_000).into_iter().filter(|r| r.event_type == event_type).collect();
+        rows.sort_by_key(|r| r.chain_position);
+        rows
+    }
+
+    fn code(r: &Value) -> &str {
+        r["_hestia_error"]["code"].as_str().unwrap_or("<no error>")
+    }
+
+    #[tokio::test]
+    async fn the_first_witness_at_zero_lands_one_v1_row_with_the_session_entity() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        // A row ahead of the witness, so the link check below has a predecessor to name.
+        state.lock().await.append_chain("test_marker", json!({})).unwrap();
+        let r = append(&state, &sid, "self_log", 0, &e(0), hw::ZERO_SHA256).await;
+        assert_eq!(r["idempotent"], false, "{r}");
+        let entity = state.lock().await.member_lct("legion-being").unwrap();
+        assert_eq!(r["entityLct"], json!(entity));
+        let rows = rows_of(&state, hw::WITNESS_EVENT).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(r["witnessEntryHash"], json!(row.hash));
+        assert_eq!(row.event_data, json!({
+            "schema": "hestia:history-witness:v1",
+            "entity_lct": entity,
+            "log_name": "self_log",
+            "seq": 0,
+            "entry_sha256": e(0),
+            "prev_sha256": hw::ZERO_SHA256,
+            "caller_uid": null,
+            "caller_basis": "token",
+        }));
+        // The existing framing: an ordinary chain row, linked to its predecessor.
+        let s = state.lock().await;
+        let before = s.chain_store.read_from(row.chain_position - 1, 1).unwrap();
+        assert_eq!(row.prev_hash, before[0].hash);
+    }
+
+    #[tokio::test]
+    async fn a_first_witness_at_k_is_a_recorded_gap() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        let r = append(&state, &sid, "settled_log", 4, &e(4), &e(3)).await;
+        assert_eq!(code(&r), hw::code::GAP, "{r}");
+        assert_eq!(r["_hestia_error"]["data"]["detail"]["first_witness"], true);
+        assert_eq!(r["_hestia_error"]["data"]["detail"]["expected_seq"], 0);
+        assert!(rows_of(&state, hw::WITNESS_EVENT).await.is_empty(), "nothing witnessed");
+        let refused = rows_of(&state, hw::REFUSED_EVENT).await;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(r["_hestia_error"]["data"]["refusalEntryHash"], json!(refused[0].hash));
+        assert_eq!(refused[0].event_data["code"], hw::code::GAP);
+        assert_eq!(refused[0].event_data["offered"], json!({
+            "log_name": "settled_log", "seq": 4, "entry_sha256": e(4), "prev_sha256": e(3),
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_skipped_seq_is_a_gap_naming_the_last_witnessed() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        witness_n(&state, &sid, "tune_log", 3).await;
+        let r = append(&state, &sid, "tune_log", 5, &e(5), &e(4)).await;
+        assert_eq!(code(&r), hw::code::GAP, "{r}");
+        let d = &r["_hestia_error"]["data"]["detail"];
+        assert_eq!((d["last_witnessed_seq"].clone(), d["expected_seq"].clone()), (json!(2), json!(3)));
+        // And the next one in order still lands.
+        let ok = append(&state, &sid, "tune_log", 3, &e(3), &e(2)).await;
+        assert!(ok.get("_hestia_error").is_none(), "{ok}");
+        assert_eq!(rows_of(&state, hw::WITNESS_EVENT).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_prev_that_disagrees_with_seq_minus_one_is_a_recorded_fork() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        witness_n(&state, &sid, "skills_log", 2).await;
+        let r = append(&state, &sid, "skills_log", 2, &e(2), &h('f')).await;
+        assert_eq!(code(&r), hw::code::FORK, "{r}");
+        assert_eq!(r["_hestia_error"]["data"]["detail"]["reason"], "prev_mismatch");
+        assert_eq!(r["_hestia_error"]["data"]["detail"]["witnessed_prev_entry_sha256"], json!(e(1)));
+        let refused = rows_of(&state, hw::REFUSED_EVENT).await;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].event_data["code"], hw::code::FORK);
+        assert_eq!(rows_of(&state, hw::WITNESS_EVENT).await.len(), 2, "the fork appended no witness");
+    }
+
+    #[tokio::test]
+    async fn a_different_hash_at_a_witnessed_seq_is_a_fork_and_the_witness_stands() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        witness_n(&state, &sid, "self_log", 3).await;
+        let r = append(&state, &sid, "self_log", 1, &h('e'), &e(0)).await;
+        assert_eq!(code(&r), hw::code::FORK, "{r}");
+        assert_eq!(r["_hestia_error"]["data"]["detail"]["reason"], "same_seq_different_hash");
+        assert_eq!(r["_hestia_error"]["data"]["detail"]["witnessed_entry_sha256"], json!(e(1)));
+        let read = tool_history_witnesses(
+            &state,
+            &json!({"entity_lct": r["_hestia_error"]["data"]["entityLct"], "log_name": "self_log", "from_seq": 1, "limit": 1}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["witnesses"][0]["event_data"]["entry_sha256"], json!(e(1)), "{read}");
+        assert_eq!(rows_of(&state, hw::REFUSED_EVENT).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_exact_repeat_returns_the_existing_row_and_appends_nothing() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        witness_n(&state, &sid, "self_log", 2).await;
+        let first = rows_of(&state, hw::WITNESS_EVENT).await;
+        let len_before = state.lock().await.chain_store.len().unwrap();
+        for seq in [0u64, 1] {
+            let r = append(&state, &sid, "self_log", seq, &e(seq), &prev(seq)).await;
+            assert_eq!(r["idempotent"], true, "{r}");
+            assert_eq!(r["witnessEntryHash"], json!(first[seq as usize].hash));
+        }
+        // A second session of the same member is the same entity, so the same repeat.
+        let sid2 = connect(&state, "legion-being").await;
+        let r = append(&state, &sid2, "self_log", 1, &e(1), &e(0)).await;
+        assert_eq!(r["idempotent"], true, "{r}");
+        assert_eq!(state.lock().await.chain_store.len().unwrap(), len_before, "no row appended");
+    }
+
+    #[tokio::test]
+    async fn malformed_offers_are_refused_with_clear_codes_and_each_is_a_row() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        let cases = [
+            (json!({"log_name": "other_log", "seq": 0, "entry_sha256": e(0), "prev_sha256": hw::ZERO_SHA256}), hw::code::UNKNOWN_LOG),
+            (json!({"seq": 0, "entry_sha256": e(0), "prev_sha256": hw::ZERO_SHA256}), hw::code::UNKNOWN_LOG),
+            (json!({"log_name": "self_log", "seq": -1, "entry_sha256": e(0), "prev_sha256": hw::ZERO_SHA256}), hw::code::MALFORMED_SEQ),
+            (json!({"log_name": "self_log", "seq": 0, "entry_sha256": h('A'), "prev_sha256": hw::ZERO_SHA256}), hw::code::MALFORMED_HEX),
+            (json!({"log_name": "self_log", "seq": 0, "entry_sha256": e(0), "prev_sha256": "00"}), hw::code::MALFORMED_HEX),
+            // The entity comes from the session: naming one is refused, not honoured.
+            (json!({"log_name": "self_log", "seq": 0, "entry_sha256": e(0), "prev_sha256": hw::ZERO_SHA256, "entity_lct": "lct:web4:member:someone"}), hw::code::UNKNOWN_ARGUMENT),
+            (json!({"log_name": "self_log", "seq": 0, "entry_sha256": e(0), "prev_sha256": hw::ZERO_SHA256, "caller_uid": 0}), hw::code::UNKNOWN_ARGUMENT),
+        ];
+        for (i, (mut args, want)) in cases.into_iter().enumerate() {
+            args["session_id"] = json!(sid);
+            let r = tool_witness_history_append(&state, &args).await.unwrap();
+            assert_eq!(code(&r), want, "case {i}: {r}");
+            let refused = rows_of(&state, hw::REFUSED_EVENT).await;
+            assert_eq!(refused.len(), i + 1, "case {i} recorded");
+            assert_eq!(refused[i].event_data["code"], want);
+            assert_eq!(refused[i].event_data["caller_basis"], "token");
+        }
+        assert!(rows_of(&state, hw::WITNESS_EVENT).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unproven_caller_is_refused_and_nothing_is_written() {
+        let (_dir, state) = test_state().await;
+        let _someone = connect(&state, "legion-being").await;
+        let len_before = state.lock().await.chain_store.len().unwrap();
+        for sid in [None, Some(Uuid::new_v4().to_string())] {
+            let mut args = json!({"log_name": "self_log", "seq": 0, "entry_sha256": e(0), "prev_sha256": hw::ZERO_SHA256});
+            if let Some(sid) = sid {
+                args["session_id"] = json!(sid);
+            }
+            let r = tool_witness_history_append(&state, &args).await.unwrap();
+            assert_eq!(code(&r), hw::code::UNATTRIBUTED, "{r}");
+        }
+        assert_eq!(state.lock().await.chain_store.len().unwrap(), len_before);
+    }
+
+    #[tokio::test]
+    async fn law_can_deny_the_append_as_witness_append() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(
+                "role:constellation:mesh-worker".into(),
+                crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    default_policy: crate::policy::PolicyDecision::Allow,
+                    enforce: true,
+                    rules: vec![crate::policy::PolicyRule {
+                        id: "deny-witness".into(),
+                        name: "deny witness".into(),
+                        priority: 0,
+                        decision: crate::policy::PolicyDecision::Deny,
+                        reason: Some("unattended".into()),
+                        r#match: crate::policy::PolicyMatch {
+                            categories: Some(vec!["witness_append".into()]),
+                            ..Default::default()
+                        },
+                    }],
+                }),
+            );
+        }
+        let sid = tool_connect(
+            &state,
+            &json!({"plugin_id": "mw", "host_agent": "t", "role": "role:constellation:mesh-worker"}),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = append(&state, &sid, "self_log", 0, &e(0), hw::ZERO_SHA256).await;
+        assert_eq!(code(&r), "hestia.policy_denied", "{r}");
+        assert!(rows_of(&state, hw::WITNESS_EVENT).await.is_empty());
+        let denies = rows_of(&state, "policy_decision").await;
+        assert_eq!(denies.last().unwrap().event_data["tool_name"], "hestia_witness_history_append");
+    }
+
+    #[tokio::test]
+    async fn the_read_returns_rows_in_seq_order_from_from_seq_per_entity_and_log() {
+        let (_dir, state) = test_state().await;
+        let a = connect(&state, "legion-being").await;
+        let b = connect(&state, "nomad-being").await;
+        // Interleave two entities and two logs so chain order is not seq order per log.
+        for i in 0..5u64 {
+            for (sid, log) in [(&a, "self_log"), (&b, "self_log"), (&a, "tune_log")] {
+                let r = append(&state, sid, log, i, &e(i), &prev(i)).await;
+                assert!(r.get("_hestia_error").is_none(), "{r}");
+            }
+        }
+        let entity_a = state.lock().await.member_lct("legion-being").unwrap();
+        let read = |from: Option<u64>, limit: Option<u64>| {
+            let mut args = json!({"entity_lct": entity_a, "log_name": "self_log"});
+            if let Some(f) = from {
+                args["from_seq"] = json!(f);
+            }
+            if let Some(l) = limit {
+                args["limit"] = json!(l);
+            }
+            let state = state.clone();
+            async move { tool_history_witnesses(&state, &args).await.unwrap() }
+        };
+        let seqs = |r: &Value| -> Vec<u64> {
+            r["witnesses"].as_array().unwrap().iter().map(|w| w["event_data"]["seq"].as_u64().unwrap()).collect()
+        };
+        let all = read(None, None).await;
+        assert_eq!(seqs(&all), vec![0, 1, 2, 3, 4], "{all}");
+        assert_eq!(all["lastWitnessedSeq"], 4);
+        assert_eq!(all["nextFromSeq"], Value::Null);
+        for w in all["witnesses"].as_array().unwrap() {
+            assert_eq!(w["event_data"]["entity_lct"], json!(entity_a));
+            assert_eq!(w["event_data"]["log_name"], "self_log");
+        }
+        let from2 = read(Some(2), None).await;
+        assert_eq!(seqs(&from2), vec![2, 3, 4]);
+        let page = read(Some(1), Some(2)).await;
+        assert_eq!(seqs(&page), vec![1, 2]);
+        assert_eq!(page["nextFromSeq"], 3);
+        let past = read(Some(9), None).await;
+        assert_eq!(seqs(&past), Vec::<u64>::new());
+        assert_eq!(past["lastWitnessedSeq"], 4);
+        // prev chaining holds inside the returned rows.
+        let ws = all["witnesses"].as_array().unwrap();
+        for pair in ws.windows(2) {
+            assert_eq!(pair[1]["event_data"]["prev_sha256"], pair[0]["event_data"]["entry_sha256"]);
+        }
+        // An unknown entity has nothing witnessed; an unknown log is refused, recording nothing.
+        let none = tool_history_witnesses(&state, &json!({"entity_lct": "lct:nobody", "log_name": "self_log"})).await.unwrap();
+        assert_eq!(none["lastWitnessedSeq"], Value::Null);
+        let len_before = state.lock().await.chain_store.len().unwrap();
+        let bad = tool_history_witnesses(&state, &json!({"entity_lct": entity_a, "log_name": "x_log"})).await.unwrap();
+        assert_eq!(code(&bad), hw::code::UNKNOWN_LOG);
+        let bad = tool_history_witnesses(&state, &json!({"entity_lct": entity_a, "log_name": "self_log", "limit": 0})).await.unwrap();
+        assert_eq!(code(&bad), "history_witness.malformed_limit");
+        assert_eq!(state.lock().await.chain_store.len().unwrap(), len_before, "reads record nothing");
+    }
+
+    #[tokio::test]
+    async fn request_witness_cannot_forge_either_history_event() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        for et in [hw::WITNESS_EVENT, hw::REFUSED_EVENT] {
+            let r = tool_request_witness(
+                &state,
+                &json!({"event_type": et, "event_data": {}, "session_id": sid}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(code(&r), "hestia.witness_reserved_event", "{et}: {r}");
+        }
+    }
+
+    /// The advertised arguments are exactly the honoured ones, both tools strict.
+    #[test]
+    fn the_schemas_advertise_exactly_the_honoured_keys() {
+        let tools = hestia_tools();
+        for (name, accepted, required) in [
+            ("hestia_witness_history_append", hw::APPEND_ACCEPTED_KEYS, &["log_name", "seq", "entry_sha256", "prev_sha256"][..]),
+            ("hestia_history_witnesses", hw::READ_ACCEPTED_KEYS, &["entity_lct", "log_name"][..]),
+        ] {
+            let tool = tools.iter().find(|t| t.name == name).expect("advertised");
+            let schema = Value::Object((*tool.input_schema).clone());
+            let mut advertised: Vec<&str> =
+                schema["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            advertised.sort_unstable();
+            let mut honoured = accepted.to_vec();
+            honoured.sort_unstable();
+            assert_eq!(advertised, honoured, "{name}");
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(schema["required"], json!(required));
+            assert!(!advertised.contains(&"caller_uid"));
+        }
+        assert!(reports_shared_state("hestia_witness_history_append"));
+        assert!(reports_shared_state("hestia_history_witnesses"));
     }
 }
