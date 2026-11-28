@@ -1969,6 +1969,56 @@ impl SqliteChainStore {
     /// distinguishes the last hour, the last day, and older, so nothing before the window can
     /// change its answer. Positions grow with time, so the window's first position is one
     /// seek on `idx_chain_timestamp`, and the scan stops there.
+    /// How many rows of `event_types` name `plugin_id` as `$.plugin_id` at or after `since` (#1748).
+    ///
+    /// The retire guard's count. It replaces one global page of `ROUTINE_CHAIN_MAX` rows that was
+    /// filtered afterwards: once a machine had more acts than that in the window, every id came
+    /// back unmeasurable, phantoms included, and the refusal called each of them LIVE. The count
+    /// is per member, and bounded the way [`Self::latest_actor_act_since`] is: one seek on
+    /// `idx_chain_timestamp` for the window's first position, then the rowid range from there.
+    pub fn count_member_acts_since(
+        &self,
+        plugin_id: &str,
+        since: &str,
+        event_types: &[&str],
+    ) -> Result<u64> {
+        if event_types.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.observed(&self.read_conn)?;
+        let floor: Option<i64> = conn
+            .query_row(
+                "SELECT chain_position FROM chain_entries WHERE timestamp >= ?1
+                 ORDER BY timestamp ASC LIMIT 1",
+                params![since],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(floor) = floor else {
+            return Ok(0);
+        };
+        let placeholders = (0..event_types.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        // `+event_type` keeps the planner on the rowid range, as in `latest_actor_act_since`.
+        let sql = format!(
+            "SELECT COUNT(*) FROM chain_entries
+             WHERE chain_position >= ?2
+               AND +event_type IN ({placeholders})
+               AND json_extract(event_data, '$.plugin_id') = ?1"
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(plugin_id.to_string()), Box::new(floor)];
+        for t in event_types {
+            binds.push(Box::new(t.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(refs.as_slice(), |row| row.get(0))?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     pub fn latest_actor_act_since(&self, plugin_id: &str, since: &str) -> Result<Option<String>> {
         let conn = self.observed(&self.read_conn)?;
         let floor: Option<i64> = conn

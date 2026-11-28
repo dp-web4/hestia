@@ -8181,24 +8181,17 @@ const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
 /// `Err` when the chain could not be read. NOT zero: the first cut wrote `.unwrap_or(0)`, which
 /// turned a scan failure into "never acted" and let the live seat retire with no confirm (cbp,
 /// PR #1100 review, finding 4). A guard that cannot measure must say so, not pass.
+///
+/// COUNTS THIS ID, NOT THE WINDOW (#1748). This was one global page of `ROUTINE_CHAIN_MAX` rows,
+/// filtered to the id afterwards, and any overflow was an `Err` reading "this member is LIVE".
+/// On cbp the whole machine passes 1,000 acts a day, so every id, two never-acted phantoms
+/// included, was refused as live-but-unmeasurable, and no route in the UI could retire them.
+/// The count is now per member, so "unmeasurable" means only that the chain could not be read.
 fn agent_acts_since(s: &crate::server::state::ServerState, plugin_id: &str, cutoff: &str) -> Result<usize, String> {
-    let want = plugin_id.trim().to_string();
     s.chain_store
-        .scan_recent_page(Some(cutoff), Some(AGENT_ACT_EVENTS), None,
-                          crate::storage::chain::ROUTINE_CHAIN_MAX, |row| {
-            serde_json::from_str::<serde_json::Value>(row.event_data)
-                .ok()
-                .and_then(|v| v.get("plugin_id").and_then(|p| p.as_str()).map(str::to_string))
-        })
+        .count_member_acts_since(plugin_id.trim(), cutoff, AGENT_ACT_EVENTS)
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         .map_err(|e| e.to_string())
-        .and_then(|page| {
-            if page.before_position.is_some() {
-                Err(format!("more than {} recent acts; this member is LIVE but the exact count is unmeasurable",
-                            crate::storage::chain::ROUTINE_CHAIN_MAX))
-            } else {
-                Ok(page.rows.into_iter().filter(|id| *id == want).count())
-            }
-        })
 }
 
 /// PURE: what the retire guard says, given what it could measure. `Err` (unmeasurable) is a
@@ -12863,8 +12856,10 @@ mod disposition_tests {
         assert!(retire_guard(&Ok(3), true).is_none());
     }
 
+    /// #488 kept: activity beyond one routine page is not truncated. #1748: it is COUNTED, not
+    /// turned into "unmeasurable", because the count is per member rather than a filtered page.
     #[tokio::test]
-    async fn activity_beyond_the_routine_page_is_unmeasurable_not_truncated_488() {
+    async fn activity_beyond_the_routine_page_is_counted_not_truncated_488_1748() {
         let (_dir, state) = test_state().await;
         {
             let s = state.lock().await;
@@ -12876,10 +12871,56 @@ mod disposition_tests {
         }
         let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let s = state.lock().await;
-        let err = agent_acts_since(&s, "kimi-code", &cutoff).unwrap_err();
-        assert!(err.contains("unmeasurable"), "{err}");
-        let refusal = retire_guard(&Err(err), false).expect("overflow must fail closed");
-        assert_eq!(refusal["unmeasurable"], serde_json::json!(true));
+        let n = agent_acts_since(&s, "kimi-code", &cutoff).expect("a busy member is measurable");
+        assert_eq!(n as u64, crate::storage::chain::ROUTINE_CHAIN_MAX + 1);
+        let refusal = retire_guard(&Ok(n), false).expect("a live member is refused");
+        assert_eq!(refusal["acts_recently"], serde_json::json!(n));
+    }
+
+    /// #1748, the case as found on cbp: a machine busy with OTHER members' acts must not make a
+    /// never-acted id unmeasurable. It counts zero and retires without `confirm_active`.
+    #[tokio::test]
+    async fn a_phantom_on_a_busy_machine_counts_zero_and_retires_1748() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "no-such-member").await;
+        {
+            let s = state.lock().await;
+            for i in 0..=crate::storage::chain::ROUTINE_CHAIN_MAX {
+                let ev = if i % 2 == 0 { "outcome" } else { "policy_decision" };
+                s.append_chain(ev, serde_json::json!({ "plugin_id": "claude-code", "success": true }))
+                    .unwrap();
+            }
+            // An operator-written row ABOUT the phantom is not an act by it.
+            s.append_chain("scope_grant", serde_json::json!({ "plugin_id": "no-such-member", "path": "/x" }))
+                .unwrap();
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        {
+            let s = state.lock().await;
+            assert_eq!(agent_acts_since(&s, "no-such-member", &cutoff), Ok(0));
+            assert_eq!(agent_acts_since(&s, " no-such-member ", &cutoff), Ok(0), "the id is trimmed");
+            assert_eq!(
+                agent_acts_since(&s, "claude-code", &cutoff).map(|n| n as u64),
+                Ok(crate::storage::chain::ROUTINE_CHAIN_MAX + 1),
+                "the busy member is counted in full, both event types"
+            );
+        }
+        let (st, b) = retire(&state, "no-such-member", serde_json::json!({"reason": "phantom", "ref": "#1748"})).await;
+        assert_eq!(st, StatusCode::OK, "a phantom retires without confirm_active: {b}");
+        assert!(state.lock().await.retired_members.is_retired("no-such-member"));
+    }
+
+    /// Acts before the window do not count: the window's floor is the first row at or after it.
+    #[tokio::test]
+    async fn acts_before_the_window_are_not_counted_1748() {
+        let (_dir, state) = test_state().await;
+        {
+            let s = state.lock().await;
+            s.append_chain("outcome", serde_json::json!({ "plugin_id": "kimi-code" })).unwrap();
+        }
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let s = state.lock().await;
+        assert_eq!(agent_acts_since(&s, "kimi-code", &future), Ok(0));
     }
 
     /// cbp, finding 5: `retired_member_connected` was documented and did not exist.

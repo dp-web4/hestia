@@ -2607,6 +2607,11 @@
       if (res.status === 409 && out && out.acts_recently) {
         if (!confirm(`"${id}" has taken ${out.acts_recently} act(s) in the last ${out.window_hours}h — this is a LIVE member, not a phantom.\n\nRetiring it revokes its standing grants. Continue?`)) return;
         [res, out] = await send(true);
+      } else if (res.status === 409 && out && out.unmeasurable) {
+        // #1748: the server asks the operator to confirm past a failed look, so this page must
+        // offer that, not dead-end at "retire failed". It shows the server's reason in full.
+        if (!confirm(`hestia could not count "${id}"'s recent acts, so whether it is live is unknown:\n\n${out.error}\n\nRetire it anyway? Only if you have checked yourself that it is not a live seat.`)) return;
+        [res, out] = await send(true);
       }
       if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
       await tick();
