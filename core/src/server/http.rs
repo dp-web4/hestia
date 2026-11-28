@@ -1691,6 +1691,17 @@ pub async fn serve_with_callback(
     bind: &str,
     callback_keypair: Option<web4_core::crypto::KeyPair>,
 ) -> Result<()> {
+    serve_with_options(state, bind, callback_keypair, None).await
+}
+
+/// As [`serve_with_callback`], plus an optional unix-socket listener serving the SAME app, whose
+/// requests carry the caller's kernel uid (S2a.0, [`super::peer_cred`]).
+pub async fn serve_with_options(
+    state: SharedState,
+    bind: &str,
+    callback_keypair: Option<web4_core::crypto::KeyPair>,
+    unix_socket: Option<std::path::PathBuf>,
+) -> Result<()> {
     super::api_version::mark_process_started();
     let addr: SocketAddr = bind
         .parse()
@@ -2128,10 +2139,24 @@ pub async fn serve_with_callback(
         shutdown_clone.cancel();
     });
 
+    #[cfg(unix)]
+    let unix_task = unix_socket.map(|path| {
+        tokio::spawn(super::peer_cred::serve_unix(app.clone(), path, shutdown_token.clone()))
+    });
+    #[cfg(not(unix))]
+    if unix_socket.is_some() {
+        anyhow::bail!("--unix is available only on unix targets");
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
         .await
         .context("axum::serve failed")?;
+
+    #[cfg(unix)]
+    if let Some(t) = unix_task {
+        t.await.context("unix listener task")??;
+    }
 
     Ok(())
 }

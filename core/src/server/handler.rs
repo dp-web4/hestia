@@ -74,8 +74,15 @@ impl ServerHandler for HestiaServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // S2a.0: the kernel's account of the caller, present only for a unix-socket connection
+        // (`peer_cred::serve_unix` stamps it on the HTTP request; rmcp carries the request parts).
+        let caller_cred = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|p| p.extensions.get::<super::peer_cred::CallerCred>())
+            .copied();
         let name = request.name.to_string();
         let args: Value = request
             .arguments
@@ -93,7 +100,7 @@ impl ServerHandler for HestiaServer {
         // they read is durable. The gate's own hot path does not wait on other requests' rows.
         let reports_shared_state = reports_shared_state(name.as_str());
         let scoped = super::state_lock::with_label(lock_label, async { match name.as_str() {
-            "hestia_connect" => tool_connect(&self.state, &args).await,
+            "hestia_connect" => tool_connect_as(&self.state, &args, caller_cred).await,
             "hestia_connect_dry_run" => tool_connect_dry_run(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
@@ -1040,6 +1047,39 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
         "dryRun": true,
         "dryRunSnapshotContract": 2,
     }))
+}
+
+/// `hestia_connect` with the caller's kernel credential (S2a.0). A TCP call (`cred` = None) is
+/// exactly [`tool_connect`] plus `caller.basis = "asserted"`. A socket call is refused BEFORE any
+/// session is minted or reused when its uid may not claim this `plugin_id`; otherwise the reply
+/// says how the claim was established. The check runs on every connect, reuse included, because
+/// the reuse key is the claimed name — the very thing being checked.
+pub(crate) async fn tool_connect_as(
+    state: &SharedState,
+    args: &Value,
+    cred: Option<super::peer_cred::CallerCred>,
+) -> ToolResult {
+    use super::peer_cred::{check_claim, daemon_uid, load_uid_map, ClaimCheck};
+    let check = match (cred, args.get("plugin_id").and_then(Value::as_str)) {
+        (None, _) => ClaimCheck::Asserted,
+        // A malformed claim is tool_connect's to refuse, with its own error; but a socket caller
+        // never reaches it unchecked.
+        (Some(_), None) => return tool_connect(state, args).await,
+        (Some(c), Some(plugin_id)) => {
+            let home = state.lock().await.home.clone();
+            check_claim(Some(c), plugin_id, &load_uid_map(&home), daemon_uid())
+        }
+    };
+    if let ClaimCheck::Refused { code, message, detail } = &check {
+        return Ok(hestia_error_envelope(code, message, Some(detail.clone())));
+    }
+    let mut out = tool_connect(state, args).await?;
+    if let (Some(obj), Some(caller)) = (out.as_object_mut(), check.caller_json()) {
+        if !obj.contains_key("_hestia_error") {
+            obj.insert("caller".into(), caller);
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
