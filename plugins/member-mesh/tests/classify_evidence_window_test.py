@@ -176,9 +176,9 @@ got = classify(log(digest="- id=9 reply peer->codex quota exceeded on the vault 
 check("A5: another member's pointer text cannot set this member's verdict",
       got == "egress-blocked", f"got {got!r} — the digest decided it")
 
-# A6 — rc=124 short-circuits before any log is read; the window cannot change that.
+# A6 — rc=124 uses only log SIZE, never the tail window; substantive output stays timeout.
 got = classify(log(quoted=EPERM, after=CREDITS), rc="124")
-check("A6: rc=124 still short-circuits to timeout without consulting the log",
+check("A6: rc=124 still short-circuits to timeout without consulting the tail text",
       got == "timeout", f"got {got!r}")
 
 # A7 — an echoed prompt and nothing after it. The honest answer is `unknown`; the

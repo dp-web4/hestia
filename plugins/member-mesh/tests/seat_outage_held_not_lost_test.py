@@ -84,6 +84,38 @@ def classify(text, rc="1", mode=""):
         return r.stdout.strip() or f"<rc={r.returncode}: {r.stderr.strip()[:200]}>"
 
 
+def classify_fire(prefix, this, before=(), mark=True, rc="124", via="classify"):
+    """rc=124 judged the way the watcher judges it: fire_log_mark BEFORE the fire, then the
+    fire writes its log(s). `before`/`this` are (text, mtime offset in s) pairs; a negative
+    offset on `this` against a positive one on `before` is the clock stepping back."""
+    funcs = "\n".join(extract(n) for n in ("fire_log_mark", "classify_fire_failure",
+                                             "fire_class_unavailable", "seat_unavailable_class"))
+    head = 'set -euo pipefail\nSTATE="@STATE@"\nFIRE="/x/fire-' + prefix + '.sh"\n' + funcs + '\n'
+    now = time.time()
+    with tempfile.TemporaryDirectory() as state:
+        logs = os.path.join(state, "logs")
+        os.makedirs(logs)
+
+        def write(i, text, off, tag):
+            path = os.path.join(logs, f"{prefix}-20260101-0000{i:02d}{tag}.log")
+            with open(path, "w") as f:
+                f.write(text)
+            os.utime(path, (now + off, now + off))
+
+        for i, (text, off) in enumerate(before):
+            write(i, text, off, "")
+        r = subprocess.run(["bash", "-c", head.replace("@STATE@", state) + "fire_log_mark\n"],
+                           capture_output=True, text=True, timeout=30)
+        pre = r.stdout.rstrip("\n")
+        for i, (text, off) in enumerate(this):
+            write(i, text, off, "-this")
+        call = 'classify_fire_failure "$1" terminal' if via == "classify" else 'seat_unavailable_class "$1"'
+        call += ' "$2"' if mark else ''
+        r = subprocess.run(["bash", "-c", head.replace("@STATE@", state) + call + "\n", "_", rc, pre],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or f"<rc={r.returncode}: {r.stderr.strip()[:200]}>"
+
+
 def unavailable(cls, rc):
     func = extract("fire_class_unavailable")
     r = subprocess.run(["bash", "-c", f"{func}\nfire_class_unavailable {cls} {rc}"], timeout=10)
@@ -118,6 +150,10 @@ def section_a():
          '106 | [projects."/home/member/ai-workspace"]\n    |           ^^^^^^^^^^^^\n',
          "1", "terminal", "launch-failed"),
         ("rc 127", "", "127", "terminal", "launch-failed"),
+        # rc=124 with no pre-fire mark: the newest log cannot be tied to this fire, so even
+        # an empty one is undetermined (attributed rows: classify_fire, below).
+        ("timeout, empty log, no pre-fire mark", "", "124", "terminal", "timeout"),
+        ("timeout with substantive output", "real work\n" * 20, "124", "terminal", "timeout"),
         # Prose ABOUT an outage in a wake that ran: the vendor string is far above the end.
         ("prose: limits discussed, run ended normally",
          "the codex seat hit your usage limit earlier today\n" + "work line\n" * 30
@@ -138,6 +174,34 @@ def section_a():
           and classify("codex remains out of credits\n", mode="terminal") == "unknown")
     check("A: out-of-credits/auth-failed/launch-failed are seat-down",
           all(unavailable(c, "1") for c in ("out-of-credits", "auth-failed", "launch-failed")))
+    # rc=124, the log tied to THIS fire by the pre-fire mark (#1584 review findings 1, 2).
+    fired = [  # (name, prefix, this fire's logs, earlier logs, expected)
+        ("streaming seat, this fire's log empty", "kimi", [("", 0)], [], "timeout-no-output"),
+        ("streaming seat, this fire's log bare Execution error", "codex",
+         [("Execution error", 0)], [("real work\n" * 20, -60)], "timeout-no-output"),
+        ("streaming seat, this fire's log substantive", "kimi",
+         [("real work\n" * 20, 0)], [("", -60)], "timeout"),
+        # Finding 1: claude -p text mode writes nothing until exit; a working wake killed
+        # at the bound has a 0-byte log. That is not evidence the seat is down.
+        ("claude, 0-byte log from a working session", "claude", [("", 0)], [], "timeout"),
+        # Finding 2: the clock steps back, so an EARLIER fire's log has the newer mtime.
+        ("clock step: earlier empty log newer than this fire's substantive log", "kimi",
+         [("real work\n" * 20, -30)], [("", 60)], "timeout"),
+        ("clock step: earlier substantive log newer than this fire's empty log", "kimi",
+         [("", -30)], [("real work\n" * 20, 60)], "timeout-no-output"),
+        ("no new log since the mark (an earlier fire's empty log is not this one's)", "kimi",
+         [], [("", -60)], "timeout"),
+        ("two new logs since the mark: ambiguous", "kimi", [("", 0), ("", 1)], [], "timeout"),
+    ]
+    for name, prefix, this, before, want in fired:
+        got = classify_fire(prefix, this, before)
+        check(f"A: rc 124 {name} -> {want}", got == want, f"got {got!r}")
+    check("A: seat_unavailable_class carries the mark: a streaming seat's own empty log is down",
+          classify_fire("kimi", [("", 0)], via="seat") == "timeout-no-output")
+    check("A: rc 124 with no pre-fire mark is undetermined even on an empty fresh log",
+          classify_fire("kimi", [("", 0)], mark=False) == "timeout")
+    check("A: timeout-no-output is seat-down, ordinary timeout is not",
+          unavailable("timeout-no-output", "124") and not unavailable("timeout", "124"))
     check("A: timeout/egress/unknown are NOT seat-down",
           not any(unavailable(c, "1") for c in ("timeout", "egress-blocked", "unknown")))
     check("A: a template/lock refusal rc (70, 75) is never seat-down, whatever the old log says",
