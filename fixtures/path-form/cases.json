@@ -1,0 +1,650 @@
+{
+ "_doc": [
+  "hestia #1743 step 1: the path-form case table.",
+  "core/src/path_form.rs and plugins/_shared/hestia_path_form.py both read this file; a",
+  "change to either implementation that moves a result fails the other's tests too.",
+  "canonical: raw -> ok (the canonical spelling) or refused (a Refusal code).",
+  "same: whether two spellings compare equal by match_key. within: is_within(root, candidate).",
+  "Generated once by hand; edit the rows directly."
+ ],
+ "canonical": [
+  {
+   "dialect": "windows",
+   "raw": "C:\\Users\\me\\x",
+   "ok": "C:/Users/me/x",
+   "why": "backslash form"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:/Users/me/x",
+   "ok": "C:/Users/me/x",
+   "why": "forward-slash form is already canonical"
+  },
+  {
+   "dialect": "windows",
+   "raw": "c:\\Users\\me\\x",
+   "ok": "C:/Users/me/x",
+   "why": "drive letter upper-cased; the rest keeps its case"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\Users/me\\x",
+   "ok": "C:/Users/me/x",
+   "why": "mixed separators"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\C:\\Users\\me\\x",
+   "ok": "C:/Users/me/x",
+   "why": "verbatim prefix, as std::fs::canonicalize returns"
+  },
+  {
+   "dialect": "windows",
+   "raw": "//?/C:/Users/me/x",
+   "ok": "C:/Users/me/x",
+   "why": "verbatim prefix with forward slashes"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\",
+   "ok": "C:/",
+   "why": "drive root"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:/",
+   "ok": "C:/",
+   "why": "drive root, canonical"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\\\b\\.\\c\\",
+   "ok": "C:/a/b/c",
+   "why": "repeated separators, '.', trailing separator"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\..\\b",
+   "ok": "C:/b",
+   "why": "'..' resolves lexically"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\..\\..\\Windows",
+   "ok": "C:/Windows",
+   "why": "'..' cannot climb above the drive root"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\Windows.",
+   "ok": "C:/Windows",
+   "why": "Win32 strips a trailing dot, so this opens C:\\Windows"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\Windows. . ",
+   "ok": "C:/Windows",
+   "why": "trailing dots and spaces strip together"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a.\\..\\b",
+   "ok": "C:/b",
+   "why": "'..' resolves before trimming, so the name it removes is never opened"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\b. \\.",
+   "refused": "trailing_dot_space",
+   "why": "the path ends in '.', not a name, so 'b. ' is not the last name and keeps its trailing dot"
+  },
+  {
+   "dialect": "windows",
+   "raw": "  C:\\x  ",
+   "ok": "C:/x",
+   "why": "surrounding ASCII whitespace trims"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\x\r\n",
+   "ok": "C:/x",
+   "why": "a pasted trailing newline trims"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\file　",
+   "ok": "C:/a/file　",
+   "why": "Windows trims only ASCII spaces; U+3000 is part of the name"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\...\\b",
+   "refused": "trailing_dot_space",
+   "why": "an inner segment of only dots is a name, not an alias of its parent"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a.\\b",
+   "refused": "trailing_dot_space",
+   "why": "an inner name ending in '.' can be a different folder"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a \\b",
+   "refused": "trailing_dot_space",
+   "why": "an inner name ending in a space can be a different folder"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a \\",
+   "refused": "trailing_dot_space",
+   "why": "a trailing separator keeps the space: nothing after it is the last name"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\...",
+   "refused": "trailing_dot_space",
+   "why": "a last name of only dots strips to nothing"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\ . ",
+   "refused": "trailing_dot_space",
+   "why": "a last name of only dots and spaces strips to nothing"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\C:\\a\\file ",
+   "refused": "verbatim_trailing",
+   "why": "under \\\\?\\ a final space is literal; the input's end is not trimmed"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\C:\\a \\b",
+   "refused": "verbatim_trailing",
+   "why": "under \\\\?\\ an inner trailing space is literal"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\Program Files\\Git",
+   "ok": "C:/Program Files/Git",
+   "why": "inner spaces are kept"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\Users\\me\\Café",
+   "ok": "C:/Users/me/Café",
+   "why": "non-ASCII kept as given"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\PROGRA~1",
+   "ok": "C:/PROGRA~1",
+   "why": "8.3 short names pass lexically; realpath resolves them"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\.hidden",
+   "ok": "C:/a/.hidden",
+   "why": "a leading dot is part of the name"
+  },
+  {
+   "dialect": "windows",
+   "raw": "D:\\data",
+   "ok": "D:/data",
+   "why": "other drives"
+  },
+  {
+   "dialect": "windows",
+   "raw": "/c/Users/me/x",
+   "refused": "current_drive",
+   "why": "outside Git Bash, /c/x means \\c\\x on the current drive"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\Users\\me",
+   "refused": "current_drive",
+   "why": "rooted on the current drive"
+  },
+  {
+   "dialect": "windows",
+   "raw": "/",
+   "refused": "current_drive",
+   "why": "the current drive's root"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:",
+   "refused": "drive_relative",
+   "why": "the current directory of drive C"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:x",
+   "refused": "drive_relative",
+   "why": "relative to drive C's current directory"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:..\\x",
+   "refused": "drive_relative",
+   "why": "drive-relative with a parent step"
+  },
+  {
+   "dialect": "windows",
+   "raw": "Users\\me",
+   "refused": "relative",
+   "why": "relative"
+  },
+  {
+   "dialect": "windows",
+   "raw": ".\\x",
+   "refused": "relative",
+   "why": "relative to the working directory"
+  },
+  {
+   "dialect": "windows",
+   "raw": "~\\x",
+   "refused": "tilde",
+   "why": "home is expanded by the caller"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\f.txt::$DATA",
+   "refused": "stream",
+   "why": "the default data stream is another name for f.txt"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\f.txt:hidden",
+   "refused": "stream",
+   "why": "a named stream"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\*.txt",
+   "refused": "invalid_char",
+   "why": "a glob is not a path"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\what?",
+   "refused": "invalid_char",
+   "why": "'?' is not a filename character"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\b|c",
+   "refused": "invalid_char",
+   "why": "'|' is not a filename character"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\\b\u0001",
+   "refused": "invalid_char",
+   "why": "control characters are not filename characters"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\server\\share\\x",
+   "refused": "unc",
+   "why": "network path"
+  },
+  {
+   "dialect": "windows",
+   "raw": "//server/share/x",
+   "refused": "unc",
+   "why": "network path, forward slashes"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\UNC\\server\\share",
+   "refused": "unc",
+   "why": "verbatim network path"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\.\\PhysicalDrive0",
+   "refused": "device_namespace",
+   "why": "device namespace"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\Volume{0b1c}\\x",
+   "refused": "device_namespace",
+   "why": "verbatim without a drive letter"
+  },
+  {
+   "dialect": "windows",
+   "raw": "\\\\?\\C:\\Windows.",
+   "refused": "verbatim_trailing",
+   "why": "under \\\\?\\ the trailing dot is literal"
+  },
+  {
+   "dialect": "windows",
+   "raw": "",
+   "refused": "empty",
+   "why": "empty"
+  },
+  {
+   "dialect": "windows",
+   "raw": "   ",
+   "refused": "empty",
+   "why": "whitespace only"
+  },
+  {
+   "dialect": "windows",
+   "raw": "C:\\a\u0000b",
+   "refused": "nul_byte",
+   "why": "NUL byte"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/c/Users/me/x",
+   "ok": "C:/Users/me/x",
+   "why": "the Git Bash drive mount"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/C/Users/me/x",
+   "ok": "C:/Users/me/x",
+   "why": "upper-case mount letter"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/c",
+   "ok": "C:/",
+   "why": "the bare drive mount is the drive root"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/c/",
+   "ok": "C:/",
+   "why": "the drive mount with a trailing slash"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/d/data/../logs",
+   "ok": "D:/logs",
+   "why": "'..' on another drive"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "C:/Users/me/x",
+   "ok": "C:/Users/me/x",
+   "why": "Git Bash also accepts drive form"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "C:\\Users\\me\\x",
+   "ok": "C:/Users/me/x",
+   "why": "a backslash that survived shell quoting"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/tmp/x",
+   "refused": "gitbash_mount",
+   "why": "a Git Bash mount whose target depends on the install"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/usr/bin/git",
+   "refused": "gitbash_mount",
+   "why": "a Git Bash mount"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/mnt/c/x",
+   "refused": "gitbash_mount",
+   "why": "a WSL-style path is not a Git Bash drive"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/cc/x",
+   "refused": "gitbash_mount",
+   "why": "only a single letter is a drive mount"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/",
+   "refused": "gitbash_mount",
+   "why": "the Git install root"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "\\Users",
+   "refused": "current_drive",
+   "why": "rooted by backslash on the current drive"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "~/x",
+   "refused": "tilde",
+   "why": "home is expanded by the caller"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "c/x",
+   "refused": "relative",
+   "why": "relative"
+  },
+  {
+   "dialect": "gitbash",
+   "raw": "/c/a/f.txt:s",
+   "refused": "stream",
+   "why": "stream rules apply after the mount converts"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/srv/app/x",
+   "ok": "/srv/app/x",
+   "why": "already canonical"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a//b/../b/c",
+   "ok": "/a/b/c",
+   "why": "normalize_scope_path's own example"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/../../etc",
+   "ok": "/etc",
+   "why": "'..' cannot climb above /"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/",
+   "ok": "/",
+   "why": "root"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/c/Users/x",
+   "ok": "/c/Users/x",
+   "why": "on POSIX /c is a directory, never a drive"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a\\b",
+   "ok": "/a\\b",
+   "why": "on POSIX a backslash is a filename character"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a/Windows.",
+   "ok": "/a/Windows.",
+   "why": "on POSIX a trailing dot is part of the name"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a. /b",
+   "ok": "/a. /b",
+   "why": "on POSIX an inner trailing dot or space is part of the name"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/srv/app　",
+   "ok": "/srv/app",
+   "why": "POSIX trims Unicode whitespace, as normalize_scope_path does"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a/f.txt:s",
+   "ok": "/a/f.txt:s",
+   "why": "on POSIX ':' is a filename character"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a/*",
+   "ok": "/a/*",
+   "why": "on POSIX '*' is a filename character; globs are the caller's"
+  },
+  {
+   "dialect": "posix",
+   "raw": "C:/x",
+   "refused": "relative",
+   "why": "on POSIX a drive spelling is a relative path"
+  },
+  {
+   "dialect": "posix",
+   "raw": "a/b",
+   "refused": "relative",
+   "why": "relative"
+  },
+  {
+   "dialect": "posix",
+   "raw": "~/x",
+   "refused": "tilde",
+   "why": "home is expanded by the caller"
+  },
+  {
+   "dialect": "posix",
+   "raw": "",
+   "refused": "empty",
+   "why": "empty"
+  },
+  {
+   "dialect": "posix",
+   "raw": "/a\u0000",
+   "refused": "nul_byte",
+   "why": "NUL byte"
+  }
+ ],
+ "same": [
+  {
+   "dialect": "windows",
+   "a": "C:\\Windows",
+   "b": "c:/windows",
+   "same": true,
+   "why": "a deny on C:\\Windows must catch c:/windows"
+  },
+  {
+   "dialect": "windows",
+   "a": "C:\\Users\\me\\Café",
+   "b": "C:\\USERS\\ME\\CAFÉ",
+   "same": true,
+   "why": "NTFS folds non-ASCII case"
+  },
+  {
+   "dialect": "windows",
+   "a": "C:\\a\\straße",
+   "b": "C:\\a\\STRASSE",
+   "same": false,
+   "why": "ß has no single-character upper case; NTFS does not expand it"
+  },
+  {
+   "dialect": "windows",
+   "a": "C:\\a\\b",
+   "b": "C:\\a\\c",
+   "same": false,
+   "why": "different files"
+  },
+  {
+   "dialect": "gitbash",
+   "a": "/c/Windows",
+   "b": "C:\\WINDOWS",
+   "same": true,
+   "why": "Git Bash and native spellings of one directory"
+  },
+  {
+   "dialect": "posix",
+   "a": "/srv/app",
+   "b": "/srv/APP",
+   "same": false,
+   "why": "POSIX compares exactly"
+  }
+ ],
+ "within": [
+  {
+   "dialect": "windows",
+   "root": "C:\\Users\\me",
+   "candidate": "c:\\users\\ME\\work\\f",
+   "within": true,
+   "why": "case-insensitive containment"
+  },
+  {
+   "dialect": "windows",
+   "root": "C:\\Users\\me",
+   "candidate": "C:\\Users\\me",
+   "within": true,
+   "why": "the root itself"
+  },
+  {
+   "dialect": "windows",
+   "root": "C:\\Users\\me",
+   "candidate": "C:\\Users\\mex",
+   "within": false,
+   "why": "containment is at a separator"
+  },
+  {
+   "dialect": "windows",
+   "root": "C:\\",
+   "candidate": "C:\\anything\\at\\all",
+   "within": true,
+   "why": "the drive root contains the drive"
+  },
+  {
+   "dialect": "windows",
+   "root": "C:\\",
+   "candidate": "D:\\x",
+   "within": false,
+   "why": "another drive"
+  },
+  {
+   "dialect": "windows",
+   "root": "C:\\a\\b",
+   "candidate": "C:\\a\\b\\..\\c",
+   "within": false,
+   "why": "'..' leaves the root before matching"
+  },
+  {
+   "dialect": "gitbash",
+   "root": "/c/Users/me",
+   "candidate": "C:\\Users\\me\\x",
+   "within": true,
+   "why": "mixed spellings contain"
+  },
+  {
+   "dialect": "posix",
+   "root": "/",
+   "candidate": "/etc/passwd",
+   "within": true,
+   "why": "POSIX root"
+  },
+  {
+   "dialect": "posix",
+   "root": "/srv/app",
+   "candidate": "/srv/appx",
+   "within": false,
+   "why": "containment is at a separator"
+  },
+  {
+   "dialect": "posix",
+   "root": "/srv/app",
+   "candidate": "/srv/APP/x",
+   "within": false,
+   "why": "POSIX is case-sensitive"
+  }
+ ]
+}

@@ -29,6 +29,7 @@ pub mod member_registry;
 pub mod mesh_cli;
 pub mod orchestrators;
 pub mod pairing;
+pub mod path_form;
 pub mod plugin;
 pub mod policy;
 pub mod profile;

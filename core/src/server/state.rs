@@ -4326,3 +4326,18 @@ mod scope_peer_window_tests {
         assert_eq!(scope_decided_by(false, 3, 1_000, 1_001, 1_800), ("operator", false));
     }
 }
+
+/// #1743 step 1: `path_form`'s POSIX dialect must not change what a grant means on Linux. It lives
+/// here because `state` is private to `server`.
+#[cfg(test)]
+mod path_form_agreement {
+    use super::normalize_scope_path;
+    use crate::path_form::{canonical, Dialect};
+
+    #[test]
+    fn the_posix_form_agrees_with_normalize_scope_path_on_absolute_paths() {
+        for raw in ["/a//b/../b/c", "/../../etc", "/a/./b/", "/", "/c/Users/x", "/a\\b"] {
+            assert_eq!(canonical(raw, Dialect::Posix).unwrap(), normalize_scope_path(raw), "{raw:?}");
+        }
+    }
+}
