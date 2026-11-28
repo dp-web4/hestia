@@ -57,6 +57,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "fsperm tests failed: $LASTEXITCODE" }
           cargo test --locked --lib fsync -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw "fsync tests failed: $LASTEXITCODE" }
+          cargo test --locked --lib path_form -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "path_form tests failed: $LASTEXITCODE" }
+          python ../tools/path_form_parity_test.py
+          if ($LASTEXITCODE -ne 0) { throw "path_form parity test failed: $LASTEXITCODE" }
           cargo test --locked --bin hestia passphrase_file_tests -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw "passphrase-file tests failed: $LASTEXITCODE" }
 
