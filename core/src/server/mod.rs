@@ -20,6 +20,7 @@ mod http;
 mod hub_tab;
 pub mod member_alias;
 pub mod operator_auth;
+pub mod peer_cred;
 pub mod gate_watch;
 pub mod gate_bypass;
 pub mod seat_config;
@@ -37,7 +38,7 @@ pub use dashboard::{
     ActivityStats, DashboardSnapshot, DeploymentHealth, RecentEntry, SocietyView, TrustView,
 };
 pub use handler::HestiaServer;
-pub use http::{DEFAULT_BIND, serve, serve_with_callback};
+pub use http::{DEFAULT_BIND, serve, serve_with_callback, serve_with_options};
 pub use state::{ServerState, SharedState};
 
 use anyhow::Result;

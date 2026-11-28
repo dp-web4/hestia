@@ -50,7 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Concurrency
 # ("time" added for the disposition reconciler's interval — http.rs `serve_with_callback`)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "net", "signal", "time", "io-util"] }
 tokio-util = "0.7"
 async-trait = "0.1"
 
@@ -60,6 +60,12 @@ rmcp = { version = "1.7", default-features = false, features = [
     "transport-streamable-http-server",
 ] }
 axum = "0.7"
+# S2a.0 unix-socket listener (server::peer_cred): axum 0.7's `serve` takes only a TcpListener,
+# so the socket is served connection-by-connection, HTTP/1 only (no h2 in the lock, none needed
+# on a local socket). Versions already in the lock via axum.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
@@ -108,6 +114,9 @@ tempfile = "3"
 
 # Owner-only files on Windows (fsperm.rs, hestia #342): a protected DACL for the current user, the
 # Windows equivalent of the 0o600/0o700 modes. Version already in Cargo.lock.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

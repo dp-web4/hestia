@@ -113,6 +113,11 @@ enum Command {
         /// Generates an ephemeral keypair; production should load from vault.
         #[arg(long)]
         callback: bool,
+
+        /// ALSO serve on this unix socket (S2a.0). A socket caller's kernel uid is checked at
+        /// `hestia_connect` against `<home>/caller-uids.json`; the TCP bind is unchanged.
+        #[arg(long)]
+        unix: Option<std::path::PathBuf>,
     },
 
     /// Launch the terminal dashboard against a running daemon
@@ -1269,7 +1274,7 @@ pub fn run() -> AnyResult<()> {
             cmd_chain_verify(&home, segment.as_deref(), trusted_witness_key,
                              expect_chain_id, expect_previous_hash, expect_end_hash)
         }
-        Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
+        Command::Serve { bind, allow_remote, callback, unix } => cmd_serve(&home, &bind, allow_remote, callback, unix),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Scope(ScopeCmd::Arbitrate { request_id, grant, deny, reason, as_member, endpoint, target }) => {
             if grant == deny {
@@ -1801,7 +1806,13 @@ fn bind_is_loopback(bind: &str) -> bool {
     host.trim_start_matches('[').trim_end_matches(']').eq_ignore_ascii_case("localhost")
 }
 
-fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: bool) -> AnyResult<()> {
+fn cmd_serve(
+    home: &std::path::Path,
+    bind: &str,
+    allow_remote: bool,
+    callback: bool,
+    unix: Option<std::path::PathBuf>,
+) -> AnyResult<()> {
     // Default-refuse off-device binds: the daemon's REST surface
     // (/api/vault, /api/policy, /api/chain, ...) is unauthenticated, so a
     // non-loopback bind hands it to anything that can route to the port.
@@ -1868,7 +1879,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(hestia::server::serve_with_callback(state, bind, callback_kp))?;
+    runtime.block_on(hestia::server::serve_with_options(state, bind, callback_kp, unix))?;
 
     // Cleanup
     let _ = std::fs::remove_file(&endpoint_file);
