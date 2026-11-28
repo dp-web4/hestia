@@ -98,6 +98,14 @@ Environment=RUST_LOG=warn
 # surface drops by ~30x. Paired with the malloc_trim(0) on the maintenance tick, which
 # releases what the cap does not prevent.
 Environment=MALLOC_ARENA_MAX=2
+# MEMORY CEILING (#592). 1G is a provisional starting bound, not 3x headroom: process
+# RSS excludes page cache, kernel memory, and child processes charged to this cgroup.
+# Validate the value from MemoryCurrent/MemoryPeak and memory.stat during the #592 soak.
+# Above MemoryHigh, anonymous memory can swap and allocating threads throttle; gate
+# timeouts fail closed, and Restart=on-failure does not fire. Track memory.events high
+# and gate-unavailable frequency before treating the bound as validated. This is not the
+# hard MemoryMax kill switch.
+MemoryHigh=1G
 # Optional workspace handed to agent-inventory for the dashboard read list.
 # Installers should render this from explicit operator configuration. Unset or
 # empty means the inventory must report inference/unknown rather than guess.
